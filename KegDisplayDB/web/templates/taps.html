@@ -248,209 +248,617 @@
                 </div>
                 
                 <div class="mb-3">
-                    <div class="list-group" id="beer-list">
-                        <!-- Beer list will be populated here -->
+                    <div class="d-flex justify-content-between align-items-center">
+                        <span>Sort by:</span>
+                        <div class="btn-group btn-group-sm" role="group" id="modal-sort-controls">
+                            <button type="button" class="btn btn-outline-secondary active" data-sort="Name">Name</button>
+                            <button type="button" class="btn btn-outline-secondary" data-sort="idBeer">ID</button>
+                            <button type="button" class="btn btn-outline-secondary" data-sort="ABV">ABV</button>
+                            <button type="button" class="btn btn-outline-secondary" data-sort="IBU">IBU</button>
+                            <button type="button" class="btn btn-outline-secondary" data-sort="Brewed">Brewed</button>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" id="modal-sort-direction">
+                            <i class="fas fa-sort-up"></i>
+                        </button>
                     </div>
+                </div>
+                
+                <div class="list-group" id="beer-list">
+                    <!-- Beers will be populated here -->
                 </div>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                <button type="button" class="btn btn-primary" id="assign-beer-btn">Assign Beer</button>
+                <button type="button" class="btn btn-danger me-auto" id="clear-tap-btn">Clear Tap</button>
+                <button type="button" class="btn btn-primary" id="assign-beer-btn" disabled>Assign Beer</button>
             </div>
         </div>
     </div>
 </div>
 {% endblock %}
 
-{% block extra_scripts %}
+{% block scripts %}
 <script>
-    let currentTapId = null;
+document.addEventListener('DOMContentLoaded', function() {
+    // Initialize modals
+    const confirmModal = new bootstrap.Modal(document.getElementById('confirmModal'));
+    const beerSelectionModal = new bootstrap.Modal(document.getElementById('beerSelectionModal'));
+    
+    // Keep track of current data
+    let allBeers = [];
+    let currentTaps = [];
     let selectedBeerId = null;
+    let currentAction = null;
+    let currentTapId = null;
+    
+    // Add these variables for sorting beers in the modal
+    let modalCurrentSortField = 'Name';
+    let modalCurrentSortDirection = 'asc';
+    
+    // Load taps when page loads
+    loadTaps();
+    loadBeers();
+    
+    // Setup event listeners after defining variables
+    setupModalEventListeners();
+    
+    function setupModalEventListeners() {
+        // Add sorting event listeners for the modal
+        document.querySelectorAll('#modal-sort-controls button').forEach(button => {
+            button.addEventListener('click', function() {
+                // Update active button
+                document.querySelectorAll('#modal-sort-controls button').forEach(btn => {
+                    btn.classList.remove('active');
+                });
+                this.classList.add('active');
+                
+                // Set sort field
+                modalCurrentSortField = this.getAttribute('data-sort');
+                
+                console.log("Sorting by:", modalCurrentSortField);
+                
+                // Re-render with new sort
+                renderBeerSelectionList(allBeers);
+            });
+        });
 
-    // Function to load taps
+        // Sort direction toggle for modal
+        document.getElementById('modal-sort-direction').addEventListener('click', function() {
+            // Toggle direction
+            modalCurrentSortDirection = modalCurrentSortDirection === 'asc' ? 'desc' : 'asc';
+            
+            // Update icon
+            const icon = this.querySelector('i');
+            icon.className = `fas fa-sort-${modalCurrentSortDirection === 'asc' ? 'up' : 'down'}`;
+            
+            console.log("Sort direction:", modalCurrentSortDirection);
+            
+            // Re-render with new sort
+            renderBeerSelectionList(allBeers);
+        });
+
+        // Update search functionality to include idBeer
+        document.getElementById('beer-search-modal').addEventListener('input', function() {
+            const searchTerm = this.value.toLowerCase();
+            
+            console.log("Searching for:", searchTerm);
+            
+            if (!searchTerm) {
+                renderBeerSelectionList(allBeers);
+                return;
+            }
+            
+            const filteredBeers = allBeers.filter(beer => {
+                return (
+                    beer.Name?.toLowerCase().includes(searchTerm) || 
+                    (beer.Description && beer.Description.toLowerCase().includes(searchTerm)) ||
+                    (beer.idBeer && beer.idBeer.toString().includes(searchTerm))
+                );
+            });
+            
+            renderBeerSelectionList(filteredBeers);
+        });
+        
+        // Clear tap button
+        document.getElementById('clear-tap-btn').addEventListener('click', function() {
+            if (!currentTapId) {
+                return;
+            }
+            
+            // Update tap with null beer id (clear the tap)
+            fetch(`/api/taps/${currentTapId}`, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    beer_id: null
+                })
+            })
+            .then(response => {
+                if (!response.ok) {
+                    return response.json().then(err => { throw err; });
+                }
+                return response.json();
+            })
+            .then(result => {
+                // Close modal and reload taps
+                beerSelectionModal.hide();
+                loadTaps();
+            })
+            .catch(error => {
+                console.error('Error clearing tap:', error);
+                alert(error.error || 'Failed to clear tap. Please try again.');
+            });
+        });
+        
+        // Update the assign beer button
+        document.getElementById('assign-beer-btn').addEventListener('click', function() {
+            if (!selectedBeerId || !currentTapId) {
+                return;
+            }
+            
+            assignBeerToTap(selectedBeerId, currentTapId, this);
+        });
+    }
+    
+    // Update tap count button
+    document.getElementById('update-tap-count').addEventListener('click', function() {
+        const newCount = parseInt(document.getElementById('tap-count').value);
+        if (isNaN(newCount) || newCount < 1) {
+            alert('Please enter a valid number of taps (1 or more)');
+            return;
+        }
+        
+        const currentCount = currentTaps.length;
+        
+        if (newCount < currentCount) {
+            // Check if any taps to be removed have beers assigned
+            const tapsToRemove = currentTaps.slice(newCount);
+            const assignedBeers = tapsToRemove.filter(tap => tap.idBeer).length;
+            
+            if (assignedBeers > 0) {
+                document.getElementById('confirm-message').textContent = 
+                    `This will remove ${currentCount - newCount} taps, including ${assignedBeers} with beers assigned. Continue?`;
+                
+                currentAction = () => updateTapCount(newCount);
+                document.getElementById('confirm-action-btn').onclick = function() {
+                    currentAction();
+                    confirmModal.hide();
+                };
+                
+                confirmModal.show();
+            } else {
+                updateTapCount(newCount);
+            }
+        } else if (newCount > currentCount) {
+            updateTapCount(newCount);
+        }
+    });
+    
+    // Functions to load and display data
     function loadTaps() {
         fetch('/api/taps')
             .then(response => response.json())
             .then(taps => {
-                const container = document.getElementById('taps-container');
-                container.innerHTML = '';
-                
-                taps.forEach(tap => {
-                    const tapCard = createTapCard(tap);
-                    container.appendChild(tapCard);
-                });
+                currentTaps = taps;
+                document.getElementById('tap-count').value = taps.length;
+                renderTaps(taps);
             })
-            .catch(error => console.error('Error loading taps:', error));
+            .catch(error => {
+                console.error('Error loading taps:', error);
+                alert('Failed to load taps. Please try again.');
+            });
     }
-
-    // Function to create a tap card
+    
+    function loadBeers() {
+        fetch('/api/beers')
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`HTTP error! Status: ${response.status}`);
+                }
+                return response.json();
+            })
+            .then(beers => {
+                allBeers = beers;
+            })
+            .catch(error => {
+                console.error('Error loading beers:', error);
+            });
+    }
+    
+    function renderTaps(taps) {
+        const container = document.getElementById('taps-container');
+        container.innerHTML = '';
+        
+        if (taps.length === 0) {
+            container.innerHTML = '<div class="col-12"><div class="alert alert-info">No taps configured yet. Set the number of taps above.</div></div>';
+            return;
+        }
+        
+        // Create a single row and add all taps to it - flex will handle the wrapping
+        const row = document.createElement('div');
+        row.className = 'row tap-row';
+        
+        // Add all taps to the row
+        taps.forEach(tap => {
+            const tapCard = createTapCard(tap);
+            row.appendChild(tapCard);
+        });
+        
+        container.appendChild(row);
+    }
+    
     function createTapCard(tap) {
         const col = document.createElement('div');
-        col.className = 'tap-col';
+        col.className = 'col-md-6 col-lg-4 tap-col';
         
-        const card = document.createElement('div');
-        card.className = `tap-card ${!tap.beer ? 'empty-tap' : ''}`;
-        card.id = `tap-${tap.id}`;
+        const hasBeer = tap.idBeer && tap.BeerName;
         
-        const header = document.createElement('div');
-        header.className = 'tap-header';
-        header.innerHTML = `
-            <h5>Tap ${tap.id}</h5>
-            <div class="btn-group">
-                <button class="btn btn-sm btn-outline-primary assign-beer" data-tap-id="${tap.id}">
-                    <i class="fas fa-beer"></i> Assign Beer
-                </button>
-                <button class="btn btn-sm btn-outline-danger clear-tap" data-tap-id="${tap.id}">
-                    <i class="fas fa-times"></i> Clear
-                </button>
+        col.innerHTML = `
+            <div class="tap-card ${!hasBeer ? 'empty-tap' : ''}">
+                <div class="tap-header d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0">Tap #${tap.idTap}</h5>
+                    <button class="btn btn-sm btn-outline-primary assign-beer" data-tap-id="${tap.idTap}">
+                        <i class="fas fa-beer me-1"></i> Assign Beer
+                    </button>
+                </div>
+                <div class="tap-body">
+                    ${hasBeer ? `
+                        <div class="tap-beer">${tap.BeerName}</div>
+                        <div class="tap-details">
+                            ${tap.ABV ? `<div><strong>ABV:</strong> ${tap.ABV}%</div>` : ''}
+                            ${tap.IBU ? `<div><strong>IBU:</strong> ${tap.IBU}</div>` : ''}
+                        </div>
+                        ${tap.Description ? `<div class="tap-description">${tap.Description}</div>` : ''}
+                    ` : `
+                        <div class="text-center py-4">
+                            <i class="fas fa-times-circle fa-2x mb-3 text-muted"></i>
+                            <p class="mb-0">No beer assigned</p>
+                        </div>
+                    `}
+                </div>
             </div>
         `;
         
-        const body = document.createElement('div');
-        body.className = 'tap-body';
+        // Add click event for assign beer button
+        col.querySelector('.assign-beer').addEventListener('click', function() {
+            assignBeer(tap.idTap);
+        });
         
-        if (tap.beer) {
-            body.innerHTML = `
-                <div class="tap-beer">
-                    <span class="beer-color-dot" style="background-color: ${tap.beer.color || '#6c757d'}"></span>
-                    ${tap.beer.name}
-                </div>
-                <div class="tap-description">${tap.beer.description || 'No description available'}</div>
-                <div class="tap-details">
-                    <small>Style: ${tap.beer.style || 'N/A'}</small><br>
-                    <small>ABV: ${tap.beer.abv || 'N/A'}%</small>
-                </div>
-            `;
-        } else {
-            body.innerHTML = `
-                <div class="text-center text-muted">
-                    <i class="fas fa-beer fa-3x mb-3"></i>
-                    <p>No beer assigned</p>
-                </div>
-            `;
-        }
-        
-        card.appendChild(header);
-        card.appendChild(body);
-        col.appendChild(card);
         return col;
     }
+    
+    function assignBeer(tapId) {
+        // Set the current tap ID
+        currentTapId = tapId;
+        
+        // Get the current tap to show in the modal title
+        const tap = currentTaps.find(t => t.idTap === tapId);
+        if (tap) {
+            document.querySelector('#beerSelectionModal .modal-title').textContent = `Assign Beer to Tap #${tapId}`;
+        }
+        
+        // Load beers for selection
+        loadBeersForSelection(tapId);
+    }
+    
+    function updateTapCount(newCount) {
+        const currentCount = currentTaps.length;
+        
+        if (newCount === currentCount) {
+            return; // No change needed
+        }
+        
+        fetch('/api/taps/count', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                count: newCount
+            })
+        })
+        .then(response => {
+            if (!response.ok) {
+                return response.json().then(err => { throw err; });
+            }
+            return response.json();
+        })
+        .then(result => {
+            loadTaps();
+        })
+        .catch(error => {
+            console.error('Error updating tap count:', error);
+            alert(error.error || 'Failed to update tap count. Please try again.');
+        });
+    }
 
-    // Function to load beers for the selection modal
-    function loadBeers() {
+    function loadBeersForSelection(tapId) {
+        selectedBeerId = null;
+        document.getElementById('assign-beer-btn').disabled = true;
+        
+        // Show modal first so user sees something happening
+        beerSelectionModal.show();
+        
+        // Clear previous beer list
+        document.getElementById('beer-list').innerHTML = '<div class="text-center p-3"><i class="fas fa-spinner fa-spin"></i> Loading beers...</div>';
+        
+        console.log("Loading beers for tap selection...");
+        
+        // Fetch beers with proper error handling
         fetch('/api/beers')
-            .then(response => response.json())
+            .then(response => {
+                console.log("Beers API response status:", response.status);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! Status: ${response.status}`);
+                }
+                return response.json();
+            })
             .then(beers => {
-                const beerList = document.getElementById('beer-list');
-                beerList.innerHTML = '';
+                console.log(`Loaded ${beers.length} beers for selection`);
+                allBeers = beers;
+                if (beers && beers.length > 0) {
+                    renderBeerSelectionList(beers);
+                } else {
+                    document.getElementById('beer-list').innerHTML = 
+                        '<div class="alert alert-info">No beers available. Please add beers first.</div>';
+                }
+            })
+            .catch(error => {
+                console.error('Error loading beers:', error);
+                document.getElementById('beer-list').innerHTML = 
+                    `<div class="alert alert-danger">Error loading beers: ${error.message}. Please try refreshing the page.</div>`;
+            });
+    }
+
+    // Define the document click handler as a named function outside the other functions
+    function handleOutsideClick(e) {
+        const beerList = document.getElementById('beer-list');
+        // Only handle clicks outside the beer list and not on assign buttons
+        if (beerList && !beerList.contains(e.target) && 
+            !e.target.classList.contains('inline-assign-btn') && 
+            !e.target.classList.contains('assign-beer-btn')) {
+            document.querySelectorAll('#beer-list a').forEach(a => {
+                a.classList.remove('active');
+            });
+            
+            // Disable the main assign button
+            const assignButton = document.getElementById('assign-beer-btn');
+            if (assignButton) {
+                assignButton.disabled = true;
+            }
+            selectedBeerId = null;
+        }
+    }
+
+    function renderBeerSelectionList(beers) {
+        console.log(`Rendering ${beers.length} beers for selection, sorted by ${modalCurrentSortField} (${modalCurrentSortDirection})`);
+        
+        if (!beers || beers.length === 0) {
+            document.getElementById('beer-list').innerHTML = '<div class="list-group-item">No beers found. Adjust your search or add a new beer.</div>';
+            return;
+        }
+        
+        try {
+            // Sort beers
+            const sortedBeers = [...beers].sort((a, b) => {
+                let aValue = a[modalCurrentSortField];
+                let bValue = b[modalCurrentSortField];
                 
-                beers.forEach(beer => {
+                // Handle nulls
+                if (aValue === null && bValue === null) return 0;
+                if (aValue === null) return modalCurrentSortDirection === 'asc' ? 1 : -1;
+                if (bValue === null) return modalCurrentSortDirection === 'asc' ? -1 : 1;
+                
+                // Convert to number for numeric fields
+                if (['idBeer', 'ABV', 'IBU', 'Color', 'OriginalGravity', 'FinalGravity'].includes(modalCurrentSortField)) {
+                    aValue = parseFloat(aValue) || 0;
+                    bValue = parseFloat(bValue) || 0;
+                }
+                
+                // Handle dates - ensure they are valid dates
+                if (['Brewed', 'Kegged', 'Tapped'].includes(modalCurrentSortField)) {
+                    const aDate = aValue ? new Date(aValue) : new Date(0);
+                    const bDate = bValue ? new Date(bValue) : new Date(0);
+                    
+                    aValue = aDate.toString() === 'Invalid Date' ? new Date(0) : aDate;
+                    bValue = bDate.toString() === 'Invalid Date' ? new Date(0) : bDate;
+                }
+                
+                // Compare values
+                if (aValue < bValue) return modalCurrentSortDirection === 'asc' ? -1 : 1;
+                if (aValue > bValue) return modalCurrentSortDirection === 'asc' ? 1 : -1;
+                return 0;
+            });
+            
+            const beerList = document.getElementById('beer-list');
+            beerList.innerHTML = '';
+            
+            if (sortedBeers.length === 0) {
+                beerList.innerHTML = '<div class="list-group-item">No beers found. Adjust your search or add a new beer.</div>';
+                return;
+            }
+            
+            sortedBeers.forEach(beer => {
+                try {
+                    // Sanity check the beer object
+                    if (!beer || typeof beer !== 'object') {
+                        console.error("Invalid beer object:", beer);
+                        return; // Skip this item
+                    }
+                    
+                    if (!beer.Name) {
+                        console.warn("Beer missing name:", beer);
+                        beer.Name = `Beer #${beer.idBeer || 'Unknown'}`;
+                    }
+                    
                     const item = document.createElement('a');
-                    item.href = '#';
                     item.className = 'list-group-item list-group-item-action';
-                    item.dataset.beerId = beer.id;
+                    item.href = '#';
+                    item.dataset.beerId = beer.idBeer;
+                    
+                    // Format dates properly for display
+                    const brewedDate = beer.Brewed && new Date(beer.Brewed).toString() !== 'Invalid Date' 
+                        ? new Date(beer.Brewed).toLocaleDateString() 
+                        : null;
+                    
+                    // Add beer color indicator if available
+                    let colorDot = '';
+                    if (beer.Color) {
+                        const beerColorStyle = getBeerColorCSS(beer.Color);
+                        colorDot = `<span class="beer-color-dot me-2" style="${beerColorStyle}"></span>`;
+                    }
+                    
+                    // Additional details to show
+                    let additionalDetails = '';
+                    if (brewedDate) {
+                        additionalDetails += `<small class="me-2">Brewed: ${brewedDate}</small>`;
+                    }
+                    
                     item.innerHTML = `
-                        <div class="d-flex w-100 justify-content-between">
-                            <h6 class="mb-1">${beer.name}</h6>
-                            <small>${beer.abv || 'N/A'}% ABV</small>
+                        <div class="d-flex w-100 justify-content-between align-items-center">
+                            <h6 class="mb-1">${colorDot}<span class="small text-muted">#${beer.idBeer}</span> ${beer.Name}</h6>
+                            <div>
+                                ${beer.ABV ? `<span class="badge bg-secondary me-1">${beer.ABV}%</span>` : ''}
+                                ${beer.IBU ? `<span class="badge bg-secondary">${beer.IBU} IBU</span>` : ''}
+                            </div>
                         </div>
-                        <p class="mb-1">${beer.style || 'No style specified'}</p>
-                        <small class="text-muted">${beer.description || 'No description available'}</small>
+                        ${beer.Description ? `<small class="text-muted">${beer.Description}</small>` : ''}
+                        ${additionalDetails ? `<div class="mt-1">${additionalDetails}</div>` : ''}
+                        <button class="btn btn-sm btn-primary inline-assign-btn">Assign</button>
                     `;
                     
-                    item.addEventListener('click', (e) => {
+                    item.addEventListener('click', function(e) {
+                        // Check if the click was on the assign button
+                        if (e.target.classList.contains('inline-assign-btn')) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            assignBeerToTap(beer.idBeer, currentTapId, null);
+                            return;
+                        }
+                        
                         e.preventDefault();
-                        document.querySelectorAll('.list-group-item').forEach(i => i.classList.remove('active'));
-                        item.classList.add('active');
-                        selectedBeerId = beer.id;
+                        
+                        // Remove active class from all items
+                        document.querySelectorAll('#beer-list a').forEach(a => {
+                            a.classList.remove('active');
+                        });
+                        
+                        // Add active class to selected item
+                        this.classList.add('active');
+                        
+                        // Update selected beer ID
+                        selectedBeerId = beer.idBeer;
+                        console.log("Selected beer:", selectedBeerId);
+                        
+                        // Enable assign button
+                        document.getElementById('assign-beer-btn').disabled = false;
                     });
                     
                     beerList.appendChild(item);
-                });
-            })
-            .catch(error => console.error('Error loading beers:', error));
-    }
-
-    // Event listeners
-    document.addEventListener('DOMContentLoaded', () => {
-        loadTaps();
-        loadBeers();
-        
-        // Update tap count
-        document.getElementById('update-tap-count').addEventListener('click', () => {
-            const count = document.getElementById('tap-count').value;
-            fetch('/api/taps/count', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ count: parseInt(count) })
-            })
-            .then(response => response.json())
-            .then(() => loadTaps())
-            .catch(error => console.error('Error updating tap count:', error));
-        });
-        
-        // Assign beer button click
-        document.querySelectorAll('.assign-beer').forEach(button => {
-            button.addEventListener('click', (e) => {
-                currentTapId = e.target.closest('.assign-beer').dataset.tapId;
-                $('#beerSelectionModal').modal('show');
-            });
-        });
-        
-        // Clear tap button click
-        document.querySelectorAll('.clear-tap').forEach(button => {
-            button.addEventListener('click', (e) => {
-                const tapId = e.target.closest('.clear-tap').dataset.tapId;
-                document.getElementById('confirm-message').textContent = 'Are you sure you want to clear this tap?';
-                document.getElementById('confirm-action-btn').onclick = () => {
-                    fetch(`/api/taps/${tapId}/clear`, {
-                        method: 'POST'
-                    })
-                    .then(() => loadTaps())
-                    .catch(error => console.error('Error clearing tap:', error));
-                    $('#confirmModal').modal('hide');
-                };
-                $('#confirmModal').modal('show');
-            });
-        });
-        
-        // Assign beer from modal
-        document.getElementById('assign-beer-btn').addEventListener('click', () => {
-            if (currentTapId && selectedBeerId) {
-                fetch(`/api/taps/${currentTapId}/assign`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ beer_id: selectedBeerId })
-                })
-                .then(() => {
-                    loadTaps();
-                    $('#beerSelectionModal').modal('hide');
-                })
-                .catch(error => console.error('Error assigning beer:', error));
-            }
-        });
-        
-        // Beer search functionality
-        document.getElementById('beer-search-modal').addEventListener('input', (e) => {
-            const searchTerm = e.target.value.toLowerCase();
-            document.querySelectorAll('.list-group-item').forEach(item => {
-                const beerName = item.querySelector('h6').textContent.toLowerCase();
-                const beerStyle = item.querySelector('p').textContent.toLowerCase();
-                const beerDesc = item.querySelector('small').textContent.toLowerCase();
-                
-                if (beerName.includes(searchTerm) || 
-                    beerStyle.includes(searchTerm) || 
-                    beerDesc.includes(searchTerm)) {
-                    item.style.display = '';
-                } else {
-                    item.style.display = 'none';
+                } catch (itemError) {
+                    console.error("Error creating beer list item:", itemError);
+                    // Continue with the next item
                 }
             });
+            
+            // Remove any existing click handler before adding a new one
+            document.removeEventListener('click', handleOutsideClick);
+            
+            // Add click handler for document to remove selection when clicking outside
+            document.addEventListener('click', handleOutsideClick);
+            
+        } catch (error) {
+            console.error("Error rendering beer list:", error);
+            document.getElementById('beer-list').innerHTML = 
+                `<div class="alert alert-danger">Error rendering beer list: ${error.message}. Please try refreshing the page.</div>`;
+        }
+    }
+
+    // Add getBeerColorCSS function if it doesn't exist
+    function getBeerColorCSS(srm) {
+        // SRM to color mapping (approximate)
+        let color = '#FFE699'; // Default light color
+        
+        if (!srm || isNaN(srm)) {
+            return 'background-color: #eeeeee;'; // No color specified
+        }
+        
+        if (srm <= 2) {
+            color = '#FFE699'; // Very pale
+        } else if (srm <= 4) {
+            color = '#FFD878'; // Pale
+        } else if (srm <= 6) {
+            color = '#FFCA5A'; // Gold
+        } else if (srm <= 8) {
+            color = '#FFBF42'; // Amber
+        } else if (srm <= 12) {
+            color = '#FBB123'; // Copper
+        } else if (srm <= 16) {
+            color = '#F8A600'; // Red/Brown
+        } else if (srm <= 20) {
+            color = '#E78A00'; // Brown
+        } else if (srm <= 25) {
+            color = '#D97000'; // Dark Brown
+        } else if (srm <= 30) {
+            color = '#BB5100'; // Very Dark Brown
+        } else if (srm <= 40) {
+            color = '#8D2700'; // Black
+        } else {
+            color = '#5A1400'; // Black, opaque
+        }
+        
+        return `background-color: ${color};`;
+    }
+
+    // Function to assign a beer to a tap with button reference for updating UI
+    function assignBeerToTap(beerId, tapId, buttonElement) {
+        if (!beerId || !tapId) {
+            return;
+        }
+        
+        // Disable button while processing
+        if (buttonElement) {
+            buttonElement.disabled = true;
+            buttonElement.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Assigning...';
+        }
+        
+        // Update tap with selected beer
+        fetch(`/api/taps/${tapId}`, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                beer_id: beerId
+            })
+        })
+        .then(response => {
+            if (!response.ok) {
+                return response.json().then(err => { throw err; });
+            }
+            return response.json();
+        })
+        .then(result => {
+            // Close modal and reload taps
+            beerSelectionModal.hide();
+            loadTaps();
+        })
+        .catch(error => {
+            console.error('Error assigning beer:', error);
+            if (buttonElement) {
+                buttonElement.innerHTML = '<i class="fas fa-times"></i> Error';
+                setTimeout(() => {
+                    buttonElement.disabled = false;
+                    buttonElement.innerHTML = 'Assign Beer';
+                    alert(error.error || 'Failed to assign beer. Please try again.');
+                }, 1000);
+            } else {
+                alert(error.error || 'Failed to assign beer. Please try again.');
+            }
         });
-    });
+    }
+});
 </script>
 {% endblock %} 

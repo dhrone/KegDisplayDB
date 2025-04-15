@@ -1,0 +1,866 @@
+{% extends "base.html" %}
+
+{% block extra_styles %}
+<style>
+    .beer-table th {
+        cursor: pointer;
+    }
+    .beer-table th.active {
+        background-color: #f8f9fa;
+    }
+    .beer-table th i {
+        margin-left: 5px;
+    }
+    .search-container {
+        position: relative;
+    }
+    .search-container .fas {
+        position: absolute;
+        top: 12px;
+        left: 10px;
+        color: #6c757d;
+    }
+    .search-input {
+        padding-left: 30px;
+    }
+    .beer-card {
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        margin-bottom: 15px;
+        transition: all 0.3s ease;
+    }
+    .beer-card:hover {
+        box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+    }
+    .beer-actions {
+        text-align: right;
+    }
+    .beer-description {
+        max-height: 80px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .beer-stats {
+        display: flex;
+        gap: 15px;
+        margin: 10px 0;
+    }
+    .beer-stat {
+        text-align: center;
+        padding: 5px 10px;
+        border-radius: 5px;
+        background-color: #f8f9fa;
+    }
+    .beer-stat .label {
+        font-size: 0.8rem;
+        color: #6c757d;
+    }
+    .beer-stat .value {
+        font-weight: bold;
+    }
+    #beerModal .modal-dialog {
+        max-width: 700px;
+    }
+    .beer-color-preview {
+        height: 25px;
+        border-radius: 4px;
+        box-shadow: inset 0 0 0 1px rgba(0,0,0,0.1);
+        transition: all 0.2s ease;
+    }
+    .beer-color-dot {
+        width: 15px;
+        height: 15px;
+        border-radius: 50%;
+        border: 1px solid rgba(0,0,0,0.1);
+        display: inline-block;
+        vertical-align: middle;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="row mb-4 align-items-center">
+    <div class="col-md-6">
+        <h1>Beer Inventory</h1>
+        <p>Manage your beer inventory and details.</p>
+    </div>
+    <div class="col-md-6 d-flex justify-content-md-end mt-3 mt-md-0">
+        <div class="search-container me-2 flex-grow-1 flex-md-grow-0">
+            <i class="fas fa-search"></i>
+            <input type="text" class="form-control search-input" id="beer-search" placeholder="Search beers...">
+        </div>
+        <button class="btn btn-success" id="add-beer-btn">
+            <i class="fas fa-plus-circle me-2"></i>Add New Beer
+        </button>
+    </div>
+</div>
+
+<div class="row mb-3">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header bg-light">
+                <div class="row align-items-center">
+                    <div class="col">
+                        <div class="btn-group" role="group" id="view-toggle">
+                            <button type="button" class="btn btn-outline-secondary active" data-view="grid">
+                                <i class="fas fa-th-large"></i> Grid
+                            </button>
+                            <button type="button" class="btn btn-outline-secondary" data-view="table">
+                                <i class="fas fa-list"></i> Table
+                            </button>
+                        </div>
+                    </div>
+                    <div class="col text-center">
+                        <div class="d-inline-block">
+                            <span class="me-2">Sort by:</span>
+                            <div class="btn-group" role="group" id="sort-controls">
+                                <button type="button" class="btn btn-sm btn-outline-secondary active" data-sort="Name">Name</button>
+                                <button type="button" class="btn btn-sm btn-outline-secondary" data-sort="idBeer">ID</button>
+                                <button type="button" class="btn btn-sm btn-outline-secondary" data-sort="Brewed">Brewed</button>
+                                <button type="button" class="btn btn-sm btn-outline-secondary" data-sort="Kegged">Kegged</button>
+                                <button type="button" class="btn btn-sm btn-outline-secondary" data-sort="Tapped">Tapped</button>
+                            </div>
+                            <button type="button" class="btn btn-sm btn-outline-secondary ms-2" id="sort-direction">
+                                <i class="fas fa-sort-up"></i>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="col-auto">
+                        <span id="beer-count" class="text-muted">0 beers</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Grid View -->
+<div id="grid-view" class="row">
+    <!-- Beer cards will be inserted here dynamically -->
+</div>
+
+<!-- Table View (hidden by default) -->
+<div id="table-view" class="d-none">
+    <div class="card">
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-hover beer-table mb-0">
+                    <thead>
+                        <tr>
+                            <th data-sort="idBeer">ID <i class="fas fa-sort"></i></th>
+                            <th data-sort="Name">Name <i class="fas fa-sort"></i></th>
+                            <th data-sort="Brewed">Brewed <i class="fas fa-sort"></i></th>
+                            <th data-sort="Kegged">Kegged <i class="fas fa-sort"></i></th>
+                            <th data-sort="Tapped">Tapped <i class="fas fa-sort"></i></th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="beer-table-body">
+                        <!-- Beer rows will be inserted here dynamically -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Beer Modal -->
+<div class="modal fade" id="beerModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="beerModalTitle">Add New Beer</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="beerForm">
+                    <input type="hidden" id="beer-id" name="beer_id">
+                    
+                    <div class="row">
+                        <div class="col-md-8">
+                            <div class="mb-3">
+                                <label for="beer-name" class="form-label">Beer Name</label>
+                                <input type="text" class="form-control" id="beer-name" name="name" required>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label for="beer-color" class="form-label">Color (SRM)</label>
+                                <input type="number" class="form-control" id="beer-color" name="color" step="0.1" min="0">
+                                <div class="beer-color-preview mt-2" id="beer-color-preview"></div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row">
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label for="beer-abv" class="form-label">ABV (%)</label>
+                                <input type="number" class="form-control" id="beer-abv" name="abv" step="0.1" min="0">
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label for="beer-ibu" class="form-label">IBU</label>
+                                <input type="number" class="form-control" id="beer-ibu" name="ibu" step="0.1" min="0">
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label for="beer-og" class="form-label">Original Gravity</label>
+                                <input type="number" class="form-control" id="beer-og" name="og" step="0.001" min="1">
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row">
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label for="beer-fg" class="form-label">Final Gravity</label>
+                                <input type="number" class="form-control" id="beer-fg" name="fg" step="0.001" min="0.990">
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label for="beer-brewed" class="form-label">Brew Date</label>
+                                <input type="date" class="form-control" id="beer-brewed" name="brewed">
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label for="beer-kegged" class="form-label">Keg Date</label>
+                                <input type="date" class="form-control" id="beer-kegged" name="kegged">
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="beer-description" class="form-label">Description</label>
+                        <textarea class="form-control" id="beer-description" name="description" rows="3"></textarea>
+                        <small class="text-muted">Brief description of the beer style and characteristics.</small>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="beer-notes" class="form-label">Brewer's Notes</label>
+                        <textarea class="form-control" id="beer-notes" name="notes" rows="3"></textarea>
+                        <small class="text-muted">Additional notes about the brewing process, recipe, etc.</small>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-danger me-auto" id="delete-beer-btn">Delete Beer</button>
+                <button type="button" class="btn btn-primary" id="save-beer-btn">Save Changes</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Confirmation Modal -->
+<div class="modal fade" id="confirmModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Confirm Deletion</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p id="confirm-message">Are you sure you want to delete this beer?</p>
+                <p id="beer-on-tap-warning" class="text-danger d-none">
+                    <i class="fas fa-exclamation-triangle me-2"></i>
+                    This beer is currently assigned to one or more taps.
+                </p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-danger" id="confirm-delete-btn">Delete</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    // Initialize modals
+    const beerModal = new bootstrap.Modal(document.getElementById('beerModal'));
+    const confirmModal = new bootstrap.Modal(document.getElementById('confirmModal'));
+    
+    // Keep track of current beer data
+    let currentBeerId = null;
+    let allBeers = [];
+    let currentSortField = 'Name';
+    let currentSortDirection = 'asc';
+    
+    // Load all beers when page loads
+    loadBeers();
+    
+    // View toggle
+    document.querySelectorAll('#view-toggle button').forEach(button => {
+        button.addEventListener('click', function() {
+            document.querySelectorAll('#view-toggle button').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            this.classList.add('active');
+            
+            const view = this.getAttribute('data-view');
+            if (view === 'grid') {
+                document.getElementById('grid-view').classList.remove('d-none');
+                document.getElementById('table-view').classList.add('d-none');
+            } else {
+                document.getElementById('grid-view').classList.add('d-none');
+                document.getElementById('table-view').classList.remove('d-none');
+            }
+        });
+    });
+    
+    // Add beer button
+    document.getElementById('add-beer-btn').addEventListener('click', function() {
+        // Reset form
+        document.getElementById('beerForm').reset();
+        document.getElementById('beer-id').value = '';
+        document.getElementById('delete-beer-btn').style.display = 'none';
+        
+        // Update modal title
+        document.getElementById('beerModalTitle').textContent = 'Add New Beer';
+        
+        // Show modal
+        beerModal.show();
+    });
+    
+    // Save beer button
+    document.getElementById('save-beer-btn').addEventListener('click', function() {
+        saveBeer();
+    });
+    
+    // Delete beer button (in edit modal)
+    document.getElementById('delete-beer-btn').addEventListener('click', function() {
+        currentBeerId = document.getElementById('beer-id').value;
+        
+        // Check if beer is assigned to any taps
+        fetch(`/api/beers/${currentBeerId}/taps`)
+            .then(response => response.json())
+            .then(taps => {
+                const warningElement = document.getElementById('beer-on-tap-warning');
+                
+                if (taps.length > 0) {
+                    warningElement.classList.remove('d-none');
+                    warningElement.textContent = `This beer is currently assigned to tap${taps.length > 1 ? 's' : ''} #${taps.join(', #')}.`;
+                } else {
+                    warningElement.classList.add('d-none');
+                }
+                
+                beerModal.hide();
+                confirmModal.show();
+            })
+            .catch(error => {
+                console.error('Error checking taps:', error);
+                beerModal.hide();
+                confirmModal.show();
+            });
+    });
+    
+    // Confirm delete button
+    document.getElementById('confirm-delete-btn').addEventListener('click', function() {
+        deleteBeer(currentBeerId);
+        confirmModal.hide();
+    });
+    
+    // Search functionality
+    document.getElementById('beer-search').addEventListener('input', function() {
+        filterBeers();
+    });
+    
+    // Sorting controls event listeners
+    document.querySelectorAll('#sort-controls button').forEach(button => {
+        button.addEventListener('click', function() {
+            // Update active button
+            document.querySelectorAll('#sort-controls button').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            this.classList.add('active');
+            
+            // Set sort field
+            currentSortField = this.getAttribute('data-sort');
+            
+            // Re-render with new sort
+            renderBeers(allBeers);
+        });
+    });
+    
+    // Sort direction toggle
+    document.getElementById('sort-direction').addEventListener('click', function() {
+        // Toggle direction
+        currentSortDirection = currentSortDirection === 'asc' ? 'desc' : 'asc';
+        
+        // Update icon
+        const icon = this.querySelector('i');
+        icon.className = `fas fa-sort-${currentSortDirection === 'asc' ? 'up' : 'down'}`;
+        
+        // Re-render with new sort
+        renderBeers(allBeers);
+    });
+    
+    // Sorting functionality for table headers
+    document.querySelectorAll('.beer-table th[data-sort]').forEach(th => {
+        th.addEventListener('click', function() {
+            const sortField = this.getAttribute('data-sort');
+            
+            // Update sort controls to match table header
+            document.querySelectorAll('#sort-controls button').forEach(btn => {
+                btn.classList.remove('active');
+                if (btn.getAttribute('data-sort') === sortField) {
+                    btn.classList.add('active');
+                }
+            });
+            
+            // Toggle direction if clicking on the same field
+            if (sortField === currentSortField) {
+                currentSortDirection = currentSortDirection === 'asc' ? 'desc' : 'asc';
+            } else {
+                currentSortField = sortField;
+                currentSortDirection = 'asc';
+            }
+            
+            // Update UI indicators
+            document.querySelectorAll('.beer-table th').forEach(header => {
+                header.classList.remove('active');
+                const icon = header.querySelector('i');
+                if (icon) {
+                    icon.className = 'fas fa-sort';
+                }
+            });
+            
+            this.classList.add('active');
+            const icon = this.querySelector('i');
+            if (icon) {
+                icon.className = `fas fa-sort-${currentSortDirection === 'asc' ? 'up' : 'down'}`;
+            }
+            
+            // Update sort direction button
+            const sortDirectionBtn = document.getElementById('sort-direction');
+            sortDirectionBtn.querySelector('i').className = `fas fa-sort-${currentSortDirection === 'asc' ? 'up' : 'down'}`;
+            
+            // Re-render with new sort
+            renderBeers(allBeers);
+        });
+    });
+    
+    // Functions to load and render data
+    function loadBeers() {
+        fetch('/api/beers')
+            .then(response => response.json())
+            .then(beers => {
+                allBeers = beers;
+                renderBeers(beers);
+                document.getElementById('beer-count').textContent = `${beers.length} beer${beers.length !== 1 ? 's' : ''}`;
+            })
+            .catch(error => {
+                console.error('Error loading beers:', error);
+                alert('Failed to load beers. Please try again.');
+            });
+    }
+    
+    function filterBeers() {
+        const searchTerm = document.getElementById('beer-search').value.toLowerCase();
+        
+        if (!searchTerm) {
+            renderBeers(allBeers);
+            return;
+        }
+        
+        const filteredBeers = allBeers.filter(beer => {
+            return (
+                beer.Name.toLowerCase().includes(searchTerm) ||
+                (beer.Description && beer.Description.toLowerCase().includes(searchTerm)) ||
+                (beer.idBeer && beer.idBeer.toString().includes(searchTerm))
+            );
+        });
+        
+        renderBeers(filteredBeers);
+        document.getElementById('beer-count').textContent = `${filteredBeers.length} beer${filteredBeers.length !== 1 ? 's' : ''}`;
+    }
+    
+    function renderBeers(beers) {
+        // Sort beers
+        const sortedBeers = [...beers].sort((a, b) => {
+            let aValue = a[currentSortField];
+            let bValue = b[currentSortField];
+            
+            // Handle nulls
+            if (aValue === null && bValue === null) return 0;
+            if (aValue === null) return currentSortDirection === 'asc' ? 1 : -1;
+            if (bValue === null) return currentSortDirection === 'asc' ? -1 : 1;
+            
+            // Convert to number for numeric fields
+            if (['idBeer', 'ABV', 'IBU', 'Color', 'OriginalGravity', 'FinalGravity'].includes(currentSortField)) {
+                aValue = parseFloat(aValue) || 0;
+                bValue = parseFloat(bValue) || 0;
+            }
+            
+            // Handle dates
+            if (['Brewed', 'Kegged', 'Tapped'].includes(currentSortField)) {
+                aValue = aValue ? new Date(aValue) : new Date(0);
+                bValue = bValue ? new Date(bValue) : new Date(0);
+            }
+            
+            // Compare values
+            if (aValue < bValue) return currentSortDirection === 'asc' ? -1 : 1;
+            if (aValue > bValue) return currentSortDirection === 'asc' ? 1 : -1;
+            return 0;
+        });
+        
+        // Render grid view
+        const gridContainer = document.getElementById('grid-view');
+        gridContainer.innerHTML = '';
+        
+        if (sortedBeers.length === 0) {
+            gridContainer.innerHTML = '<div class="col-12"><div class="alert alert-info">No beers found. Add your first beer or adjust your search.</div></div>';
+        } else {
+            sortedBeers.forEach(beer => {
+                const beerCard = createBeerCard(beer);
+                gridContainer.appendChild(beerCard);
+            });
+        }
+        
+        // Render table view
+        const tableBody = document.getElementById('beer-table-body');
+        tableBody.innerHTML = '';
+        
+        sortedBeers.forEach(beer => {
+            const row = document.createElement('tr');
+            
+            row.innerHTML = `
+                <td>${beer.idBeer}</td>
+                <td>${beer.Name}</td>
+                <td>${beer.Brewed ? (new Date(beer.Brewed).toString() !== 'Invalid Date' ? new Date(beer.Brewed).toLocaleDateString() : '-') : '-'}</td>
+                <td>${beer.Kegged ? (new Date(beer.Kegged).toString() !== 'Invalid Date' ? new Date(beer.Kegged).toLocaleDateString() : '-') : '-'}</td>
+                <td>${beer.Tapped ? (new Date(beer.Tapped).toString() !== 'Invalid Date' ? new Date(beer.Tapped).toLocaleDateString() : '-') : '-'}</td>
+                <td>
+                    <button class="btn btn-sm btn-outline-primary edit-beer" data-beer-id="${beer.idBeer}">
+                        <i class="fas fa-edit"></i> Edit
+                    </button>
+                </td>
+            `;
+            
+            row.querySelector('.edit-beer').addEventListener('click', function() {
+                editBeer(beer.idBeer);
+            });
+            
+            tableBody.appendChild(row);
+        });
+    }
+    
+    function createBeerCard(beer) {
+        const col = document.createElement('div');
+        col.className = 'col-md-6 col-lg-4';
+        
+        col.innerHTML = `
+            <div class="card beer-card">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-start">
+                        <h5 class="card-title mb-3">
+                            <span class="small text-muted">#${beer.idBeer}</span> ${beer.Name}
+                        </h5>
+                        <button class="btn btn-sm btn-outline-primary edit-beer" data-beer-id="${beer.idBeer}">
+                            <i class="fas fa-edit"></i> Edit
+                        </button>
+                    </div>
+                    
+                    <div class="beer-stats">
+                        ${beer.ABV ? `
+                            <div class="beer-stat">
+                                <div class="label">ABV</div>
+                                <div class="value">${beer.ABV}%</div>
+                            </div>
+                        ` : ''}
+                        
+                        ${beer.IBU ? `
+                            <div class="beer-stat">
+                                <div class="label">IBU</div>
+                                <div class="value">${beer.IBU}</div>
+                            </div>
+                        ` : ''}
+                        
+                        ${beer.Color ? `
+                            <div class="beer-stat">
+                                <div class="label">SRM</div>
+                                <div class="value">${beer.Color}</div>
+                            </div>
+                        ` : ''}
+                    </div>
+                    
+                    ${beer.Description ? `
+                        <p class="card-text beer-description">${beer.Description}</p>
+                    ` : ''}
+                    
+                    <div class="beer-dates text-muted mt-2 small">
+                        ${beer.Brewed ? `<div>Brewed: ${new Date(beer.Brewed).toLocaleDateString()}</div>` : ''}
+                        ${beer.Kegged ? `<div>Kegged: ${new Date(beer.Kegged).toLocaleDateString()}</div>` : ''}
+                        ${beer.Tapped ? `<div>Tapped: ${new Date(beer.Tapped).toLocaleDateString()}</div>` : ''}
+                    </div>
+                </div>
+            </div>
+        `;
+        
+        // Add click event for edit button
+        col.querySelector('.edit-beer').addEventListener('click', function() {
+            editBeer(beer.idBeer);
+        });
+        
+        return col;
+    }
+    
+    function editBeer(beerId) {
+        fetch(`/api/beers/${beerId}`)
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('Failed to fetch beer details');
+                }
+                return response.json();
+            })
+            .then(beer => {
+                console.log('Beer details:', beer); // Debug log to see what we're getting
+                
+                // Set form values
+                document.getElementById('beer-id').value = beer.idBeer;
+                document.getElementById('beer-name').value = beer.Name || '';
+                document.getElementById('beer-abv').value = beer.ABV || '';
+                document.getElementById('beer-ibu').value = beer.IBU || '';
+                document.getElementById('beer-color').value = beer.Color || '';
+                document.getElementById('beer-og').value = beer.OriginalGravity || '';
+                document.getElementById('beer-fg').value = beer.FinalGravity || '';
+                document.getElementById('beer-description').value = beer.Description || '';
+                
+                // Format dates properly
+                if (beer.Brewed) {
+                    document.getElementById('beer-brewed').value = beer.Brewed.split('T')[0];
+                } else {
+                    document.getElementById('beer-brewed').value = '';
+                }
+                
+                if (beer.Kegged) {
+                    document.getElementById('beer-kegged').value = beer.Kegged.split('T')[0];
+                } else {
+                    document.getElementById('beer-kegged').value = '';
+                }
+                
+                document.getElementById('beer-notes').value = beer.Notes || '';
+                
+                // Update beer color preview if that function exists
+                if (typeof updateBeerColorPreview === 'function') {
+                    updateBeerColorPreview();
+                }
+                
+                // Update modal title and show delete button
+                document.getElementById('beerModalTitle').textContent = `Edit Beer: ${beer.Name}`;
+                document.getElementById('delete-beer-btn').style.display = 'block';
+                
+                // Get taps using this beer
+                fetch(`/api/beers/${beerId}/taps`)
+                    .then(response => response.json())
+                    .then(taps => {
+                        const deleteBtn = document.getElementById('delete-beer-btn');
+                        
+                        if (taps && taps.length > 0) {
+                            // This beer is assigned to taps, add confirmation
+                            deleteBtn.setAttribute('data-bs-toggle', 'modal');
+                            deleteBtn.setAttribute('data-bs-target', '#confirmModal');
+                            
+                            const tapsList = taps.map(tapId => `Tap #${tapId}`).join(', ');
+                            document.getElementById('confirm-message').innerHTML = 
+                                `This beer is currently assigned to: <strong>${tapsList}</strong>.<br>
+                                Deleting it will remove it from these taps. Continue?`;
+                        } else {
+                            // Beer not assigned to taps, direct delete
+                            deleteBtn.removeAttribute('data-bs-toggle');
+                            deleteBtn.removeAttribute('data-bs-target');
+                            deleteBtn.onclick = () => {
+                                deleteBeer(beerId);
+                                beerModal.hide();
+                            };
+                        }
+                    });
+                
+                // Show modal
+                beerModal.show();
+            })
+            .catch(error => {
+                console.error('Error loading beer details:', error);
+                alert('Failed to load beer details. Please try again.');
+            });
+    }
+    
+    function formatDateForAPI(dateString) {
+        if (!dateString) return null;
+        
+        // If it's already a valid ISO string with time, return it
+        if (dateString.includes('T')) return dateString;
+        
+        // Otherwise, assume it's YYYY-MM-DD and add time
+        return `${dateString}T00:00:00Z`;
+    }
+    
+    function saveBeer() {
+        const beerId = document.getElementById('beer-id').value;
+        const isNew = !beerId;
+        const url = isNew ? '/api/beers' : `/api/beers/${beerId}`;
+        const method = isNew ? 'POST' : 'PUT';
+        
+        const data = {
+            Name: document.getElementById('beer-name').value,
+            ABV: parseFloat(document.getElementById('beer-abv').value) || null,
+            IBU: parseFloat(document.getElementById('beer-ibu').value) || null,
+            Color: parseFloat(document.getElementById('beer-color').value) || null,
+            OriginalGravity: parseFloat(document.getElementById('beer-og').value) || null,
+            FinalGravity: parseFloat(document.getElementById('beer-fg').value) || null,
+            Description: document.getElementById('beer-description').value || null,
+            Brewed: document.getElementById('beer-brewed').value || null,
+            Kegged: document.getElementById('beer-kegged').value || null,
+            Notes: document.getElementById('beer-notes').value || null
+        };
+        
+        console.log('Saving beer data:', data); // Debug log
+        
+        fetch(url, {
+            method: method,
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(data)
+        })
+        .then(response => {
+            if (!response.ok) {
+                return response.json().then(err => { throw err; });
+            }
+            return response.json();
+        })
+        .then(result => {
+            beerModal.hide();
+            loadBeers();
+        })
+        .catch(error => {
+            console.error('Error saving beer:', error);
+            alert(error.error || 'Failed to save beer. Please try again.');
+        });
+    }
+    
+    function deleteBeer(beerId) {
+        fetch(`/api/beers/${beerId}`, {
+            method: 'DELETE'
+        })
+        .then(response => {
+            if (!response.ok) {
+                return response.json().then(err => { throw err; });
+            }
+            return response.json();
+        })
+        .then(result => {
+            loadBeers();
+        })
+        .catch(error => {
+            console.error('Error deleting beer:', error);
+            alert(error.error || 'Failed to delete beer. Please try again.');
+        });
+    }
+
+    // Add this function before the editBeer function
+    function updateBeerColorPreview() {
+        const colorInput = document.getElementById('beer-color');
+        const colorPreview = document.getElementById('beer-color-preview');
+        
+        if (colorInput && colorPreview) {
+            const colorValue = parseFloat(colorInput.value);
+            
+            if (colorValue && !isNaN(colorValue)) {
+                // SRM to color mapping (approximate)
+                let color = '#FFE699'; // Default light color
+                
+                if (colorValue <= 2) {
+                    color = '#FFE699'; // Very pale
+                } else if (colorValue <= 4) {
+                    color = '#FFD878'; // Pale
+                } else if (colorValue <= 6) {
+                    color = '#FFCA5A'; // Gold
+                } else if (colorValue <= 8) {
+                    color = '#FFBF42'; // Amber
+                } else if (colorValue <= 12) {
+                    color = '#FBB123'; // Copper
+                } else if (colorValue <= 16) {
+                    color = '#F8A600'; // Red/Brown
+                } else if (colorValue <= 20) {
+                    color = '#E78A00'; // Brown
+                } else if (colorValue <= 25) {
+                    color = '#D97000'; // Dark Brown
+                } else if (colorValue <= 30) {
+                    color = '#BB5100'; // Very Dark Brown
+                } else if (colorValue <= 40) {
+                    color = '#8D2700'; // Black
+                } else {
+                    color = '#5A1400'; // Black, opaque
+                }
+                
+                colorPreview.style.backgroundColor = color;
+                colorPreview.style.height = '25px';
+                colorPreview.style.borderRadius = '4px';
+            } else {
+                colorPreview.style.backgroundColor = '';
+                colorPreview.style.height = '0';
+            }
+        }
+    }
+
+    // Add event listener for the beer color input
+    document.addEventListener('DOMContentLoaded', function() {
+        const colorInput = document.getElementById('beer-color');
+        if (colorInput) {
+            colorInput.addEventListener('input', updateBeerColorPreview);
+        }
+    });
+
+    // Add this function near the other utility functions
+    function getBeerColorCSS(srm) {
+        // SRM to color mapping (approximate)
+        let color = '#FFE699'; // Default light color
+        
+        if (!srm || isNaN(srm)) {
+            return 'background-color: #eeeeee;'; // No color specified
+        }
+        
+        if (srm <= 2) {
+            color = '#FFE699'; // Very pale
+        } else if (srm <= 4) {
+            color = '#FFD878'; // Pale
+        } else if (srm <= 6) {
+            color = '#FFCA5A'; // Gold
+        } else if (srm <= 8) {
+            color = '#FFBF42'; // Amber
+        } else if (srm <= 12) {
+            color = '#FBB123'; // Copper
+        } else if (srm <= 16) {
+            color = '#F8A600'; // Red/Brown
+        } else if (srm <= 20) {
+            color = '#E78A00'; // Brown
+        } else if (srm <= 25) {
+            color = '#D97000'; // Dark Brown
+        } else if (srm <= 30) {
+            color = '#BB5100'; // Very Dark Brown
+        } else if (srm <= 40) {
+            color = '#8D2700'; // Black
+        } else {
+            color = '#5A1400'; // Black, opaque
+        }
+        
+        return `background-color: ${color};`;
+    }
+
+    // Helper function to format gravity value
+    function formatGravity(gravity) {
+        if (!gravity) return null;
+        // Format as X.XXX with 3 decimal places
+        return parseFloat(gravity).toFixed(3);
+    }
+});
+</script>
+{% endblock %} 

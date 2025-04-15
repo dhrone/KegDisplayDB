@@ -1,0 +1,327 @@
+{% extends "base.html" %}
+
+{% block extra_styles %}
+<style>
+    .action-card {
+        margin-bottom: 20px;
+        transition: all 0.3s ease;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+    }
+    .action-card:hover {
+        box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+    }
+    .card-header {
+        background-color: #f8f9fa;
+        font-weight: bold;
+    }
+    .card-body {
+        padding: 20px;
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+    }
+    .card-content {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+    }
+    .card-actions {
+        margin-top: auto;
+    }
+    .alert-container {
+        display: none;
+        margin-top: 20px;
+    }
+    .progress-bar {
+        transition: width 0.3s ease;
+    }
+    .icon-large {
+        font-size: 2.5rem;
+        margin-bottom: 15px;
+        color: #6c757d;
+    }
+    #import-file-name {
+        font-style: italic;
+        margin-left: 10px;
+    }
+    #confirmation-input {
+        text-transform: uppercase;
+        font-weight: bold;
+    }
+    .card-row {
+        display: flex;
+    }
+    .card-column {
+        display: flex;
+        flex-direction: column;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col">
+        <h1>Database Management</h1>
+        <p class="lead">Manage your beer database with backup, import, and reset options.</p>
+    </div>
+</div>
+
+<div class="row card-row">
+    <!-- Backup Beer Database -->
+    <div class="col-md-4 card-column">
+        <div class="card action-card">
+            <div class="card-header">
+                <i class="fas fa-download me-2"></i> Backup Beers
+            </div>
+            <div class="card-body text-center">
+                <div class="card-content">
+                    <div class="icon-large">
+                        <i class="fas fa-file-export"></i>
+                    </div>
+                    <p>Export all beers to a CSV file for safekeeping.</p>
+                </div>
+                <div class="card-actions">
+                    <button class="btn btn-primary" id="backup-btn">
+                        <i class="fas fa-download me-1"></i> Download Backup
+                    </button>
+                    <div id="backup-alert-container" class="alert-container"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Import to Beer Database -->
+    <div class="col-md-4 card-column">
+        <div class="card action-card">
+            <div class="card-header">
+                <i class="fas fa-upload me-2"></i> Import Beers
+            </div>
+            <div class="card-body text-center">
+                <div class="card-content">
+                    <div class="icon-large">
+                        <i class="fas fa-file-import"></i>
+                    </div>
+                    <p>Import beers from a properly formatted CSV file.</p>
+                </div>
+                <div class="card-actions">
+                    <div class="mb-3">
+                        <label for="import-file" class="form-label visually-hidden">Choose CSV file</label>
+                        <input type="file" class="form-control" id="import-file" accept=".csv">
+                        <div id="import-file-name"></div>
+                    </div>
+                    <button class="btn btn-primary" id="import-btn" disabled>
+                        <i class="fas fa-upload me-1"></i> Import Beers
+                    </button>
+                    <div id="import-progress" class="progress mt-3" style="display: none;">
+                        <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width: 100%"></div>
+                    </div>
+                    <div id="import-alert-container" class="alert-container"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Clear Beer Database -->
+    <div class="col-md-4 card-column">
+        <div class="card action-card">
+            <div class="card-header text-danger">
+                <i class="fas fa-trash-alt me-2"></i> Clear Beer Database
+            </div>
+            <div class="card-body text-center">
+                <div class="card-content">
+                    <div class="icon-large text-danger">
+                        <i class="fas fa-exclamation-triangle"></i>
+                    </div>
+                    <p>Delete all beers from the database. This action cannot be undone!</p>
+                </div>
+                <div class="card-actions">
+                    <div class="mb-3">
+                        <label for="confirmation-input" class="form-label">Type "CONFIRM" to proceed:</label>
+                        <input type="text" class="form-control text-center" id="confirmation-input" placeholder="CONFIRM">
+                    </div>
+                    <button class="btn btn-danger" id="clear-btn" disabled>
+                        <i class="fas fa-trash-alt me-1"></i> Clear Beer Database
+                    </button>
+                    <div id="clear-alert-container" class="alert-container"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Confirmation Modal -->
+<div class="modal fade" id="confirmModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Confirm Action</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p class="lead text-danger">
+                    <i class="fas fa-exclamation-triangle me-2"></i>
+                    Are you sure you want to clear the entire beer database?
+                </p>
+                <p>This will remove all beer entries and clear all tap assignments. This action cannot be undone!</p>
+                <p>We recommend making a backup before proceeding.</p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-danger" id="confirm-clear-btn">
+                    <i class="fas fa-trash-alt me-1"></i> Yes, Clear Database
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    // Initialize modal
+    const confirmModal = new bootstrap.Modal(document.getElementById('confirmModal'));
+    
+    // Backup functionality
+    document.getElementById('backup-btn').addEventListener('click', function() {
+        // Direct download by redirecting to the backup API
+        window.location.href = '/api/beers/backup';
+        
+        // Show success message
+        showAlert('backup-alert-container', 'success', 'Backup download initiated. Check your downloads folder.');
+    });
+    
+    // Import file selection
+    document.getElementById('import-file').addEventListener('change', function() {
+        const fileName = this.files[0]?.name;
+        const importBtn = document.getElementById('import-btn');
+        
+        if (fileName) {
+            document.getElementById('import-file-name').textContent = 'Selected: ' + fileName;
+            importBtn.disabled = false;
+        } else {
+            document.getElementById('import-file-name').textContent = '';
+            importBtn.disabled = true;
+        }
+    });
+    
+    // Import functionality
+    document.getElementById('import-btn').addEventListener('click', function() {
+        const fileInput = document.getElementById('import-file');
+        if (!fileInput.files[0]) {
+            showAlert('import-alert-container', 'danger', 'Please select a CSV file to import.');
+            return;
+        }
+        
+        // Show progress bar
+        document.getElementById('import-progress').style.display = 'block';
+        
+        // Create form data
+        const formData = new FormData();
+        formData.append('file', fileInput.files[0]);
+        
+        // Send import request
+        fetch('/api/beers/import', {
+            method: 'POST',
+            body: formData
+        })
+        .then(response => {
+            if (!response.ok) {
+                return response.json().then(err => { throw err; });
+            }
+            return response.json();
+        })
+        .then(result => {
+            // Hide progress bar
+            document.getElementById('import-progress').style.display = 'none';
+            
+            let message = `Successfully imported ${result.imported_count} beers.`;
+            
+            if (result.errors && result.errors.length > 0) {
+                message += ` There were ${result.errors.length} errors during import.`;
+                console.error('Import errors:', result.errors);
+            }
+            
+            showAlert('import-alert-container', 'success', message);
+            
+            // Reset file input
+            fileInput.value = '';
+            document.getElementById('import-file-name').textContent = '';
+            document.getElementById('import-btn').disabled = true;
+        })
+        .catch(error => {
+            // Hide progress bar
+            document.getElementById('import-progress').style.display = 'none';
+            
+            console.error('Error importing beers:', error);
+            showAlert('import-alert-container', 'danger', 'Error: ' + (error.error || 'Failed to import beers'));
+        });
+    });
+    
+    // Confirmation input for clear database
+    document.getElementById('confirmation-input').addEventListener('input', function() {
+        const clearBtn = document.getElementById('clear-btn');
+        clearBtn.disabled = this.value.toUpperCase() !== 'CONFIRM';
+    });
+    
+    // Clear database confirmation
+    document.getElementById('clear-btn').addEventListener('click', function() {
+        confirmModal.show();
+    });
+    
+    // Clear database execution
+    document.getElementById('confirm-clear-btn').addEventListener('click', function() {
+        // Hide modal
+        confirmModal.hide();
+        
+        // Show progress
+        showAlert('clear-alert-container', 'info', 'Clearing database...');
+        
+        // Send clear request
+        fetch('/api/beers/clear', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                confirmation: 'CONFIRM'
+            })
+        })
+        .then(response => {
+            if (!response.ok) {
+                return response.json().then(err => { throw err; });
+            }
+            return response.json();
+        })
+        .then(result => {
+            showAlert('clear-alert-container', 'success', result.message);
+            
+            // Reset confirmation input
+            document.getElementById('confirmation-input').value = '';
+            document.getElementById('clear-btn').disabled = true;
+        })
+        .catch(error => {
+            console.error('Error clearing database:', error);
+            showAlert('clear-alert-container', 'danger', 'Error: ' + (error.error || 'Failed to clear database'));
+        });
+    });
+    
+    // Helper function to show alerts
+    function showAlert(containerId, type, message) {
+        const container = document.getElementById(containerId);
+        container.innerHTML = `
+            <div class="alert alert-${type} alert-dismissible fade show" role="alert">
+                ${message}
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            </div>
+        `;
+        container.style.display = 'block';
+        
+        // Scroll to the alert
+        container.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+});
+</script>
+{% endblock %} 
