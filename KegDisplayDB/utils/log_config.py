@@ -5,7 +5,7 @@ Logging configuration for KegDisplayDB
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, UTC
 
 def configure_logging(log_level='INFO'):
     """
@@ -38,7 +38,7 @@ def configure_logging(log_level='INFO'):
     console_handler.setLevel(numeric_level)
     
     # Create file handler
-    log_date = datetime.now().strftime("%Y-%m-%d")
+    log_date = datetime.now(UTC).strftime("%Y-%m-%d")
     log_file = os.path.join(logs_dir, f"kegdisplay-{log_date}.log")
     file_handler = logging.FileHandler(log_file)
     file_handler.setLevel(numeric_level)

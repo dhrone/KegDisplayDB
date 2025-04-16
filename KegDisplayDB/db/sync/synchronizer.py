@@ -9,7 +9,7 @@ import time
 import os
 import shutil
 import socket
-from datetime import datetime
+from datetime import datetime, UTC
 import hashlib
 
 from .protocol import SyncProtocol
@@ -479,7 +479,7 @@ class DatabaseSynchronizer:
                         conn.execute('''
                             INSERT OR REPLACE INTO version (id, timestamp, hash)
                             VALUES (1, ?, ?)
-                        ''', (datetime.now().isoformat(), peer_version.get('hash')))
+                        ''', (datetime.now(UTC).isoformat(), peer_version.get('hash')))
                         conn.commit()
             else:
                 logger.info(f"Peer {peer_ip} has no changes for us")

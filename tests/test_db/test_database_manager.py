@@ -2,7 +2,7 @@ import unittest
 import tempfile
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, UTC
 
 from KegDisplayDB.db.database import DatabaseManager
 
@@ -55,7 +55,7 @@ class TestDatabaseManager(unittest.TestCase):
         self.assertIsNotNone(beer_id1, "Failed to add beer with only name")
         
         # Beer with all fields
-        now = datetime.now()
+        now = datetime.now(UTC)
         beer_id2 = self.db_manager.add_beer(
             name="Complete Beer",
             abv=5.5,

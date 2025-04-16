@@ -207,16 +207,16 @@ class DatabaseManager:
         """Add a new beer to the database
         
         Args:
-            name: Name of the beer (required)
+            name: Beer name
             abv: Alcohol by volume percentage
-            ibu: International Bitterness Units
-            color: Beer color (SRM)
+            ibu: International bitterness units
+            color: SRM color
             og: Original gravity
             fg: Final gravity
             description: Beer description
-            brewed: Date brewed (ISO format string or datetime object)
-            kegged: Date kegged (ISO format string or datetime object)
-            tapped: Date tapped (ISO format string or datetime object)
+            brewed: Brew date (datetime object or string)
+            kegged: Keg date (datetime object or string)
+            tapped: Tap date (datetime object or string)
             notes: Additional notes
             
         Returns:
@@ -224,10 +224,19 @@ class DatabaseManager:
         """
         # Convert datetime objects to strings if needed
         if isinstance(brewed, datetime):
+            # Ensure datetime is in UTC
+            if getattr(brewed, 'tzinfo', None) is None:
+                brewed = brewed.replace(tzinfo=UTC)
             brewed = brewed.strftime("%Y-%m-%d %H:%M:%S")
         if isinstance(kegged, datetime):
+            # Ensure datetime is in UTC
+            if getattr(kegged, 'tzinfo', None) is None:
+                kegged = kegged.replace(tzinfo=UTC)
             kegged = kegged.strftime("%Y-%m-%d %H:%M:%S")
         if isinstance(tapped, datetime):
+            # Ensure datetime is in UTC
+            if getattr(tapped, 'tzinfo', None) is None:
+                tapped = tapped.replace(tzinfo=UTC)
             tapped = tapped.strftime("%Y-%m-%d %H:%M:%S")
         
         with self.get_connection() as conn:
@@ -258,10 +267,19 @@ class DatabaseManager:
         """
         # Convert datetime objects to strings if needed
         if isinstance(brewed, datetime):
+            # Ensure datetime is in UTC
+            if getattr(brewed, 'tzinfo', None) is None:
+                brewed = brewed.replace(tzinfo=UTC)
             brewed = brewed.strftime("%Y-%m-%d %H:%M:%S")
         if isinstance(kegged, datetime):
+            # Ensure datetime is in UTC
+            if getattr(kegged, 'tzinfo', None) is None:
+                kegged = kegged.replace(tzinfo=UTC)
             kegged = kegged.strftime("%Y-%m-%d %H:%M:%S")
         if isinstance(tapped, datetime):
+            # Ensure datetime is in UTC
+            if getattr(tapped, 'tzinfo', None) is None:
+                tapped = tapped.replace(tzinfo=UTC)
             tapped = tapped.strftime("%Y-%m-%d %H:%M:%S")
         
         # First get the current values
