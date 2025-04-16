@@ -190,13 +190,13 @@ class ChangeTracker:
                     if row:
                         timestamp, stored_hash = row
                         
-                        # Update the hash if it's changed or not set
-                        if not stored_hash or stored_hash != content_hash:
-                            cursor.execute(
-                                "UPDATE version SET hash = ? WHERE id = 1", 
-                                (content_hash,)
-                            )
-                            conn.commit()
+                        # Always update the hash to ensure it's correct
+                        # This guarantees the hash reflects the current database state
+                        cursor.execute(
+                            "UPDATE version SET hash = ? WHERE id = 1", 
+                            (content_hash,)
+                        )
+                        conn.commit()
                     else:
                         timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
                         cursor.execute(

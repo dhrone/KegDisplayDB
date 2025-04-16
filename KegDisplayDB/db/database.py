@@ -578,6 +578,9 @@ class DatabaseManager:
                     )
                 ''')
                 
+                # Track the latest timestamp from applied changes
+                latest_timestamp = None
+                
                 # Apply each change
                 for change in changes:
                     if len(change) < 6:  # Should have (table_name, operation, row_id, timestamp, content, content_hash)
@@ -585,6 +588,10 @@ class DatabaseManager:
                         continue
                         
                     table_name, operation, row_id, timestamp, content, content_hash = change
+                    
+                    # Track latest timestamp
+                    if latest_timestamp is None or timestamp > latest_timestamp:
+                        latest_timestamp = timestamp
                     
                     # Convert content to string if it's a dictionary
                     if isinstance(content, dict):
@@ -597,167 +604,60 @@ class DatabaseManager:
                         logger.warning(f"Content hash mismatch for change: {change}")
                         continue
                     
-                    # Apply the change
-                    if operation == 'INSERT':
-                        if table_name == 'beers':
-                            # Parse the content from JSON string to dict if it's a string
-                            if isinstance(content, str):
-                                try:
-                                    content_dict = json.loads(content)
-                                    # Check if content is a serialized row (list) rather than a dictionary
-                                    if isinstance(content_dict, list):
-                                        # Map values from list to appropriate column positions
-                                        # Assuming format is [idBeer, Name, ABV, IBU, Color, OriginalGravity, FinalGravity, Description, etc.]
-                                        conn.execute('''
-                                            INSERT OR REPLACE INTO beers (idBeer, Name, ABV, IBU, Color, OriginalGravity, 
-                                            FinalGravity, Description, Brewed, Kegged, Tapped, Notes)
-                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                        ''', (row_id, content_dict[1] if len(content_dict) > 1 else None, 
-                                              content_dict[2] if len(content_dict) > 2 else None,
-                                              content_dict[3] if len(content_dict) > 3 else None, 
-                                              content_dict[4] if len(content_dict) > 4 else None,
-                                              content_dict[5] if len(content_dict) > 5 else None,
-                                              content_dict[6] if len(content_dict) > 6 else None,
-                                              content_dict[7] if len(content_dict) > 7 else None,
-                                              content_dict[8] if len(content_dict) > 8 else None,
-                                              content_dict[9] if len(content_dict) > 9 else None,
-                                              content_dict[10] if len(content_dict) > 10 else None,
-                                              content_dict[11] if len(content_dict) > 11 else None))
-                                    else:
-                                        # It's a dictionary, use .get()
-                                        conn.execute('''
-                                            INSERT OR REPLACE INTO beers (idBeer, Name, ABV, IBU, Color, OriginalGravity, 
-                                            FinalGravity, Description, Brewed, Kegged, Tapped, Notes)
-                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                        ''', (row_id, content_dict.get('name'), content_dict.get('abv'),
-                                            content_dict.get('ibu'), content_dict.get('color'), content_dict.get('og'),
-                                            content_dict.get('fg'), content_dict.get('description'),
-                                            content_dict.get('brewed'), content_dict.get('kegged'),
-                                            content_dict.get('tapped'), content_dict.get('notes')))
-                                except json.JSONDecodeError:
-                                    logger.error(f"Failed to parse content as JSON: {content}")
-                                    continue
+                    try:
+                        # Parse content if it's JSON
+                        try:
+                            content_data = json.loads(content_str)
+                        except (json.JSONDecodeError, TypeError):
+                            logger.error(f"Error parsing content JSON: {content_str}")
+                            continue
+                        
+                        # Apply the change based on the operation type
+                        if operation == "INSERT":
+                            # Check if the row already exists
+                            cursor = conn.cursor()
+                            cursor.execute(f"SELECT 1 FROM {table_name} WHERE rowid = ?", (row_id,))
+                            if cursor.fetchone():
+                                # If row exists, use UPDATE instead
+                                logger.warning(f"Row {row_id} already exists in {table_name}, using UPDATE instead")
+                                self._apply_update_change(conn, table_name, row_id, content_data)
                             else:
-                                # Content is already a dictionary
-                                conn.execute('''
-                                    INSERT OR REPLACE INTO beers (idBeer, Name, ABV, IBU, Color, OriginalGravity, 
-                                    FinalGravity, Description, Brewed, Kegged, Tapped, Notes)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                ''', (row_id, content.get('name'), content.get('abv'),
-                                    content.get('ibu'), content.get('color'), content.get('og'),
-                                    content.get('fg'), content.get('description'),
-                                    content.get('brewed'), content.get('kegged'),
-                                    content.get('tapped'), content.get('notes')))
-                        elif table_name == 'taps':
-                            # Parse the content from JSON string to dict if it's a string
-                            if isinstance(content, str):
-                                try:
-                                    content_dict = json.loads(content)
-                                    # Check if content is a serialized row (list) rather than a dictionary
-                                    if isinstance(content_dict, list):
-                                        conn.execute('''
-                                            INSERT OR REPLACE INTO taps (idTap, idBeer)
-                                            VALUES (?, ?)
-                                        ''', (row_id, content_dict[1] if len(content_dict) > 1 else None))
-                                    else:
-                                        # It's a dictionary, use .get()
-                                        conn.execute('''
-                                            INSERT OR REPLACE INTO taps (idTap, idBeer)
-                                            VALUES (?, ?)
-                                        ''', (row_id, content_dict.get('beer_id')))
-                                except json.JSONDecodeError:
-                                    logger.error(f"Failed to parse content as JSON: {content}")
-                                    continue
-                            else:
-                                # Content is already a dictionary
-                                conn.execute('''
-                                    INSERT OR REPLACE INTO taps (idTap, idBeer)
-                                    VALUES (?, ?)
-                                ''', (row_id, content.get('beer_id')))
-                    elif operation == 'UPDATE':
-                        if table_name == 'beers':
-                            # Parse the content from JSON string to dict if it's a string
-                            if isinstance(content, str):
-                                try:
-                                    content_dict = json.loads(content)
-                                    # Check if content is a serialized row (list) rather than a dictionary
-                                    if isinstance(content_dict, list):
-                                        # Map values from list to appropriate column positions
-                                        conn.execute('''
-                                            UPDATE beers SET Name=?, ABV=?, IBU=?, Color=?, OriginalGravity=?, 
-                                            FinalGravity=?, Description=?, Brewed=?, Kegged=?, Tapped=?, Notes=?
-                                            WHERE idBeer=?
-                                        ''', (content_dict[1] if len(content_dict) > 1 else None, 
-                                              content_dict[2] if len(content_dict) > 2 else None,
-                                              content_dict[3] if len(content_dict) > 3 else None, 
-                                              content_dict[4] if len(content_dict) > 4 else None,
-                                              content_dict[5] if len(content_dict) > 5 else None,
-                                              content_dict[6] if len(content_dict) > 6 else None,
-                                              content_dict[7] if len(content_dict) > 7 else None,
-                                              content_dict[8] if len(content_dict) > 8 else None,
-                                              content_dict[9] if len(content_dict) > 9 else None,
-                                              content_dict[10] if len(content_dict) > 10 else None,
-                                              content_dict[11] if len(content_dict) > 11 else None,
-                                              row_id))
-                                    else:
-                                        # It's a dictionary, use .get()
-                                        conn.execute('''
-                                            UPDATE beers SET Name=?, ABV=?, IBU=?, Color=?, OriginalGravity=?, 
-                                            FinalGravity=?, Description=?, Brewed=?, Kegged=?, Tapped=?, Notes=?
-                                            WHERE idBeer=?
-                                        ''', (content_dict.get('name'), content_dict.get('abv'),
-                                            content_dict.get('ibu'), content_dict.get('color'), content_dict.get('og'),
-                                            content_dict.get('fg'), content_dict.get('description'),
-                                            content_dict.get('brewed'), content_dict.get('kegged'),
-                                            content_dict.get('tapped'), content_dict.get('notes'), row_id))
-                                except json.JSONDecodeError:
-                                    logger.error(f"Failed to parse content as JSON: {content}")
-                                    continue
-                            else:
-                                # Content is already a dictionary
-                                conn.execute('''
-                                    UPDATE beers SET Name=?, ABV=?, IBU=?, Color=?, OriginalGravity=?, 
-                                    FinalGravity=?, Description=?, Brewed=?, Kegged=?, Tapped=?, Notes=?
-                                    WHERE idBeer=?
-                                ''', (content.get('name'), content.get('abv'),
-                                    content.get('ibu'), content.get('color'), content.get('og'),
-                                    content.get('fg'), content.get('description'),
-                                    content.get('brewed'), content.get('kegged'),
-                                    content.get('tapped'), content.get('notes'), row_id))
-                        elif table_name == 'taps':
-                            # Parse the content from JSON string to dict if it's a string
-                            if isinstance(content, str):
-                                try:
-                                    content_dict = json.loads(content)
-                                    # Check if content is a serialized row (list) rather than a dictionary
-                                    if isinstance(content_dict, list):
-                                        conn.execute('''
-                                            UPDATE taps SET idBeer=?
-                                            WHERE idTap=?
-                                        ''', (content_dict[1] if len(content_dict) > 1 else None, row_id))
-                                    else:
-                                        # It's a dictionary, use .get()
-                                        conn.execute('''
-                                            UPDATE taps SET idBeer=?
-                                            WHERE idTap=?
-                                        ''', (content_dict.get('beer_id'), row_id))
-                                except json.JSONDecodeError:
-                                    logger.error(f"Failed to parse content as JSON: {content}")
-                                    continue
-                            else:
-                                # Content is already a dictionary
-                                conn.execute('''
-                                    UPDATE taps SET idBeer=?
-                                    WHERE idTap=?
-                                ''', (content.get('beer_id'), row_id))
-                    elif operation == 'DELETE':
-                        conn.execute(f'DELETE FROM {table_name} WHERE id{table_name[:-1]}=?', (row_id,))
+                                # Otherwise use INSERT
+                                self._apply_insert_change(conn, table_name, row_id, content_data)
+                        
+                        elif operation == "UPDATE":
+                            self._apply_update_change(conn, table_name, row_id, content_data)
+                        
+                        elif operation == "DELETE":
+                            self._apply_delete_change(conn, table_name, row_id)
+                        
+                        else:
+                            logger.warning(f"Unknown operation type: {operation}")
+                            continue
+                        
+                    except Exception as e:
+                        logger.error(f"Error applying change: {e}")
+                        continue
                     
                     # Log the change
                     conn.execute('''
                         INSERT INTO change_log (table_name, operation, row_id, timestamp, content, content_hash)
                         VALUES (?, ?, ?, ?, ?, ?)
                     ''', (table_name, operation, row_id, timestamp, content_str, content_hash))
+                
+                # Update the version table with the latest timestamp
+                if latest_timestamp:
+                    # Note: We don't update the hash here since that will be recalculated
+                    # when get_db_version is called
+                    conn.execute('''
+                        UPDATE version SET timestamp = ? WHERE id = 1
+                    ''', (latest_timestamp,))
+                    
+                    # If no row was updated, insert one
+                    if conn.total_changes == 0:
+                        conn.execute('''
+                            INSERT INTO version (id, timestamp, hash) VALUES (1, ?, '0')
+                        ''', (latest_timestamp,))
                 
                 # Commit transaction
                 conn.commit()
@@ -825,4 +725,121 @@ class DatabaseManager:
                 
         except Exception as e:
             logger.error(f"Error importing database: {e}")
-            return False 
+            return False
+    
+    def _apply_insert_change(self, conn, table_name, row_id, content_data):
+        """Apply an INSERT change to the database
+        
+        Args:
+            conn: Database connection
+            table_name: Name of the table
+            row_id: ID of the row
+            content_data: Content data (list or dict)
+        """
+        if table_name == 'beers':
+            if isinstance(content_data, list):
+                # Map values from list to appropriate column positions
+                # Assuming format is [idBeer, Name, ABV, IBU, Color, OriginalGravity, FinalGravity, Description, etc.]
+                conn.execute('''
+                    INSERT OR REPLACE INTO beers (idBeer, Name, ABV, IBU, Color, OriginalGravity, 
+                    FinalGravity, Description, Brewed, Kegged, Tapped, Notes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (row_id, content_data[1] if len(content_data) > 1 else None, 
+                      content_data[2] if len(content_data) > 2 else None,
+                      content_data[3] if len(content_data) > 3 else None, 
+                      content_data[4] if len(content_data) > 4 else None,
+                      content_data[5] if len(content_data) > 5 else None,
+                      content_data[6] if len(content_data) > 6 else None,
+                      content_data[7] if len(content_data) > 7 else None,
+                      content_data[8] if len(content_data) > 8 else None,
+                      content_data[9] if len(content_data) > 9 else None,
+                      content_data[10] if len(content_data) > 10 else None,
+                      content_data[11] if len(content_data) > 11 else None))
+            else:
+                # It's a dictionary, use .get()
+                conn.execute('''
+                    INSERT OR REPLACE INTO beers (idBeer, Name, ABV, IBU, Color, OriginalGravity, 
+                    FinalGravity, Description, Brewed, Kegged, Tapped, Notes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (row_id, content_data.get('name'), content_data.get('abv'),
+                    content_data.get('ibu'), content_data.get('color'), content_data.get('og'),
+                    content_data.get('fg'), content_data.get('description'),
+                    content_data.get('brewed'), content_data.get('kegged'),
+                    content_data.get('tapped'), content_data.get('notes')))
+        elif table_name == 'taps':
+            if isinstance(content_data, list):
+                conn.execute('''
+                    INSERT OR REPLACE INTO taps (idTap, idBeer)
+                    VALUES (?, ?)
+                ''', (row_id, content_data[1] if len(content_data) > 1 else None))
+            else:
+                # It's a dictionary, use .get()
+                conn.execute('''
+                    INSERT OR REPLACE INTO taps (idTap, idBeer)
+                    VALUES (?, ?)
+                ''', (row_id, content_data.get('beer_id')))
+                
+    def _apply_update_change(self, conn, table_name, row_id, content_data):
+        """Apply an UPDATE change to the database
+        
+        Args:
+            conn: Database connection
+            table_name: Name of the table
+            row_id: ID of the row
+            content_data: Content data (list or dict)
+        """
+        if table_name == 'beers':
+            if isinstance(content_data, list):
+                # Map values from list to appropriate column positions
+                conn.execute('''
+                    UPDATE beers SET Name=?, ABV=?, IBU=?, Color=?, OriginalGravity=?, 
+                    FinalGravity=?, Description=?, Brewed=?, Kegged=?, Tapped=?, Notes=?
+                    WHERE idBeer=?
+                ''', (content_data[1] if len(content_data) > 1 else None, 
+                      content_data[2] if len(content_data) > 2 else None,
+                      content_data[3] if len(content_data) > 3 else None, 
+                      content_data[4] if len(content_data) > 4 else None,
+                      content_data[5] if len(content_data) > 5 else None,
+                      content_data[6] if len(content_data) > 6 else None,
+                      content_data[7] if len(content_data) > 7 else None,
+                      content_data[8] if len(content_data) > 8 else None,
+                      content_data[9] if len(content_data) > 9 else None,
+                      content_data[10] if len(content_data) > 10 else None,
+                      content_data[11] if len(content_data) > 11 else None,
+                      row_id))
+            else:
+                # It's a dictionary, use .get()
+                conn.execute('''
+                    UPDATE beers SET Name=?, ABV=?, IBU=?, Color=?, OriginalGravity=?, 
+                    FinalGravity=?, Description=?, Brewed=?, Kegged=?, Tapped=?, Notes=?
+                    WHERE idBeer=?
+                ''', (content_data.get('name'), content_data.get('abv'),
+                    content_data.get('ibu'), content_data.get('color'), content_data.get('og'),
+                    content_data.get('fg'), content_data.get('description'),
+                    content_data.get('brewed'), content_data.get('kegged'),
+                    content_data.get('tapped'), content_data.get('notes'), row_id))
+        elif table_name == 'taps':
+            if isinstance(content_data, list):
+                conn.execute('''
+                    UPDATE taps SET idBeer=?
+                    WHERE idTap=?
+                ''', (content_data[1] if len(content_data) > 1 else None, row_id))
+            else:
+                # It's a dictionary, use .get()
+                conn.execute('''
+                    UPDATE taps SET idBeer=?
+                    WHERE idTap=?
+                ''', (content_data.get('beer_id'), row_id))
+                
+    def _apply_delete_change(self, conn, table_name, row_id):
+        """Apply a DELETE change to the database
+        
+        Args:
+            conn: Database connection
+            table_name: Name of the table
+            row_id: ID of the row
+        """
+        if table_name == 'beers':
+            conn.execute('DELETE FROM beers WHERE idBeer=?', (row_id,))
+        elif table_name == 'taps':
+            conn.execute('DELETE FROM taps WHERE idTap=?', (row_id,)) 

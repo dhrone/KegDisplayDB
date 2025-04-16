@@ -229,9 +229,14 @@ class DatabaseSynchronizer:
         
         # Compare versions
         our_version = self.change_tracker.get_db_version()
-        if peer_version != our_version:
+        if peer_version.get('hash') != our_version.get('hash'):
             logger.info(f"Detected version change from {peer_ip}, requesting sync")
+            logger.debug(f"Peer version hash: {peer_version.get('hash')}")
+            logger.debug(f"Our version hash: {our_version.get('hash')}")
             self._request_sync(peer_ip, peer_sync_port)
+        else:
+            logger.debug(f"No version change detected from {peer_ip}")
+            logger.debug(f"Both using version hash: {our_version.get('hash')}")
     
     def _handle_sync_request(self, client_socket, message, addr):
         """Handle sync request from peer
@@ -423,9 +428,12 @@ class DatabaseSynchronizer:
                 logger.info(f"Applying {len(changes)} changes to our database")
                 self.db_manager.apply_sync_changes(changes)
                 
+                # Force recalculation of our database version after applying changes
+                our_version = self.change_tracker.get_db_version()
+                logger.info(f"Our version after applying changes: {our_version}")
+                
                 # Verify versions match after sync
                 peer_version = response.get('version')
-                our_version = self.change_tracker.get_db_version()
                 
                 if peer_version.get('hash') != our_version.get('hash'):
                     logger.error(f"Version mismatch after sync with {peer_ip}")
@@ -436,7 +444,7 @@ class DatabaseSynchronizer:
                         conn.rollback()
                 else:
                     logger.info(f"Successfully synced with {peer_ip}, versions match")
-                    # Only update our version if the sync was successful
+                    # Only update our version timestamp if the sync was successful
                     with self.db_manager.get_connection() as conn:
                         conn.execute('''
                             INSERT OR REPLACE INTO version (id, timestamp, hash)
@@ -716,6 +724,11 @@ class DatabaseSynchronizer:
                 try:
                     self.db_manager.apply_sync_changes(changes)
                     logger.info(f"Successfully applied {len(changes)} changes from peer")
+                    
+                    # Update our database version after applying changes
+                    our_new_version = self.change_tracker.get_db_version()
+                    logger.info(f"Updated our version to: {our_new_version} after applying changes")
+                    
                 except Exception as e:
                     logger.error(f"Error applying test mode changes: {e}")
                     raise
