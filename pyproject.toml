@@ -27,6 +27,8 @@ pytest-cov = "^6.1.1"
 
 [tool.poetry.scripts]
 passwd = "KegDisplayDB.utils.passwd:main"
+web = "KegDisplayDB.web.__main__:main"
+dbsync = "KegDisplayDB.dbsync.__main__:main"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
