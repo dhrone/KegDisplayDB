@@ -25,6 +25,9 @@ flake8 = "^7.0.0"
 coverage = "^7.7.1"
 pytest-cov = "^6.1.1"
 
+[tool.poetry.scripts]
+passwd = "KegDisplayDB.utils.passwd:main"
+
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
