@@ -30,18 +30,19 @@ class TestChangeTracker(unittest.TestCase):
     
     def test_initialize_tracking(self):
         """Test that change tracking tables are properly initialized."""
+        # Re-initialize tracking tables
+        self.change_tracker.initialize_tracking()
+
+        # Check that tables exist
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            
-            # Check change_log table
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='change_log'")
-            self.assertIsNotNone(cursor.fetchone(), "change_log table not created")
+            self.assertIsNotNone(cursor.fetchone(), "change_log table missing")
             
-            # Check version table
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='version'")
-            self.assertIsNotNone(cursor.fetchone(), "version table not created")
+            self.assertIsNotNone(cursor.fetchone(), "version table missing")
             
-            # Check change_log table structure
+            # Check change_log has the correct columns
             cursor.execute("PRAGMA table_info(change_log)")
             columns = cursor.fetchall()
             column_names = [col[1] for col in columns]
@@ -56,7 +57,7 @@ class TestChangeTracker(unittest.TestCase):
             self.assertEqual(count, 1, "version table should have exactly one record")
             
             # Check version table has a timestamp
-            cursor.execute("SELECT last_modified FROM version")
+            cursor.execute("SELECT timestamp FROM version")
             timestamp = cursor.fetchone()[0]
             self.assertIsNotNone(timestamp, "version table should have a timestamp")
     

@@ -549,7 +549,21 @@ def log_change(conn, table_name, operation, row_id):
     ''', (table_name, operation, row_id, timestamp, content_hash))
     
     # Update version timestamp
-    cursor.execute("UPDATE version SET last_modified = ?", (timestamp,))
+    try:
+        # Update timestamp in the version table
+        cursor.execute(
+            "UPDATE version SET timestamp = ? WHERE id = 1",
+            (timestamp,)
+        )
+        if cursor.rowcount == 0:
+            # If no rows affected, insert a new row
+            cursor.execute(
+                "INSERT OR REPLACE INTO version (id, timestamp, hash) VALUES (1, ?, ?)",
+                (timestamp, "0")
+            )
+    except sqlite3.Error as e:
+        logger.error(f"Error updating version table: {e}")
+    
     conn.commit()
     
     # Notify peers about the change if sync is enabled

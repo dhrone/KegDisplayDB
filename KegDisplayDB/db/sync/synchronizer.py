@@ -687,9 +687,11 @@ class DatabaseSynchronizer:
             # Get our last known timestamp
             our_version = self.change_tracker.get_db_version()
             last_timestamp = our_version.get('timestamp', '1970-01-01T00:00:00Z')
+            logger.info(f"Syncing with peer. Our last timestamp: {last_timestamp}")
             
             # Get peer version
             peer_version = peer.change_tracker.get_db_version()
+            logger.info(f"Peer version: {peer_version}")
             
             # Skip if versions are identical
             if our_version.get('hash') == peer_version.get('hash'):
@@ -698,27 +700,24 @@ class DatabaseSynchronizer:
             
             # Get changes from peer since our last timestamp
             changes = peer.change_tracker.get_changes_since(last_timestamp)
+            logger.info(f"Got {len(changes)} changes from peer in test mode")
+            
+            # Log details of changes for debugging
+            for i, change in enumerate(changes):
+                if len(change) >= 6:  # Should have (table_name, operation, row_id, timestamp, content, content_hash)
+                    table_name, operation, row_id, timestamp, content, content_hash = change
+                    logger.info(f"Change {i+1}: {operation} on {table_name} row {row_id} at {timestamp}")
+                    logger.debug(f"Content: {content}")
+                else:
+                    logger.warning(f"Invalid change format at index {i}: {change}")
             
             if changes:
-                logger.info(f"Got {len(changes)} changes from peer in test mode")
-                
-                # Create a temporary database for validation
-                temp_db_path = f"{self.db_manager.db_path}.temp"
+                # Apply the changes directly to the database
                 try:
-                    # Copy the current database to temp
-                    shutil.copy2(self.db_manager.db_path, temp_db_path)
-                    
-                    # Apply the changes through database manager API
-                    self.db_manager.apply_sync_changes(changes, temp_db_path)
-                    
-                    # Clean up temp file
-                    if os.path.exists(temp_db_path):
-                        os.remove(temp_db_path)
-                        
+                    self.db_manager.apply_sync_changes(changes)
+                    logger.info(f"Successfully applied {len(changes)} changes from peer")
                 except Exception as e:
                     logger.error(f"Error applying test mode changes: {e}")
-                    if os.path.exists(temp_db_path):
-                        os.remove(temp_db_path)
                     raise
             else:
                 logger.info("No changes to apply from peer in test mode")

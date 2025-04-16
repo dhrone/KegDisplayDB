@@ -36,6 +36,10 @@ class SyncedDatabase:
                 self.network
             )
             self.synchronizer.start()
+        else:
+            # Initialize synchronizer with mock network for test mode
+            # The actual NetworkManager will be mocked in tests
+            self.synchronizer = None
     
     def add_test_peer(self, peer):
         """Add a peer for test mode synchronization"""
@@ -48,8 +52,10 @@ class SyncedDatabase:
         if self.test_mode:
             # In test mode, directly sync with test peers
             for peer in self.test_peers:
-                if peer != self:
-                    self.synchronizer._sync_with_peer(peer)
+                if peer != self and hasattr(peer, 'synchronizer') and peer.synchronizer:
+                    # Only sync with peer if both have synchronizers
+                    if hasattr(self, 'synchronizer') and self.synchronizer:
+                        self.synchronizer._sync_with_peer(peer)
         else:
             # Use synchronizer to broadcast update
             self.synchronizer.notify_update()

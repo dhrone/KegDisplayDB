@@ -49,16 +49,19 @@ class ChangeTracker:
             # Create version table if it doesn't exist
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS version (
-                    last_modified TEXT
+                    id INTEGER PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    hash TEXT NOT NULL
                 )
             ''')
             
             # Initialize version table if empty
             cursor.execute("SELECT COUNT(*) FROM version")
             if cursor.fetchone()[0] == 0:
+                now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
                 cursor.execute(
-                    "INSERT INTO version (last_modified) VALUES (?)",
-                    (datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),)
+                    "INSERT INTO version (id, timestamp, hash) VALUES (1, ?, ?)",
+                    (now, "0")
                 )
             
             conn.commit()
@@ -105,8 +108,22 @@ class ChangeTracker:
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (table_name, operation, row_id, timestamp, content, content_hash))
             
-            # Update version timestamp
-            cursor.execute("UPDATE version SET last_modified = ?", (timestamp,))
+            # Update version timestamp 
+            try:
+                # Update timestamp field
+                cursor.execute(
+                    "UPDATE version SET timestamp = ? WHERE id = 1",
+                    (timestamp,)
+                )
+                if cursor.rowcount == 0:
+                    # If no rows were updated, insert a new row
+                    cursor.execute(
+                        "INSERT INTO version (id, timestamp, hash) VALUES (1, ?, ?)",
+                        (timestamp, "0")
+                    )
+            except sqlite3.Error as e:
+                logger.error(f"Error updating version table: {e}")
+            
             conn.commit()
             
             logger.debug(f"Logged {operation} operation on {table_name} for row {row_id}")
@@ -166,15 +183,46 @@ class ChangeTracker:
                 
                 # Get timestamp from version table
                 try:
-                    cursor.execute("SELECT last_modified FROM version LIMIT 1")
-                    timestamp = cursor.fetchone()[0]
-                    if not timestamp:
+                    # Get timestamp and hash from version table
+                    cursor.execute("SELECT timestamp, hash FROM version WHERE id = 1 LIMIT 1")
+                    row = cursor.fetchone()
+                    
+                    if row:
+                        timestamp, stored_hash = row
+                        
+                        # Update the hash if it's changed or not set
+                        if not stored_hash or stored_hash != content_hash:
+                            cursor.execute(
+                                "UPDATE version SET hash = ? WHERE id = 1", 
+                                (content_hash,)
+                            )
+                            conn.commit()
+                    else:
                         timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        cursor.execute("UPDATE version SET last_modified = ?", (timestamp,))
+                        cursor.execute(
+                            "INSERT INTO version (id, timestamp, hash) VALUES (1, ?, ?)",
+                            (timestamp, content_hash)
+                        )
                         conn.commit()
                 except sqlite3.Error as e:
                     logger.error(f"Error accessing version table: {e}")
                     timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    # Try to create the version table with proper schema
+                    try:
+                        cursor.execute('''
+                            CREATE TABLE IF NOT EXISTS version (
+                                id INTEGER PRIMARY KEY,
+                                timestamp TEXT NOT NULL,
+                                hash TEXT NOT NULL
+                            )
+                        ''')
+                        cursor.execute(
+                            "INSERT INTO version (id, timestamp, hash) VALUES (1, ?, ?)",
+                            (timestamp, content_hash)
+                        )
+                        conn.commit()
+                    except sqlite3.Error as e2:
+                        logger.error(f"Error creating version table: {e2}")
         except Exception as e:
             logger.error(f"Error getting database version: {e}")
             return {"hash": "0", "timestamp": "1970-01-01T00:00:00Z"}

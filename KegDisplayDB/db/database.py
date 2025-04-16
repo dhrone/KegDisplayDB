@@ -102,7 +102,8 @@ class DatabaseManager:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS version (
                     id INTEGER PRIMARY KEY,
-                    last_modified TEXT NOT NULL
+                    timestamp TEXT NOT NULL,
+                    hash TEXT NOT NULL
                 )
             ''')
             
