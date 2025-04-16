@@ -1,0 +1,18 @@
+[Unit]
+Description=KegDisplay Web Interface
+After=network.target
+
+[Service]
+Type=simple
+User=beer
+WorkingDirectory=/home/beer/Dev/KegDisplayDB
+# Use full path to poetry
+ExecStart=/home/beer/.local/bin/poetry run web
+# Or alternatively use this if poetry is installed system-wide
+# ExecStart=/usr/local/bin/poetry run web
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target 
