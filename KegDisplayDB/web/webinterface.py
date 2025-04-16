@@ -10,6 +10,9 @@ import argparse
 import sys
 import csv
 import io
+import subprocess
+import shutil
+from pathlib import Path
 
 # Import log configuration
 from ..utils.log_config import configure_logging
@@ -18,7 +21,14 @@ from ..utils.log_config import configure_logging
 from ..db import SyncedDatabase
 from ..db.database import DatabaseManager
 
-# Get the directory where this script is located
+# Import Gunicorn at module level
+try:
+    from gunicorn.app.base import BaseApplication
+except ImportError:
+    # We'll handle this error when the start function is called
+    BaseApplication = None
+
+# Define paths and directories
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 USER_HOME = os.path.expanduser("~")
 CONFIG_DIR = os.path.join(USER_HOME, ".KegDisplayDB")
@@ -29,6 +39,7 @@ SSL_DIR = os.path.join(CONFIG_DIR, "ssl")
 # Create required directories if they don't exist
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(ETC_DIR, exist_ok=True)
+os.makedirs(SSL_DIR, exist_ok=True)
 
 # Define paths to database and config files
 DB_PATH = os.path.join(DATA_DIR, 'beer.db')
@@ -41,49 +52,72 @@ print(f"Database path: {DB_PATH}")
 # Get the pre-configured logger
 logger = logging.getLogger("KegDisplay")
 
-# Parse all command line arguments at the beginning
-def parse_args():
+# Define default arguments
+DEFAULT_ARGS = {
+    'host': '0.0.0.0',
+    'port': 8080,
+    'broadcast_port': 5002,
+    'sync_port': 5003,
+    'no_sync': False,
+    'debug': False,
+    'log_level': 'INFO',
+    'ssl_cert': os.path.join(SSL_DIR, 'certs', 'kegdisplay.crt'),
+    'ssl_key': os.path.join(SSL_DIR, 'private', 'kegdisplay.key'),
+    'workers': 2,
+    'worker_class': 'sync',
+    'timeout': 30
+}
+
+# Create a namespace object with default arguments
+class Args:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+# Initialize with default arguments
+args = Args(**DEFAULT_ARGS)
+
+def parse_args(argv=None):
+    """
+    Parse command line arguments.
+    
+    Args:
+        argv: Command line arguments (default: None, using sys.argv)
+        
+    Returns:
+        Namespace with parsed arguments
+    """
     parser = argparse.ArgumentParser(description='KegDisplay Web Interface')
-    parser.add_argument('--host', default='0.0.0.0', help='Host to listen on')
-    parser.add_argument('--port', type=int, default=8080, help='Port to listen on')
-    parser.add_argument('--broadcast-port', type=int, default=5002, 
-                       help='UDP port for synchronization broadcasts (default: 5002)')
-    parser.add_argument('--sync-port', type=int, default=5003,
-                       help='TCP port for synchronization connections (default: 5003)')
+    parser.add_argument('--host', default=DEFAULT_ARGS['host'], help='Host to listen on')
+    parser.add_argument('--port', type=int, default=DEFAULT_ARGS['port'], help='Port to listen on')
+    parser.add_argument('--broadcast-port', type=int, default=DEFAULT_ARGS['broadcast_port'], 
+                        help='UDP port for synchronization broadcasts (default: 5002)')
+    parser.add_argument('--sync-port', type=int, default=DEFAULT_ARGS['sync_port'],
+                        help='TCP port for synchronization connections (default: 5003)')
     parser.add_argument('--no-sync', action='store_true',
-                       help='Disable database synchronization')
+                        help='Disable database synchronization')
     parser.add_argument('--debug', action='store_true',
-                       help='Run Flask in debug mode')
+                        help='Run Flask in debug mode')
     parser.add_argument('--log-level', 
-                       default='INFO',
-                       choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
-                       type=str.upper,
-                       help='Set the logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)')
+                        default=DEFAULT_ARGS['log_level'],
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                        type=str.upper,
+                        help='Set the logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)')
     # Add SSL-related arguments
     parser.add_argument('--ssl-cert', type=str,
-                       default=os.path.join(SSL_DIR, 'certs', 'kegdisplay.crt'),
-                       help='Path to SSL certificate file (default: ~/.KegDisplayDB/ssl/certs/kegdisplay.crt)')
+                        default=DEFAULT_ARGS['ssl_cert'],
+                        help='Path to SSL certificate file (default: ~/.KegDisplayDB/ssl/certs/kegdisplay.crt)')
     parser.add_argument('--ssl-key', type=str,
-                       default=os.path.join(SSL_DIR, 'private', 'kegdisplay.key'),
-                       help='Path to SSL private key file (default: ~/.KegDisplayDB/ssl/private/kegdisplay.key)')
-    parser.add_argument('--workers', type=int, default=2,
-                       help='Number of Gunicorn worker processes (default: 2)')
-    parser.add_argument('--worker-class', type=str, default='sync',
-                       choices=['sync', 'eventlet', 'gevent'],
-                       help='Gunicorn worker class (default: sync)')
-    parser.add_argument('--timeout', type=int, default=30,
-                       help='Worker timeout in seconds (default: 30)')
-    return parser.parse_args()
-
-# Parse arguments once at module level
-args = parse_args()
-print(f"Web interface configuration:")
-print(f"  Host: {args.host}")
-print(f"  Web port: {args.port}")
-print(f"  Broadcast port: {args.broadcast_port}")
-print(f"  Sync port: {args.sync_port}")
-print(f"  Synchronization: {'Disabled' if args.no_sync else 'Enabled'}")
-print(f"  Debug mode: {'Enabled' if args.debug else 'Disabled'}")
+                        default=DEFAULT_ARGS['ssl_key'],
+                        help='Path to SSL private key file (default: ~/.KegDisplayDB/ssl/private/kegdisplay.key)')
+    parser.add_argument('--workers', type=int, default=DEFAULT_ARGS['workers'],
+                        help='Number of Gunicorn worker processes (default: 2)')
+    parser.add_argument('--worker-class', type=str, default=DEFAULT_ARGS['worker_class'],
+                        choices=['sync', 'eventlet', 'gevent'],
+                        help='Gunicorn worker class (default: sync)')
+    parser.add_argument('--timeout', type=int, default=DEFAULT_ARGS['timeout'],
+                        help='Worker timeout in seconds (default: 30)')
+    return parser.parse_args(argv)
 
 # Initialize the SyncedDatabase unless disabled
 synced_db = None
@@ -1030,44 +1064,115 @@ def api_set_tap_count():
         
         return jsonify({"success": True, "tap_count": count})
 
-def start(passed_args=None):
+def generate_self_signed_certificate(cert_path, key_path):
     """
-    Main entry point for the web interface.
+    Generate a self-signed SSL certificate and key if they don't exist
     
     Args:
-        passed_args: Pre-parsed arguments (optional)
+        cert_path: Path where the certificate will be saved
+        key_path: Path where the private key will be saved
+    
+    Returns:
+        bool: True if certificate was generated, False if error occurred
     """
-    # Use passed arguments or parse again
-    args = passed_args or parse_args()
+    # Create directories if they don't exist
+    cert_dir = os.path.dirname(cert_path)
+    key_dir = os.path.dirname(key_path)
+    os.makedirs(cert_dir, exist_ok=True) 
+    os.makedirs(key_dir, exist_ok=True)
     
-    # Configure logging with the specified level
-    configure_logging(args.log_level)
-    logger.debug(f"Starting KegDisplay web interface with log level {args.log_level}")
+    try:
+        # Generate private key and certificate
+        logger.info(f"Generating self-signed SSL certificate: {cert_path}")
+        subprocess.run([
+            'openssl', 'req', '-x509', '-newkey', 'rsa:2048', 
+            '-keyout', key_path, 
+            '-out', cert_path,
+            '-days', '365',
+            '-nodes',  # No passphrase
+            '-subj', '/CN=kegdisplay.local'
+        ], check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        
+        # Set proper permissions on the key file
+        os.chmod(key_path, 0o600)
+        logger.info(f"Self-signed certificate generated successfully")
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to generate SSL certificate: {e.stderr.decode('utf-8')}")
+        return False
+    except Exception as e:
+        logger.error(f"Error generating SSL certificate: {str(e)}")
+        return False
+
+class KegDisplayApplication(BaseApplication):
+    def __init__(self, app, options=None):
+        self.options = options or {}
+        self.application = app
+        super().__init__()
     
-    # Initialize database synchronization if enabled
-    if not args.no_sync and synced_db:
-        # The SyncedDatabase already starts the synchronizer in its constructor
+    def load_config(self):
+        for key, value in self.options.items():
+            self.cfg.set(key, value)
+    
+    def load(self):
+        return self.application
+
+def start(passed_args=None):
+    """
+    Start the web interface server.
+    
+    Args:
+        passed_args: Arguments passed from another module. If None, use command line arguments.
+    """
+    global args
+    
+    # Parse arguments if they weren't passed
+    if passed_args is None:
+        passed_args = parse_args()
+    
+    # Update the global args
+    args = passed_args
+    
+    # Configure logging
+    configure_logging(log_level=args.log_level)
+    
+    # Re-initialize logger with configured level
+    logger = logging.getLogger("KegDisplay")
+    logger.setLevel(getattr(logging, args.log_level))
+    
+    # Initialize SyncedDatabase if not disabled with --no-sync
+    global synced_db
+    if not args.no_sync and synced_db is None:
+        try:
+            logger.info(f"Initializing SyncedDatabase with broadcast_port={args.broadcast_port}, sync_port={args.sync_port}")
+            synced_db = SyncedDatabase(
+                db_path=DB_PATH,
+                broadcast_port=args.broadcast_port,
+                sync_port=args.sync_port,
+                test_mode=False
+            )
+            logger.info("Initialized SyncedDatabase for web interface")
+        except OSError as e:
+            logger.error(f"Error initializing SyncedDatabase: {e}")
+            logger.info("If another instance is already running, use --broadcast-port and --sync-port to set different ports")
+            logger.info("or use --no-sync to disable synchronization for this instance.")
+            sys.exit(1)
+        
         logger.info(f"Database synchronization active on ports {args.broadcast_port} (UDP) and {args.sync_port} (TCP)")
     
-    # Import Gunicorn here to avoid importing it when not needed
-    try:
-        from gunicorn.app.base import BaseApplication
-    except ImportError:
+    # Check if Gunicorn is available
+    if BaseApplication is None:
         logger.error("Gunicorn is not installed. Please install it with: pip install gunicorn")
         sys.exit(1)
     
-    class KegDisplayApplication(BaseApplication):
-        def __init__(self, app, options=None):
-            self.options = options or {}
-            self.application = app
-            super().__init__()
-        
-        def load_config(self):
-            for key, value in self.options.items():
-                self.cfg.set(key, value)
-        
-        def load(self):
-            return self.application
+    # Display configuration
+    logger.info(f"Web interface configuration:")
+    logger.info(f"  Host: {args.host}")
+    logger.info(f"  Web port: {args.port}")
+    logger.info(f"  Broadcast port: {args.broadcast_port}")
+    logger.info(f"  Sync port: {args.sync_port}")
+    logger.info(f"  Synchronization: {'Disabled' if args.no_sync else 'Enabled'}")
+    logger.info(f"  Debug mode: {'Enabled' if args.debug else 'Disabled'}")
     
     # Configure Gunicorn options optimized for Raspberry Pi Zero 2W
     options = {
@@ -1075,33 +1180,36 @@ def start(passed_args=None):
         'workers': args.workers,
         'worker_class': args.worker_class,
         'timeout': args.timeout,
-        'worker_connections': 100,  # Conservative limit for Pi Zero 2W
-        'max_requests': 1000,  # Restart workers periodically to prevent memory leaks
-        'max_requests_jitter': 50,  # Add jitter to prevent all workers restarting at once
-        'keepalive': 2,  # Short keepalive timeout to free resources quickly
-        'graceful_timeout': 30,  # Time to wait for workers to finish their requests
-        'accesslog': '-',  # Log to stdout
-        'errorlog': '-',   # Log to stderr
+        'worker_connections': 100,
+        'max_requests': 1000,
+        'max_requests_jitter': 50,
+        'keepalive': 2,
+        'graceful_timeout': 30,
+        'accesslog': '-',
+        'errorlog': '-',
         'loglevel': args.log_level.lower(),
         'capture_output': True,
         'enable_stdio_inheritance': True,
-        'daemon': False,  # Run in foreground for systemd
-        'pidfile': None,  # Don't create pidfile (systemd handles this)
-        'umask': 0,  # Default umask
-        'user': None,  # Let systemd handle user
-        'group': None,  # Let systemd handle group
-        'tmp_upload_dir': None,  # Use system default
-        'reload': args.debug,  # Enable auto-reload in debug mode
+        'daemon': False,
+        'pidfile': None,
+        'umask': 0,
+        'user': None,
+        'group': None,
+        'tmp_upload_dir': None,
+        'reload': args.debug,
     }
     
     # Add SSL configuration if certificates are provided
     if args.ssl_cert and args.ssl_key:
-        if not os.path.exists(args.ssl_cert):
-            logger.error(f"SSL certificate file not found: {args.ssl_cert}")
-            sys.exit(1)
-        if not os.path.exists(args.ssl_key):
-            logger.error(f"SSL private key file not found: {args.ssl_key}")
-            sys.exit(1)
+        # Check if certificate and key files exist, generate them if not
+        if not os.path.exists(args.ssl_cert) or not os.path.exists(args.ssl_key):
+            logger.info("SSL certificate or key not found, generating self-signed certificate")
+            if generate_self_signed_certificate(args.ssl_cert, args.ssl_key):
+                logger.info("SSL certificate and key generated successfully")
+            else:
+                logger.error("Failed to generate SSL certificate and key")
+                sys.exit(1)
+        
         options['certfile'] = args.ssl_cert
         options['keyfile'] = args.ssl_key
         logger.info(f"SSL enabled with certificate: {args.ssl_cert}")
@@ -1112,4 +1220,5 @@ def start(passed_args=None):
     KegDisplayApplication(app, options).run()
 
 if __name__ == '__main__':
-    start() 
+    # Only parse arguments when run as a script
+    start(parse_args()) 
