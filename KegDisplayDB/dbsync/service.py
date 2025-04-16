@@ -8,7 +8,7 @@ synchronization methods as the web interface.
 
 Usage:
   python -m KegDisplayDB.dbsync.service --primary
-  python -m KegDisplayDB.dbsync.service --client --primary-ip <ip>
+  python -m KegDisplayDB.dbsync.service --client [--primary-ip <ip>]
 """
 
 import os
@@ -159,7 +159,7 @@ def main():
     parser.add_argument('--db-path',
                        help='Path to SQLite database file')
     parser.add_argument('--primary-ip',
-                       help='IP address of the primary server (client mode only)')
+                       help='IP address of the primary server (optional for client mode, will use broadcast discovery if not provided)')
     parser.add_argument('--broadcast-port',
                        type=int, 
                        default=5002,
@@ -179,12 +179,6 @@ def main():
     # Configure logging with the specified level
     configure_logging(args.log_level)
     logger.debug(f"Starting dbsync service with log level {args.log_level}")
-    
-    # Validate arguments
-    if args.client and args.primary_ip is None:
-        logger.error("In client mode, --primary-ip is required")
-        parser.print_help()
-        sys.exit(1)
     
     # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
