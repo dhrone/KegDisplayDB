@@ -7,8 +7,7 @@ between multiple KegDisplay instances. It has been updated to use the same
 synchronization methods as the web interface.
 
 Usage:
-  python -m KegDisplayDB.dbsync.service --primary
-  python -m KegDisplayDB.dbsync.service --client [--primary-ip <ip>]
+  python -m KegDisplayDB.dbsync.service [--primary-ip <ip>]
 """
 
 import os
@@ -39,23 +38,21 @@ DB_PATH = os.path.join(DATA_DIR, 'beer.db')
 
 class DBSyncService:
     """
-    Database synchronization service with primary and client modes.
+    Database synchronization service in client mode.
     
     This service uses the SyncedDatabase class to handle synchronization between
     different instances of KegDisplayDB, without the web interface components.
     """
     
-    def __init__(self, primary=False, db_path=None, primary_ip=None, broadcast_port=5002, sync_port=5003):
+    def __init__(self, db_path=None, primary_ip=None, broadcast_port=5002, sync_port=5003):
         """Initialize the database sync service
         
         Args:
-            primary: Whether this instance is primary (True) or client (False)
             db_path: Path to the database file
-            primary_ip: IP address of the primary server (for client mode)
+            primary_ip: IP address of the primary server (optional)
             broadcast_port: Port for UDP broadcast
             sync_port: Port for TCP sync connections
         """
-        self.primary = primary
         self.running = False
         self.exit_requested = False
         
@@ -84,8 +81,7 @@ class DBSyncService:
             logger.warning("Service is already running")
             return
             
-        mode_str = "primary" if self.primary else "client"
-        logger.info(f"Starting database sync service in {mode_str} mode")
+        logger.info("Starting database sync service in client mode")
         
         try:
             # Initialize the database and managers
@@ -99,8 +95,8 @@ class DBSyncService:
                 test_mode=False
             )
             
-            # For clients with known primary server, add it as a peer
-            if not self.primary and self.primary_ip:
+            # If a primary server IP is specified, add it as a peer
+            if self.primary_ip:
                 logger.info(f"Adding primary server as peer: {self.primary_ip}")
                 self.db.add_peer(self.primary_ip)
             
@@ -148,18 +144,11 @@ def signal_handler(sig, frame):
 def main():
     """Main entry point for the service"""
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='KegDisplay Database Sync Service')
-    mode_group = parser.add_mutually_exclusive_group(required=True)
-    mode_group.add_argument('--primary', 
-                         action='store_true',
-                         help='Run in primary mode')
-    mode_group.add_argument('--client', 
-                         action='store_true',
-                         help='Run in client mode')
+    parser = argparse.ArgumentParser(description='KegDisplay Database Sync Service (Client Mode)')
     parser.add_argument('--db-path',
                        help='Path to SQLite database file')
     parser.add_argument('--primary-ip',
-                       help='IP address of the primary server (optional for client mode, will use broadcast discovery if not provided)')
+                       help='IP address of the primary server (optional, will use broadcast discovery if not provided)')
     parser.add_argument('--broadcast-port',
                        type=int, 
                        default=5002,
@@ -187,7 +176,6 @@ def main():
     # Create and start the service
     global service
     service = DBSyncService(
-        primary=args.primary,
         db_path=args.db_path,
         primary_ip=args.primary_ip,
         broadcast_port=args.broadcast_port,
