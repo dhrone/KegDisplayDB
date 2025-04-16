@@ -647,6 +647,27 @@ class DatabaseManager:
                 
                 # Update the version table with the latest timestamp
                 if latest_timestamp:
+                    # Ensure the timestamp is in the consistent format YYYY-MM-DDThh:mm:ssZ
+                    try:
+                        # Normalize the timestamp format
+                        if '.' in latest_timestamp:
+                            # If it has milliseconds, parse accordingly
+                            dt = datetime.strptime(latest_timestamp, "%Y-%m-%dT%H:%M:%S.%f")
+                        elif 'Z' in latest_timestamp:
+                            # If it has Z timezone indicator
+                            dt = datetime.strptime(latest_timestamp.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
+                        else:
+                            # Basic ISO format without timezone
+                            dt = datetime.strptime(latest_timestamp, "%Y-%m-%dT%H:%M:%S")
+                            
+                        # Convert to standard format with Z timezone indicator
+                        normalized_timestamp = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        
+                        logger.debug(f"Normalized timestamp from '{latest_timestamp}' to '{normalized_timestamp}' for version table")
+                        latest_timestamp = normalized_timestamp
+                    except Exception as e:
+                        logger.warning(f"Failed to normalize timestamp '{latest_timestamp}': {e}")
+                
                     # Note: We don't update the hash here since that will be recalculated
                     # when get_db_version is called
                     conn.execute('''

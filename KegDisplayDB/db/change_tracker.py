@@ -89,6 +89,7 @@ class ChangeTracker:
         
         with self.db_manager.get_connection() as conn:
             cursor = conn.cursor()
+            # Use a consistent timestamp format: YYYY-MM-DDThh:mm:ssZ (without milliseconds)
             timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             
             # Get the actual row data for the change
@@ -139,26 +140,71 @@ class ChangeTracker:
             changes: List of changes since the timestamp
         """
         changes = []
-        with self.db_manager.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT table_name, operation, row_id, timestamp, content, content_hash
-                FROM change_log
-                WHERE timestamp > ?
-                ORDER BY timestamp
-            ''', (last_timestamp,))
-            
-            # Use fetchmany to avoid memory issues with large result sets
-            while True:
-                batch = cursor.fetchmany(batch_size)
-                if not batch:
-                    break
-                changes.extend(batch)
+        
+        try:
+            # Normalize the timestamp format to ensure consistent comparison
+            # Handle both formats: '2025-04-16T23:30:33.348840' and '2025-04-16T22:31:01Z'
+            try:
+                if '.' in last_timestamp:
+                    # If it has milliseconds, parse accordingly
+                    dt = datetime.strptime(last_timestamp, "%Y-%m-%dT%H:%M:%S.%f")
+                elif 'Z' in last_timestamp:
+                    # If it has Z timezone indicator
+                    dt = datetime.strptime(last_timestamp.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
+                else:
+                    # Basic ISO format without timezone
+                    dt = datetime.strptime(last_timestamp, "%Y-%m-%dT%H:%M:%S")
+            except ValueError as e:
+                logger.warning(f"Error parsing timestamp '{last_timestamp}': {e}")
+                dt = datetime(1970, 1, 1, 0, 0, 0)  # Use epoch start if parsing fails
                 
-                # Optional safety check for extremely large result sets
-                if len(changes) > 100000:  # Arbitrary large threshold
-                    logger.warning(f"Extremely large change set detected ({len(changes)} records). Consider implementing change log pruning.")
+            # Convert back to a standard ISO format without timezone for consistent comparison
+            normalized_timestamp = dt.strftime("%Y-%m-%dT%H:%M:%S")
             
+            logger.debug(f"Normalized timestamp from '{last_timestamp}' to '{normalized_timestamp}'")
+            
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # First, get all changes from the change_log table
+                cursor.execute('''
+                    SELECT table_name, operation, row_id, timestamp, content, content_hash
+                    FROM change_log
+                    ORDER BY timestamp
+                ''')
+                
+                all_changes = cursor.fetchall()
+                
+                # Filter changes that have a timestamp after our normalized_timestamp
+                # by using timestamp comparison on parsed datetime objects
+                filtered_changes = []
+                for change in all_changes:
+                    change_timestamp = change[3]  # timestamp is at index 3
+                    
+                    try:
+                        # Parse the change timestamp
+                        if '.' in change_timestamp:
+                            change_dt = datetime.strptime(change_timestamp, "%Y-%m-%dT%H:%M:%S.%f")
+                        elif 'Z' in change_timestamp:
+                            change_dt = datetime.strptime(change_timestamp.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
+                        else:
+                            change_dt = datetime.strptime(change_timestamp, "%Y-%m-%dT%H:%M:%S")
+                            
+                        # Compare with our timestamp
+                        if change_dt > dt:
+                            filtered_changes.append(change)
+                            
+                    except ValueError as e:
+                        logger.warning(f"Failed to parse change timestamp '{change_timestamp}': {e}")
+                        # Skip this change if we can't parse its timestamp
+                
+                changes = filtered_changes
+                
+                logger.debug(f"Found {len(changes)} changes since timestamp {last_timestamp}")
+        except Exception as e:
+            logger.error(f"Error getting changes since timestamp '{last_timestamp}': {e}")
+            # If there was an error in timestamp parsing, fall back to returning an empty change set
+        
         return changes
     
     def get_db_version(self):
@@ -300,15 +346,52 @@ class ChangeTracker:
         # If version2 is empty database, any other version is newer
         if version2.get("hash") == "0":
             return True
+        
+        # If hashes are the same, they are the same version
+        if version1.get("hash") == version2.get("hash"):
+            return False
             
         # Compare timestamps
         try:
-            timestamp1 = datetime.strptime(version1.get("timestamp", "1970-01-01T00:00:00Z"), 
-                                         "%Y-%m-%dT%H:%M:%SZ")
-            timestamp2 = datetime.strptime(version2.get("timestamp", "1970-01-01T00:00:00Z"), 
-                                         "%Y-%m-%dT%H:%M:%SZ")
+            # Get timestamp strings, defaulting to epoch start if missing
+            ts1_str = version1.get("timestamp", "1970-01-01T00:00:00Z")
+            ts2_str = version2.get("timestamp", "1970-01-01T00:00:00Z")
+            
+            # Parse timestamps, handling different formats
+            try:
+                if '.' in ts1_str:
+                    # Handle milliseconds format
+                    timestamp1 = datetime.strptime(ts1_str, "%Y-%m-%dT%H:%M:%S.%f")
+                elif 'Z' in ts1_str:
+                    # Handle Z timezone format
+                    timestamp1 = datetime.strptime(ts1_str.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
+                else:
+                    # Handle basic format
+                    timestamp1 = datetime.strptime(ts1_str, "%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                # If parsing fails, default to epoch start
+                logger.warning(f"Failed to parse timestamp1: {ts1_str}, using epoch start")
+                timestamp1 = datetime(1970, 1, 1, 0, 0, 0)
+                
+            try:
+                if '.' in ts2_str:
+                    # Handle milliseconds format
+                    timestamp2 = datetime.strptime(ts2_str, "%Y-%m-%dT%H:%M:%S.%f")
+                elif 'Z' in ts2_str:
+                    # Handle Z timezone format
+                    timestamp2 = datetime.strptime(ts2_str.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
+                else:
+                    # Handle basic format
+                    timestamp2 = datetime.strptime(ts2_str, "%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                # If parsing fails, default to epoch start
+                logger.warning(f"Failed to parse timestamp2: {ts2_str}, using epoch start")
+                timestamp2 = datetime(1970, 1, 1, 0, 0, 0)
+            
+            logger.debug(f"Comparing timestamps: {timestamp1} vs {timestamp2}")
             return timestamp1 > timestamp2
-        except (ValueError, TypeError) as e:
+            
+        except Exception as e:
             logger.error(f"Error comparing timestamps: {e}")
             # Fall back to hash comparison if timestamp comparison fails
             return version1.get("hash") != version2.get("hash") 

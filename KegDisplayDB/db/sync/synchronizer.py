@@ -252,11 +252,41 @@ class DatabaseSynchronizer:
         last_timestamp = message.get('last_timestamp', '1970-01-01T00:00:00Z')
         logger.info(f"Getting changes since {last_timestamp} for {peer_ip}")
         
+        # Get our current database version for logging
+        our_version = self.change_tracker.get_db_version()
+        logger.debug(f"Our database version: hash={our_version.get('hash')}, timestamp={our_version.get('timestamp')}")
+        
+        # Get a count of all changes in our change log
+        total_changes = 0
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM change_log")
+                row = cursor.fetchone()
+                if row:
+                    total_changes = row[0]
+                logger.debug(f"Total changes in change_log: {total_changes}")
+                
+                # Get the latest change timestamp for comparison
+                cursor.execute("SELECT MAX(timestamp) FROM change_log")
+                row = cursor.fetchone()
+                if row and row[0]:
+                    latest_change = row[0]
+                    logger.debug(f"Latest change timestamp: {latest_change}")
+        except Exception as e:
+            logger.error(f"Error getting change log stats: {e}")
+        
         # Get changes since the client's last timestamp
         changes = self.change_tracker.get_changes_since(last_timestamp)
         
         if changes:
             logger.info(f"Found {len(changes)} changes to send to {peer_ip}")
+            
+            # Log some details about the changes
+            for i, change in enumerate(changes):
+                if i < 5:  # Log details of first 5 changes only
+                    table_name, operation, row_id, timestamp = change[0:4]
+                    logger.debug(f"Change {i+1}: {operation} on {table_name} row {row_id} at {timestamp}")
             
             # Verify each change has content and content_hash
             for change in changes:
@@ -298,8 +328,8 @@ class DatabaseSynchronizer:
             
             logger.info(f"Sent changes to {peer_ip}")
         else:
-            # No changes to send
             logger.info(f"No changes to send to {peer_ip}")
+            logger.debug(f"Client asked for changes since {last_timestamp}, but no changes were found with newer timestamps")
             response = self.protocol.create_sync_response(
                 self.change_tracker.get_db_version(), 
                 False
