@@ -119,9 +119,21 @@ def parse_args(argv=None):
                         help='Worker timeout in seconds (default: 30)')
     return parser.parse_args(argv)
 
+# Parse command line arguments at module level
+# This ensures args are available when imported by another module
+# Skip parsing args if not being run directly - this avoids arg parsing during imports/tests
+if not hasattr(sys, '_called_from_test') and 'pytest' not in sys.modules:
+    try:
+        args = parse_args()
+    except SystemExit:
+        # This can happen when --help is passed or invalid arguments are provided
+        # Keep using default args in this case
+        pass
+
 # Initialize the SyncedDatabase unless disabled
 synced_db = None
-if not args.no_sync:
+# Only initialize at module level if called directly, not when imported
+if not hasattr(sys, '_called_from_test') and 'pytest' not in sys.modules and __name__ == '__main__':
     try:
         print(f"Initializing SyncedDatabase with broadcast_port={args.broadcast_port}, sync_port={args.sync_port}")
         synced_db = SyncedDatabase(
@@ -1140,7 +1152,7 @@ def start(passed_args=None):
     logger = logging.getLogger("KegDisplay")
     logger.setLevel(getattr(logging, args.log_level))
     
-    # Initialize SyncedDatabase if not disabled with --no-sync
+    # Initialize SyncedDatabase if not disabled
     global synced_db
     if not args.no_sync and synced_db is None:
         try:
