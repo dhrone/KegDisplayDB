@@ -631,6 +631,8 @@ class DatabaseManager:
                             continue
                         
                         # Apply the change based on the operation type
+                        success = False
+                        
                         if operation == "INSERT":
                             # Check if the row already exists
                             cursor = conn.cursor()
@@ -642,26 +644,31 @@ class DatabaseManager:
                             else:
                                 # Otherwise use INSERT
                                 self._apply_insert_change(conn, table_name, row_id, content_data)
+                            success = True
                         
                         elif operation == "UPDATE":
                             self._apply_update_change(conn, table_name, row_id, content_data)
+                            success = True
                         
                         elif operation == "DELETE":
                             self._apply_delete_change(conn, table_name, row_id)
+                            success = True
                         
                         else:
                             logger.warning(f"Unknown operation type: {operation}")
                             continue
                         
+                        # Only log the change if we successfully applied it to the destination table
+                        if success:
+                            # Log the change
+                            conn.execute('''
+                                INSERT INTO change_log (table_name, operation, row_id, timestamp, content, content_hash)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                            ''', (table_name, operation, row_id, timestamp, content_str, content_hash))
+                        
                     except Exception as e:
-                        logger.error(f"Error applying change: {e}")
+                        logger.error(f"Error applying change {operation} to {table_name}.{row_id}: {e}")
                         continue
-                    
-                    # Log the change
-                    conn.execute('''
-                        INSERT INTO change_log (table_name, operation, row_id, timestamp, content, content_hash)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (table_name, operation, row_id, timestamp, content_str, content_hash))
                 
                 # Update the version table with the latest timestamp
                 if latest_timestamp:
