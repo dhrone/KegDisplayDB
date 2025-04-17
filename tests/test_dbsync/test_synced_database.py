@@ -5,6 +5,7 @@ import sqlite3
 import time
 import shutil
 from datetime import datetime
+import glob
 
 from KegDisplayDB.db import SyncedDatabase
 
@@ -29,6 +30,31 @@ class TestSyncedDatabase(unittest.TestCase):
         if os.path.exists(self.temp_dir):
             # Use shutil.rmtree to remove directory even if not empty
             shutil.rmtree(self.temp_dir)
+            
+        # Clean up any temporary MagicMock files
+        self.cleanup_magicmock_files()
+    
+    def cleanup_magicmock_files(self):
+        """Clean up any temporary files with MagicMock in their names."""
+        # Find any files with MagicMock in their names
+        magicmock_files = glob.glob("*MagicMock*")
+        
+        # Remove each file
+        for f in magicmock_files:
+            try:
+                os.remove(f)
+                print(f"Removed temporary test file: {f}")
+            except Exception as e:
+                print(f"Failed to remove {f}: {e}")
+        
+        # Also clean up any _TESTONLY_ files
+        testonly_files = glob.glob("*_TESTONLY_*")
+        for f in testonly_files:
+            try:
+                os.remove(f)
+                print(f"Removed temporary test file: {f}")
+            except Exception as e:
+                print(f"Failed to remove {f}: {e}")
     
     def test_beer_operations(self):
         """Test beer CRUD operations with synchronization."""
