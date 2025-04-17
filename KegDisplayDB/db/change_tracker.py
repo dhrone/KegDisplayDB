@@ -70,11 +70,22 @@ class ChangeTracker:
     def ensure_valid_session(self):
         """Ensure we have a valid tracking session"""
         try:
-            # Test if session is still valid
-            self.get_changes_since('1970-01-01T00:00:00Z')
-        except sqlite3.Error:
-            # If session is invalid, create a new one
-            logger.warning("Session invalid, creating new session")
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                # Directly check if the change_log table exists
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='change_log'")
+                if cursor.fetchone() is None:
+                    # Table doesn't exist, needs initialization
+                    raise sqlite3.Error("change_log table missing") 
+
+                # Check for the version table too
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='version'")
+                if cursor.fetchone() is None:
+                    raise sqlite3.Error("version table missing")
+
+        except sqlite3.Error as e:
+            # If session is invalid (tables missing or other DB error during check)
+            logger.warning(f"Session invalid ({e}), attempting reinitialization")
             self.initialize_tracking()
     
     def log_change(self, table_name, operation, row_id):
