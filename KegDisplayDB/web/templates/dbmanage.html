@@ -237,19 +237,29 @@ document.addEventListener('DOMContentLoaded', function() {
             // Hide progress bar
             document.getElementById('import-progress').style.display = 'none';
             
-            let message = `Successfully imported ${result.imported_count} beers.`;
-            
-            if (result.errors && result.errors.length > 0) {
-                message += ` There were ${result.errors.length} errors during import.`;
-                console.error('Import errors:', result.errors);
-            }
-            
-            showAlert('import-alert-container', 'success', message);
+            // Show a message indicating the background process has started
+            showAlert('import-alert-container', 'success', 
+                result.message || 'Import started. This operation will continue in the background.');
             
             // Reset file input
             fileInput.value = '';
             document.getElementById('import-file-name').textContent = '';
             document.getElementById('import-btn').disabled = true;
+            
+            // Start a periodic check to inform user that import is still in progress
+            let updateCount = 0;
+            const maxUpdates = 15; // Show updates for about 30 seconds
+            const intervalId = setInterval(() => {
+                updateCount++;
+                if (updateCount > maxUpdates) {
+                    clearInterval(intervalId);
+                    showAlert('import-alert-container', 'info', 
+                        'Import is continuing in the background. You can continue using the application.');
+                } else {
+                    showAlert('import-alert-container', 'info', 
+                        `Import is processing in the background... (${updateCount * 2} seconds elapsed)`);
+                }
+            }, 2000);
         })
         .catch(error => {
             // Hide progress bar

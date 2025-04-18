@@ -13,6 +13,7 @@ import io
 import subprocess
 import shutil
 from pathlib import Path
+import threading
 
 # Import log configuration
 from ..utils.log_config import configure_logging
@@ -340,130 +341,146 @@ def import_beers():
     
     # Read CSV file
     try:
-        stream = io.StringIO(file.stream.read().decode("UTF8"), newline=None)
-        reader = csv.DictReader(stream)
+        # Create a copy of the file data since we can't pass the file object to a background thread
+        file_data = file.stream.read().decode("UTF8")
         
-        # Convert CSV rows to a list of dictionaries
-        beer_data_list = []
-        for row in reader:
-            # Skip rows without a name
-            if not row.get('Name'):
-                continue
-                
-            # Convert empty strings to None for numeric fields
-            for field in ['ABV', 'IBU', 'Color', 'OriginalGravity', 'FinalGravity']:
-                if field in row and (not row[field] or row[field].strip() == ''):
-                    row[field] = None
-                elif field in row:
-                    try:
-                        row[field] = float(row[field])
-                    except (ValueError, TypeError):
-                        row[field] = None
-            
-            beer_data_list.append(row)
+        # Start the import in a background thread to avoid worker timeouts
+        logger = logging.getLogger("KegDisplay")
         
-        if synced_db:
-            # Use the new bulk import method
-            imported_count, errors = synced_db.import_beers_from_data(beer_data_list)
-        else:
-            # Use a single connection for all operations
-            conn = sqlite3.connect(DB_PATH)
-            
+        def background_import():
             try:
-                # Process each row in the CSV
-                imported_count = 0
-                errors = []
+                logger.info("Starting background beer import process")
                 
-                for idx, row in enumerate(beer_data_list):
-                    try:
-                        # Handle existing beer with same ID
-                        beer_id = row.get('idBeer')
-                        existing_beer = None
+                # Process the CSV data
+                stream = io.StringIO(file_data, newline=None)
+                reader = csv.DictReader(stream)
+                
+                # Convert CSV rows to a list of dictionaries
+                beer_data_list = []
+                for row in reader:
+                    # Skip rows without a name
+                    if not row.get('Name'):
+                        continue
                         
-                        if beer_id and str(beer_id).strip() and str(beer_id) != '':
+                    # Convert empty strings to None for numeric fields
+                    for field in ['ABV', 'IBU', 'Color', 'OriginalGravity', 'FinalGravity']:
+                        if field in row and (not row[field] or row[field].strip() == ''):
+                            row[field] = None
+                        elif field in row:
                             try:
-                                beer_id = int(beer_id)
-                                cursor = conn.cursor()
-                                conn.row_factory = sqlite3.Row
-                                cursor.execute("SELECT * FROM beers WHERE idBeer = ?", (beer_id,))
-                                existing_beer = cursor.fetchone()
+                                row[field] = float(row[field])
                             except (ValueError, TypeError):
-                                beer_id = None
-                        
-                        cursor = conn.cursor()  # Create a new cursor for each operation
-                        
-                        # If beer exists, update it; otherwise add new beer
-                        if existing_beer:
-                            cursor.execute('''
-                                UPDATE beers SET
-                                    Name = ?, ABV = ?, IBU = ?, Color = ?, OriginalGravity = ?, FinalGravity = ?,
-                                    Description = ?, Brewed = ?, Kegged = ?, Tapped = ?, Notes = ?
-                                WHERE idBeer = ?
-                            ''', (
-                                row.get('Name'),
-                                row.get('ABV'),
-                                row.get('IBU'),
-                                row.get('Color'),
-                                row.get('OriginalGravity'),
-                                row.get('FinalGravity'),
-                                row.get('Description'),
-                                row.get('Brewed'),
-                                row.get('Kegged'),
-                                row.get('Tapped'),
-                                row.get('Notes'),
-                                beer_id
-                            ))
-                            log_change(conn, "beers", "UPDATE", beer_id, skip_notify=True)
-                        else:
-                            # Add new beer
-                            cursor.execute('''
-                                INSERT INTO beers (
-                                    Name, ABV, IBU, Color, OriginalGravity, FinalGravity,
-                                    Description, Brewed, Kegged, Tapped, Notes
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            ''', (
-                                row.get('Name'),
-                                row.get('ABV'),
-                                row.get('IBU'),
-                                row.get('Color'),
-                                row.get('OriginalGravity'),
-                                row.get('FinalGravity'),
-                                row.get('Description'),
-                                row.get('Brewed'),
-                                row.get('Kegged'),
-                                row.get('Tapped'),
-                                row.get('Notes')
-                            ))
-                            beer_id = cursor.lastrowid
-                            log_change(conn, "beers", "INSERT", beer_id, skip_notify=True)
-                        
-                        imported_count += 1
-                        
-                    except Exception as e:
-                        errors.append(f"Error on row {idx+1}: {str(e)}")
-                
-                # Commit all changes at once
-                conn.commit()
-                
-                # Send a single notification after all updates
-                if imported_count > 0 and synced_db:
-                    synced_db.notify_update()
+                                row[field] = None
                     
+                    beer_data_list.append(row)
+                
+                if synced_db:
+                    # Use the bulk import method
+                    imported_count, errors = synced_db.import_beers_from_data(beer_data_list)
+                    logger.info(f"Background import completed: {imported_count} beers imported with {len(errors)} errors")
+                else:
+                    # Use a single connection for all operations
+                    conn = sqlite3.connect(DB_PATH)
+                    
+                    try:
+                        # Process each row in the CSV
+                        imported_count = 0
+                        errors = []
+                        
+                        for idx, row in enumerate(beer_data_list):
+                            try:
+                                # Handle existing beer with same ID
+                                beer_id = row.get('idBeer')
+                                existing_beer = None
+                                
+                                if beer_id and str(beer_id).strip() and str(beer_id) != '':
+                                    try:
+                                        beer_id = int(beer_id)
+                                        cursor = conn.cursor()
+                                        conn.row_factory = sqlite3.Row
+                                        cursor.execute("SELECT * FROM beers WHERE idBeer = ?", (beer_id,))
+                                        existing_beer = cursor.fetchone()
+                                    except (ValueError, TypeError):
+                                        beer_id = None
+                                
+                                cursor = conn.cursor()
+                                
+                                # If beer exists, update it; otherwise add new beer
+                                if existing_beer:
+                                    cursor.execute('''
+                                        UPDATE beers SET
+                                            Name = ?, ABV = ?, IBU = ?, Color = ?, OriginalGravity = ?, FinalGravity = ?,
+                                            Description = ?, Brewed = ?, Kegged = ?, Tapped = ?, Notes = ?
+                                        WHERE idBeer = ?
+                                    ''', (
+                                        row.get('Name'),
+                                        row.get('ABV'),
+                                        row.get('IBU'),
+                                        row.get('Color'),
+                                        row.get('OriginalGravity'),
+                                        row.get('FinalGravity'),
+                                        row.get('Description'),
+                                        row.get('Brewed'),
+                                        row.get('Kegged'),
+                                        row.get('Tapped'),
+                                        row.get('Notes'),
+                                        beer_id
+                                    ))
+                                    log_change(conn, "beers", "UPDATE", beer_id, skip_notify=True)
+                                else:
+                                    # Add new beer
+                                    cursor.execute('''
+                                        INSERT INTO beers (
+                                            Name, ABV, IBU, Color, OriginalGravity, FinalGravity,
+                                            Description, Brewed, Kegged, Tapped, Notes
+                                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    ''', (
+                                        row.get('Name'),
+                                        row.get('ABV'),
+                                        row.get('IBU'),
+                                        row.get('Color'),
+                                        row.get('OriginalGravity'),
+                                        row.get('FinalGravity'),
+                                        row.get('Description'),
+                                        row.get('Brewed'),
+                                        row.get('Kegged'),
+                                        row.get('Tapped'),
+                                        row.get('Notes')
+                                    ))
+                                    beer_id = cursor.lastrowid
+                                    log_change(conn, "beers", "INSERT", beer_id, skip_notify=True)
+                                
+                                imported_count += 1
+                                
+                            except Exception as e:
+                                errors.append(f"Error on row {idx+1}: {str(e)}")
+                        
+                        # Commit all changes at once
+                        conn.commit()
+                        
+                        # Send a single notification after all updates
+                        if imported_count > 0 and synced_db:
+                            synced_db.notify_update()
+                        
+                        logger.info(f"Background import completed: {imported_count} beers imported with {len(errors)} errors")
+                            
+                    except Exception as e:
+                        conn.rollback()
+                        logger.error(f"Error in background import: {e}")
+                    finally:
+                        conn.close()
             except Exception as e:
-                conn.rollback()
-                raise e
-            finally:
-                conn.close()
+                logger.error(f"Unexpected error in background import: {e}")
         
-        result = {
+        # Start the background thread
+        import_thread = threading.Thread(target=background_import, daemon=True)
+        import_thread.start()
+        
+        # Return success immediately
+        return jsonify({
             "success": True,
-            "imported_count": imported_count
-        }
-        
-        if errors:
-            result["errors"] = errors
-            
-        return jsonify(result)
+            "message": "Import started in the background. This may take a few minutes to complete."
+        })
         
     except Exception as e:
         return jsonify({"error": f"Error processing CSV: {str(e)}"}), 500
