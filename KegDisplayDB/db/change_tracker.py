@@ -86,83 +86,232 @@ class ChangeTracker:
             logger.warning(f"Using temporary node ID: {temp_id}")
             return temp_id
     
-    def increment_logical_clock(self):
-        """Increment the logical clock for local events
-        
-        Returns:
-            int: The new clock value
+    def increment_logical_clock(self, max_retries=5, retry_delay=0.5):
         """
-        try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
-                row = cursor.fetchone()
-                current_clock = row[0] if row and row[0] is not None else 0
-                new_clock = current_clock + 1
-                
-                cursor.execute(
-                    "UPDATE version SET logical_clock = ? WHERE id = 1",
-                    (new_clock,)
-                )
-                conn.commit()
-                logger.debug(f"Incremented logical clock to {new_clock}")
-                return new_clock
-        except Exception as e:
-            logger.error(f"Error incrementing logical clock: {e}")
-            return 0
+        Increment the logical clock in the version table
+        
+        Args:
+            max_retries: Number of times to retry if database is locked
+            retry_delay: Time to wait between retries in seconds
+            
+        Returns:
+            New logical clock value or None if unsuccessful
+        """
+        retries = 0
+        
+        while retries < max_retries:
+            try:
+                with self.db_manager.get_connection() as conn:
+                    # Set a longer timeout for this operation
+                    conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
+                    
+                    # Get current logical clock value
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
+                    row = cursor.fetchone()
+                    
+                    if row is None:
+                        # Initialize with 1 if no row exists
+                        current_clock = 0
+                        new_clock = 1
+                        
+                        # Insert new version record
+                        cursor.execute(
+                            "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
+                            (
+                                datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                "0",
+                                new_clock,
+                                self.node_id
+                            )
+                        )
+                    else:
+                        # Increment existing clock
+                        current_clock = row[0] if row[0] is not None else 0
+                        new_clock = current_clock + 1
+                        
+                        # Update version record
+                        cursor.execute(
+                            "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
+                            (
+                                datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                new_clock
+                            )
+                        )
+                    
+                    # Commit the transaction
+                    conn.commit()
+                    
+                    # Log the update
+                    logger.info(f"Incremented logical clock from {current_clock} to {new_clock}")
+                    return new_clock
+                    
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e):
+                    retries += 1
+                    logger.warning(f"Database locked when incrementing logical clock (attempt {retries}/{max_retries}), retrying in {retry_delay}s")
+                    time.sleep(retry_delay)
+                    # Increase backoff time for subsequent retries
+                    retry_delay *= 1.5
+                else:
+                    logger.error(f"Error incrementing logical clock: {e}")
+                    return None
+            except Exception as e:
+                logger.error(f"Error incrementing logical clock: {e}")
+                return None
+        
+        logger.error(f"Failed to increment logical clock after {max_retries} attempts")
+        return None
     
-    def update_logical_clock(self, received_clock):
-        """Update logical clock based on received clock value (Lamport algorithm)
+    def update_logical_clock(self, received_clock, max_retries=5, retry_delay=0.5):
+        """
+        Update logical clock based on received clock value (Lamport algorithm)
         
         Args:
             received_clock: Clock value received from another node
+            max_retries: Number of times to retry if database is locked
+            retry_delay: Time to wait between retries in seconds
             
         Returns:
-            int: The new clock value
+            New clock value or None if unsuccessful
         """
-        try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
-                row = cursor.fetchone()
-                current_clock = row[0] if row and row[0] is not None else 0
-                
-                # Lamport clock rule: local_clock = max(local_clock, received_clock) + 1
-                new_clock = max(current_clock, received_clock) + 1
-                
-                cursor.execute(
-                    "UPDATE version SET logical_clock = ? WHERE id = 1",
-                    (new_clock,)
-                )
-                conn.commit()
-                logger.debug(f"Updated logical clock to {new_clock} based on received clock {received_clock}")
-                return new_clock
-        except Exception as e:
-            logger.error(f"Error updating logical clock: {e}")
-            return 0
+        retries = 0
+        
+        while retries < max_retries:
+            try:
+                with self.db_manager.get_connection() as conn:
+                    # Set a longer timeout for this operation
+                    conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
+                    
+                    # Get current logical clock value
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
+                    row = cursor.fetchone()
+                    
+                    if row is None:
+                        # Initialize with received_clock+1 if no row exists
+                        current_clock = 0
+                        new_clock = received_clock + 1
+                        
+                        # Insert new version record
+                        cursor.execute(
+                            "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
+                            (
+                                datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                "0",
+                                new_clock,
+                                self.node_id
+                            )
+                        )
+                    else:
+                        # Lamport clock rule: local_clock = max(local_clock, received_clock) + 1
+                        current_clock = row[0] if row[0] is not None else 0
+                        new_clock = max(current_clock, received_clock) + 1
+                        
+                        # Update version record
+                        cursor.execute(
+                            "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
+                            (
+                                datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                new_clock
+                            )
+                        )
+                    
+                    # Commit the transaction
+                    conn.commit()
+                    
+                    # Log the update
+                    logger.info(f"Updated logical clock from {current_clock} to {new_clock} based on received clock {received_clock}")
+                    return new_clock
+                    
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e):
+                    retries += 1
+                    logger.warning(f"Database locked when updating logical clock (attempt {retries}/{max_retries}), retrying in {retry_delay}s")
+                    time.sleep(retry_delay)
+                    # Increase backoff time for subsequent retries
+                    retry_delay *= 1.5
+                else:
+                    logger.error(f"Error updating logical clock: {e}")
+                    return None
+            except Exception as e:
+                logger.error(f"Error updating logical clock: {e}")
+                return None
+        
+        logger.error(f"Failed to update logical clock after {max_retries} attempts")
+        return None
     
-    def set_logical_clock(self, new_clock):
-        """Set the logical clock to a specific value
+    def set_logical_clock(self, new_clock, max_retries=5, retry_delay=0.5):
+        """
+        Set the logical clock to a specific value
         
         Args:
             new_clock: The clock value to set
+            max_retries: Number of times to retry if database is locked
+            retry_delay: Time to wait between retries in seconds
             
         Returns:
-            int: The new clock value
+            The set clock value or None if unsuccessful
         """
-        try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE version SET logical_clock = ? WHERE id = 1",
-                    (new_clock,)
-                )
-                conn.commit()
-                logger.debug(f"Set logical clock to exact value: {new_clock}")
-                return new_clock
-        except Exception as e:
-            logger.error(f"Error setting logical clock: {e}")
-            return 0
+        retries = 0
+        
+        while retries < max_retries:
+            try:
+                with self.db_manager.get_connection() as conn:
+                    # Set a longer timeout for this operation
+                    conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
+                    
+                    # Get current logical clock value for logging
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
+                    row = cursor.fetchone()
+                    current_clock = row[0] if row and row[0] is not None else 0
+                    
+                    # Check if version row exists
+                    if row is None:
+                        # Create new version record with specified clock
+                        cursor.execute(
+                            "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
+                            (
+                                datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                "0",
+                                new_clock,
+                                self.node_id
+                            )
+                        )
+                    else:
+                        # Update existing version record
+                        cursor.execute(
+                            "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
+                            (
+                                datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                new_clock
+                            )
+                        )
+                    
+                    # Commit the transaction
+                    conn.commit()
+                    
+                    # Log the update
+                    logger.info(f"Set logical clock from {current_clock} to exact value: {new_clock}")
+                    return new_clock
+                    
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e):
+                    retries += 1
+                    logger.warning(f"Database locked when setting logical clock (attempt {retries}/{max_retries}), retrying in {retry_delay}s")
+                    time.sleep(retry_delay)
+                    # Increase backoff time for subsequent retries
+                    retry_delay *= 1.5
+                else:
+                    logger.error(f"Error setting logical clock: {e}")
+                    return None
+            except Exception as e:
+                logger.error(f"Error setting logical clock: {e}")
+                return None
+        
+        logger.error(f"Failed to set logical clock after {max_retries} attempts")
+        return None
     
     def ensure_valid_session(self):
         """Ensure we have a valid tracking session"""
