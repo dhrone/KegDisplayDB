@@ -568,7 +568,12 @@ class DatabaseManager:
             changes: List of changes to apply
         """
         if not changes:
+            logger.info("No changes to apply")
             return
+            
+        logger.info(f"Applying {len(changes)} sync changes")
+        applied_changes = 0
+        failed_changes = 0
             
         try:
             # Start transaction
@@ -600,12 +605,15 @@ class DatabaseManager:
                 latest_timestamp = None
                 
                 # Apply each change
-                for change in changes:
+                for i, change in enumerate(changes):
                     if len(change) < 6:  # Should have (table_name, operation, row_id, timestamp, content, content_hash)
                         logger.warning(f"Invalid change format: {change}")
+                        failed_changes += 1
                         continue
                         
                     table_name, operation, row_id, timestamp, content, content_hash = change
+                    
+                    logger.debug(f"Processing change {i+1}/{len(changes)}: {operation} on {table_name}.{row_id}")
                     
                     # Track latest timestamp
                     if latest_timestamp is None or timestamp > latest_timestamp:
@@ -618,16 +626,22 @@ class DatabaseManager:
                         content_str = content
                     
                     # Verify content hash matches content
-                    if hashlib.md5(content_str.encode()).hexdigest() != content_hash:
-                        logger.warning(f"Content hash mismatch for change: {change}")
+                    calculated_hash = hashlib.md5(content_str.encode()).hexdigest()
+                    if calculated_hash != content_hash:
+                        logger.warning(f"Content hash mismatch for change: {table_name}.{row_id}")
+                        logger.warning(f"Expected hash: {content_hash}, calculated hash: {calculated_hash}")
+                        failed_changes += 1
                         continue
                     
                     try:
                         # Parse content if it's JSON
                         try:
                             content_data = json.loads(content_str)
-                        except (json.JSONDecodeError, TypeError):
-                            logger.error(f"Error parsing content JSON: {content_str}")
+                            logger.debug(f"Successfully parsed content JSON for {table_name}.{row_id}")
+                        except (json.JSONDecodeError, TypeError) as e:
+                            logger.error(f"Error parsing content JSON for {table_name}.{row_id}: {e}")
+                            logger.error(f"Content: {content_str[:100]}...")
+                            failed_changes += 1
                             continue
                         
                         # Apply the change based on the operation type
@@ -636,26 +650,33 @@ class DatabaseManager:
                         if operation == "INSERT":
                             # Check if the row already exists
                             cursor = conn.cursor()
-                            cursor.execute(f"SELECT 1 FROM {table_name} WHERE rowid = ?", (row_id,))
-                            if cursor.fetchone():
-                                # If row exists, use UPDATE instead
-                                logger.warning(f"Row {row_id} already exists in {table_name}, using UPDATE instead")
-                                self._apply_update_change(conn, table_name, row_id, content_data)
-                            else:
-                                # Otherwise use INSERT
-                                self._apply_insert_change(conn, table_name, row_id, content_data)
-                            success = True
+                            try:
+                                cursor.execute(f"SELECT 1 FROM {table_name} WHERE rowid = ?", (row_id,))
+                                if cursor.fetchone():
+                                    logger.info(f"Row {row_id} already exists in {table_name}, using UPDATE instead")
+                                    self._apply_update_change(conn, table_name, row_id, content_data)
+                                else:
+                                    logger.info(f"Inserting new row {row_id} into {table_name}")
+                                    self._apply_insert_change(conn, table_name, row_id, content_data)
+                                success = True
+                            except sqlite3.Error as e:
+                                logger.error(f"Database error checking row existence in {table_name}: {e}")
+                                failed_changes += 1
+                                continue
                         
                         elif operation == "UPDATE":
+                            logger.info(f"Updating row {row_id} in {table_name}")
                             self._apply_update_change(conn, table_name, row_id, content_data)
                             success = True
                         
                         elif operation == "DELETE":
+                            logger.info(f"Deleting row {row_id} from {table_name}")
                             self._apply_delete_change(conn, table_name, row_id)
                             success = True
                         
                         else:
                             logger.warning(f"Unknown operation type: {operation}")
+                            failed_changes += 1
                             continue
                         
                         # Only log the change if we successfully applied it to the destination table
@@ -665,9 +686,11 @@ class DatabaseManager:
                                 INSERT INTO change_log (table_name, operation, row_id, timestamp, content, content_hash)
                                 VALUES (?, ?, ?, ?, ?, ?)
                             ''', (table_name, operation, row_id, timestamp, content_str, content_hash))
+                            applied_changes += 1
                         
                     except Exception as e:
                         logger.error(f"Error applying change {operation} to {table_name}.{row_id}: {e}")
+                        failed_changes += 1
                         continue
                 
                 # Update the version table with the latest timestamp
@@ -707,6 +730,7 @@ class DatabaseManager:
                 
                 # Commit transaction
                 conn.commit()
+                logger.info(f"Sync changes applied: {applied_changes} successful, {failed_changes} failed")
                 
         except Exception as e:
             logger.error(f"Error applying sync changes: {e}")
@@ -782,48 +806,94 @@ class DatabaseManager:
             row_id: ID of the row
             content_data: Content data (list or dict)
         """
-        if table_name == 'beers':
-            if isinstance(content_data, list):
-                # Map values from list to appropriate column positions
-                # Assuming format is [idBeer, Name, ABV, IBU, Color, OriginalGravity, FinalGravity, Description, etc.]
-                conn.execute('''
-                    INSERT OR REPLACE INTO beers (idBeer, Name, ABV, IBU, Color, OriginalGravity, 
-                    FinalGravity, Description, Brewed, Kegged, Tapped, Notes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (row_id, content_data[1] if len(content_data) > 1 else None, 
-                      content_data[2] if len(content_data) > 2 else None,
-                      content_data[3] if len(content_data) > 3 else None, 
-                      content_data[4] if len(content_data) > 4 else None,
-                      content_data[5] if len(content_data) > 5 else None,
-                      content_data[6] if len(content_data) > 6 else None,
-                      content_data[7] if len(content_data) > 7 else None,
-                      content_data[8] if len(content_data) > 8 else None,
-                      content_data[9] if len(content_data) > 9 else None,
-                      content_data[10] if len(content_data) > 10 else None,
-                      content_data[11] if len(content_data) > 11 else None))
+        try:
+            logger.debug(f"Applying INSERT to {table_name}.{row_id}")
+            logger.debug(f"Content data type: {type(content_data)}")
+            
+            if table_name == 'beers':
+                if isinstance(content_data, list):
+                    # Map values from list to appropriate column positions
+                    # Assuming format is [idBeer, Name, ABV, IBU, Color, OriginalGravity, FinalGravity, Description, etc.]
+                    logger.debug(f"INSERT beer with list data: {content_data}")
+                    conn.execute('''
+                        INSERT OR REPLACE INTO beers (idBeer, Name, ABV, IBU, Color, OriginalGravity, 
+                        FinalGravity, Description, Brewed, Kegged, Tapped, Notes)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (row_id, content_data[1] if len(content_data) > 1 else None, 
+                        content_data[2] if len(content_data) > 2 else None,
+                        content_data[3] if len(content_data) > 3 else None, 
+                        content_data[4] if len(content_data) > 4 else None,
+                        content_data[5] if len(content_data) > 5 else None,
+                        content_data[6] if len(content_data) > 6 else None,
+                        content_data[7] if len(content_data) > 7 else None,
+                        content_data[8] if len(content_data) > 8 else None,
+                        content_data[9] if len(content_data) > 9 else None,
+                        content_data[10] if len(content_data) > 10 else None,
+                        content_data[11] if len(content_data) > 11 else None))
+                else:
+                    # It's a dictionary, use .get()
+                    # Log the dictionary keys to help with debugging
+                    logger.debug(f"INSERT beer with dict data. Keys: {list(content_data.keys())}")
+                    
+                    # Check for different possible name conventions in the dictionary
+                    name = None
+                    if 'name' in content_data:
+                        name = content_data.get('name')
+                    elif 'Name' in content_data:
+                        name = content_data.get('Name')
+                        
+                    # Same for other fields
+                    abv = content_data.get('abv') or content_data.get('ABV')
+                    ibu = content_data.get('ibu') or content_data.get('IBU')
+                    color = content_data.get('color') or content_data.get('Color')
+                    og = content_data.get('og') or content_data.get('OriginalGravity')
+                    fg = content_data.get('fg') or content_data.get('FinalGravity')
+                    description = content_data.get('description') or content_data.get('Description')
+                    brewed = content_data.get('brewed') or content_data.get('Brewed')
+                    kegged = content_data.get('kegged') or content_data.get('Kegged')
+                    tapped = content_data.get('tapped') or content_data.get('Tapped')
+                    notes = content_data.get('notes') or content_data.get('Notes')
+                    
+                    logger.debug(f"Inserting beer: id={row_id}, name={name}, abv={abv}")
+                    
+                    conn.execute('''
+                        INSERT OR REPLACE INTO beers (idBeer, Name, ABV, IBU, Color, OriginalGravity, 
+                        FinalGravity, Description, Brewed, Kegged, Tapped, Notes)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (row_id, name, abv, ibu, color, og, fg, description, brewed, kegged, tapped, notes))
+            elif table_name == 'taps':
+                if isinstance(content_data, list):
+                    logger.debug(f"INSERT tap with list data: {content_data}")
+                    conn.execute('''
+                        INSERT OR REPLACE INTO taps (idTap, idBeer)
+                        VALUES (?, ?)
+                    ''', (row_id, content_data[1] if len(content_data) > 1 else None))
+                else:
+                    # It's a dictionary, use .get()
+                    logger.debug(f"INSERT tap with dict data. Keys: {list(content_data.keys())}")
+                    
+                    # Check for different possible beer_id naming conventions
+                    beer_id = None
+                    if 'beer_id' in content_data:
+                        beer_id = content_data.get('beer_id')
+                    elif 'idBeer' in content_data:
+                        beer_id = content_data.get('idBeer')
+                    
+                    logger.debug(f"Inserting tap: idTap={row_id}, idBeer={beer_id}")
+                    
+                    conn.execute('''
+                        INSERT OR REPLACE INTO taps (idTap, idBeer)
+                        VALUES (?, ?)
+                    ''', (row_id, beer_id))
             else:
-                # It's a dictionary, use .get()
-                conn.execute('''
-                    INSERT OR REPLACE INTO beers (idBeer, Name, ABV, IBU, Color, OriginalGravity, 
-                    FinalGravity, Description, Brewed, Kegged, Tapped, Notes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (row_id, content_data.get('name'), content_data.get('abv'),
-                    content_data.get('ibu'), content_data.get('color'), content_data.get('og'),
-                    content_data.get('fg'), content_data.get('description'),
-                    content_data.get('brewed'), content_data.get('kegged'),
-                    content_data.get('tapped'), content_data.get('notes')))
-        elif table_name == 'taps':
-            if isinstance(content_data, list):
-                conn.execute('''
-                    INSERT OR REPLACE INTO taps (idTap, idBeer)
-                    VALUES (?, ?)
-                ''', (row_id, content_data[1] if len(content_data) > 1 else None))
-            else:
-                # It's a dictionary, use .get()
-                conn.execute('''
-                    INSERT OR REPLACE INTO taps (idTap, idBeer)
-                    VALUES (?, ?)
-                ''', (row_id, content_data.get('beer_id')))
+                logger.warning(f"Unknown table for INSERT: {table_name}")
+                
+        except sqlite3.Error as e:
+            logger.error(f"SQLite error applying INSERT to {table_name}.{row_id}: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error applying INSERT to {table_name}.{row_id}: {e}")
+            raise
                 
     def _apply_update_change(self, conn, table_name, row_id, content_data):
         """Apply an UPDATE change to the database
@@ -834,49 +904,95 @@ class DatabaseManager:
             row_id: ID of the row
             content_data: Content data (list or dict)
         """
-        if table_name == 'beers':
-            if isinstance(content_data, list):
-                # Map values from list to appropriate column positions
-                conn.execute('''
-                    UPDATE beers SET Name=?, ABV=?, IBU=?, Color=?, OriginalGravity=?, 
-                    FinalGravity=?, Description=?, Brewed=?, Kegged=?, Tapped=?, Notes=?
-                    WHERE idBeer=?
-                ''', (content_data[1] if len(content_data) > 1 else None, 
-                      content_data[2] if len(content_data) > 2 else None,
-                      content_data[3] if len(content_data) > 3 else None, 
-                      content_data[4] if len(content_data) > 4 else None,
-                      content_data[5] if len(content_data) > 5 else None,
-                      content_data[6] if len(content_data) > 6 else None,
-                      content_data[7] if len(content_data) > 7 else None,
-                      content_data[8] if len(content_data) > 8 else None,
-                      content_data[9] if len(content_data) > 9 else None,
-                      content_data[10] if len(content_data) > 10 else None,
-                      content_data[11] if len(content_data) > 11 else None,
-                      row_id))
+        try:
+            logger.debug(f"Applying UPDATE to {table_name}.{row_id}")
+            logger.debug(f"Content data type: {type(content_data)}")
+            
+            if table_name == 'beers':
+                if isinstance(content_data, list):
+                    # Map values from list to appropriate column positions
+                    logger.debug(f"UPDATE beer with list data: {content_data}")
+                    conn.execute('''
+                        UPDATE beers SET Name=?, ABV=?, IBU=?, Color=?, OriginalGravity=?, 
+                        FinalGravity=?, Description=?, Brewed=?, Kegged=?, Tapped=?, Notes=?
+                        WHERE idBeer=?
+                    ''', (content_data[1] if len(content_data) > 1 else None, 
+                        content_data[2] if len(content_data) > 2 else None,
+                        content_data[3] if len(content_data) > 3 else None, 
+                        content_data[4] if len(content_data) > 4 else None,
+                        content_data[5] if len(content_data) > 5 else None,
+                        content_data[6] if len(content_data) > 6 else None,
+                        content_data[7] if len(content_data) > 7 else None,
+                        content_data[8] if len(content_data) > 8 else None,
+                        content_data[9] if len(content_data) > 9 else None,
+                        content_data[10] if len(content_data) > 10 else None,
+                        content_data[11] if len(content_data) > 11 else None,
+                        row_id))
+                else:
+                    # It's a dictionary, use .get()
+                    # Log the dictionary keys to help with debugging
+                    logger.debug(f"UPDATE beer with dict data. Keys: {list(content_data.keys())}")
+                    
+                    # Check for different possible name conventions in the dictionary
+                    name = None
+                    if 'name' in content_data:
+                        name = content_data.get('name')
+                    elif 'Name' in content_data:
+                        name = content_data.get('Name')
+                        
+                    # Same for other fields
+                    abv = content_data.get('abv') or content_data.get('ABV')
+                    ibu = content_data.get('ibu') or content_data.get('IBU')
+                    color = content_data.get('color') or content_data.get('Color')
+                    og = content_data.get('og') or content_data.get('OriginalGravity')
+                    fg = content_data.get('fg') or content_data.get('FinalGravity')
+                    description = content_data.get('description') or content_data.get('Description')
+                    brewed = content_data.get('brewed') or content_data.get('Brewed')
+                    kegged = content_data.get('kegged') or content_data.get('Kegged')
+                    tapped = content_data.get('tapped') or content_data.get('Tapped')
+                    notes = content_data.get('notes') or content_data.get('Notes')
+                    
+                    logger.debug(f"Updating beer: id={row_id}, name={name}, abv={abv}")
+                    
+                    conn.execute('''
+                        UPDATE beers SET Name=?, ABV=?, IBU=?, Color=?, OriginalGravity=?, 
+                        FinalGravity=?, Description=?, Brewed=?, Kegged=?, Tapped=?, Notes=?
+                        WHERE idBeer=?
+                    ''', (name, abv, ibu, color, og, fg, description, brewed, kegged, tapped, notes, row_id))
+            elif table_name == 'taps':
+                if isinstance(content_data, list):
+                    logger.debug(f"UPDATE tap with list data: {content_data}")
+                    conn.execute('''
+                        UPDATE taps SET idBeer=?
+                        WHERE idTap=?
+                    ''', (content_data[1] if len(content_data) > 1 else None, row_id))
+                else:
+                    # It's a dictionary, use .get()
+                    logger.debug(f"UPDATE tap with dict data. Keys: {list(content_data.keys())}")
+                    
+                    # Check for different possible beer_id naming conventions
+                    beer_id = None
+                    if 'beer_id' in content_data:
+                        beer_id = content_data.get('beer_id')
+                    elif 'idBeer' in content_data:
+                        beer_id = content_data.get('idBeer')
+                    
+                    logger.debug(f"Updating tap: idTap={row_id}, idBeer={beer_id}")
+                    
+                    conn.execute('''
+                        UPDATE taps SET idBeer=?
+                        WHERE idTap=?
+                    ''', (beer_id, row_id))
             else:
-                # It's a dictionary, use .get()
-                conn.execute('''
-                    UPDATE beers SET Name=?, ABV=?, IBU=?, Color=?, OriginalGravity=?, 
-                    FinalGravity=?, Description=?, Brewed=?, Kegged=?, Tapped=?, Notes=?
-                    WHERE idBeer=?
-                ''', (content_data.get('name'), content_data.get('abv'),
-                    content_data.get('ibu'), content_data.get('color'), content_data.get('og'),
-                    content_data.get('fg'), content_data.get('description'),
-                    content_data.get('brewed'), content_data.get('kegged'),
-                    content_data.get('tapped'), content_data.get('notes'), row_id))
-        elif table_name == 'taps':
-            if isinstance(content_data, list):
-                conn.execute('''
-                    UPDATE taps SET idBeer=?
-                    WHERE idTap=?
-                ''', (content_data[1] if len(content_data) > 1 else None, row_id))
-            else:
-                # It's a dictionary, use .get()
-                conn.execute('''
-                    UPDATE taps SET idBeer=?
-                    WHERE idTap=?
-                ''', (content_data.get('beer_id'), row_id))
+                logger.warning(f"Unknown table for UPDATE: {table_name}")
                 
+        except sqlite3.Error as e:
+            logger.error(f"SQLite error applying UPDATE to {table_name}.{row_id}: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error applying UPDATE to {table_name}.{row_id}: {e}")
+            raise
+    
     def _apply_delete_change(self, conn, table_name, row_id):
         """Apply a DELETE change to the database
         
@@ -885,7 +1001,33 @@ class DatabaseManager:
             table_name: Name of the table
             row_id: ID of the row
         """
-        if table_name == 'beers':
-            conn.execute('DELETE FROM beers WHERE idBeer=?', (row_id,))
-        elif table_name == 'taps':
-            conn.execute('DELETE FROM taps WHERE idTap=?', (row_id,)) 
+        try:
+            logger.debug(f"Applying DELETE to {table_name}.{row_id}")
+            
+            if table_name == 'beers':
+                # Check if the row actually exists
+                cursor = conn.cursor()
+                cursor.execute('SELECT 1 FROM beers WHERE idBeer=?', (row_id,))
+                if cursor.fetchone():
+                    conn.execute('DELETE FROM beers WHERE idBeer=?', (row_id,))
+                    logger.info(f"Deleted beer with idBeer={row_id}")
+                else:
+                    logger.warning(f"Beer with idBeer={row_id} not found for deletion")
+            elif table_name == 'taps':
+                # Check if the row actually exists
+                cursor = conn.cursor()
+                cursor.execute('SELECT 1 FROM taps WHERE idTap=?', (row_id,))
+                if cursor.fetchone():
+                    conn.execute('DELETE FROM taps WHERE idTap=?', (row_id,))
+                    logger.info(f"Deleted tap with idTap={row_id}")
+                else:
+                    logger.warning(f"Tap with idTap={row_id} not found for deletion")
+            else:
+                logger.warning(f"Unknown table for DELETE: {table_name}")
+                
+        except sqlite3.Error as e:
+            logger.error(f"SQLite error applying DELETE to {table_name}.{row_id}: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error applying DELETE to {table_name}.{row_id}: {e}")
+            raise 
