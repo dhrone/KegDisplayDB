@@ -208,7 +208,7 @@ class DatabaseManager:
     # ---- Beer Management Methods ----
     
     def add_beer(self, name, abv=None, ibu=None, color=None, og=None, fg=None, 
-                description=None, brewed=None, kegged=None, tapped=None, notes=None):
+                description=None, brewed=None, kegged=None, tapped=None, notes=None, conn=None):
         """Add a new beer to the database
         
         Args:
@@ -223,6 +223,7 @@ class DatabaseManager:
             kegged: Keg date (datetime object or string)
             tapped: Tap date (datetime object or string)
             notes: Additional notes
+            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             id: The ID of the newly added beer
@@ -244,7 +245,8 @@ class DatabaseManager:
                 tapped = tapped.replace(tzinfo=UTC)
             tapped = tapped.strftime("%Y-%m-%d %H:%M:%S")
         
-        with self.get_connection() as conn:
+        # If a connection was provided, use it directly
+        if conn:
             cursor = conn.cursor()
             cursor.execute('''
                 INSERT INTO beers (
@@ -254,18 +256,35 @@ class DatabaseManager:
             ''', (name, abv, ibu, color, og, fg, description, brewed, kegged, tapped, notes))
             
             beer_id = cursor.lastrowid
-            conn.commit()
+            # Do not commit - caller will handle this
             
             logger.info(f"Added beer '{name}' with ID {beer_id}")
             return beer_id
+        else:
+            # Use our own connection if none was provided
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO beers (
+                        Name, ABV, IBU, Color, OriginalGravity, FinalGravity,
+                        Description, Brewed, Kegged, Tapped, Notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (name, abv, ibu, color, og, fg, description, brewed, kegged, tapped, notes))
+                
+                beer_id = cursor.lastrowid
+                conn.commit()
+                
+                logger.info(f"Added beer '{name}' with ID {beer_id}")
+                return beer_id
     
     def update_beer(self, beer_id, name=None, abv=None, ibu=None, color=None, og=None, fg=None,
-                   description=None, brewed=None, kegged=None, tapped=None, notes=None):
+                   description=None, brewed=None, kegged=None, tapped=None, notes=None, conn=None):
         """Update an existing beer in the database
         
         Args:
             beer_id: ID of the beer to update
             Other parameters: Same as add_beer, but all optional
+            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             success: True if the beer was updated, False if not found
@@ -287,9 +306,11 @@ class DatabaseManager:
                 tapped = tapped.replace(tzinfo=UTC)
             tapped = tapped.strftime("%Y-%m-%d %H:%M:%S")
         
-        # First get the current values
-        with self.get_connection() as conn:
+        # If a connection was provided, use it
+        if conn:
             cursor = conn.cursor()
+            
+            # Get current values
             cursor.execute(
                 "SELECT Name, ABV, IBU, Color, OriginalGravity, FinalGravity, "
                 "Description, Brewed, Kegged, Tapped, Notes FROM beers WHERE idBeer = ?", 
@@ -330,7 +351,7 @@ class DatabaseManager:
                  update_fg, update_desc, update_brewed, update_kegged, update_tapped, 
                  update_notes, beer_id))
             
-            conn.commit()
+            # Do not commit - caller will handle this
             
             if cursor.rowcount > 0:
                 logger.info(f"Updated beer '{update_name}' with ID {beer_id}")
@@ -338,6 +359,60 @@ class DatabaseManager:
             else:
                 logger.warning(f"No changes made to beer with ID {beer_id}")
                 return False
+        else:
+            # Use our own connection if none was provided
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Get current values
+                cursor.execute(
+                    "SELECT Name, ABV, IBU, Color, OriginalGravity, FinalGravity, "
+                    "Description, Brewed, Kegged, Tapped, Notes FROM beers WHERE idBeer = ?", 
+                    (beer_id,)
+                )
+                
+                row = cursor.fetchone()
+                if not row:
+                    logger.warning(f"Beer with ID {beer_id} not found for update")
+                    return False
+                
+                # Use existing values for any parameters not provided
+                current_name, current_abv, current_ibu, current_color = row[0:4]
+                current_og, current_fg, current_desc = row[4:7]
+                current_brewed, current_kegged, current_tapped, current_notes = row[7:11]
+                
+                # Update with new values if provided
+                update_name = name if name is not None else current_name
+                update_abv = abv if abv is not None else current_abv
+                update_ibu = ibu if ibu is not None else current_ibu
+                update_color = color if color is not None else current_color
+                update_og = og if og is not None else current_og
+                update_fg = fg if fg is not None else current_fg
+                update_desc = description if description is not None else current_desc
+                update_brewed = brewed if brewed is not None else current_brewed
+                update_kegged = kegged if kegged is not None else current_kegged
+                update_tapped = tapped if tapped is not None else current_tapped
+                update_notes = notes if notes is not None else current_notes
+                
+                # Perform the update
+                cursor.execute('''
+                    UPDATE beers SET 
+                        Name = ?, ABV = ?, IBU = ?, Color = ?, OriginalGravity = ?, 
+                        FinalGravity = ?, Description = ?, Brewed = ?, Kegged = ?, 
+                        Tapped = ?, Notes = ?
+                    WHERE idBeer = ?
+                ''', (update_name, update_abv, update_ibu, update_color, update_og, 
+                     update_fg, update_desc, update_brewed, update_kegged, update_tapped, 
+                     update_notes, beer_id))
+                
+                conn.commit()
+                
+                if cursor.rowcount > 0:
+                    logger.info(f"Updated beer '{update_name}' with ID {beer_id}")
+                    return True
+                else:
+                    logger.warning(f"No changes made to beer with ID {beer_id}")
+                    return False
     
     def delete_beer(self, beer_id):
         """Delete a beer from the database

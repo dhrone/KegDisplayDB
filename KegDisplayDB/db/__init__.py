@@ -323,7 +323,8 @@ class SyncedDatabase:
                                     brewed=beer_data.get('Brewed'),
                                     kegged=beer_data.get('Kegged'),
                                     tapped=beer_data.get('Tapped'),
-                                    notes=beer_data.get('Notes')
+                                    notes=beer_data.get('Notes'),
+                                    conn=conn  # Pass the existing connection
                                 )
                                 if success:
                                     # Get content for the row for change tracking
@@ -353,7 +354,8 @@ class SyncedDatabase:
                                     brewed=beer_data.get('Brewed'),
                                     kegged=beer_data.get('Kegged'),
                                     tapped=beer_data.get('Tapped'),
-                                    notes=beer_data.get('Notes')
+                                    notes=beer_data.get('Notes'),
+                                    conn=conn  # Pass the existing connection
                                 )
                                 if beer_id:
                                     # Get content for the row for change tracking
