@@ -344,6 +344,16 @@ def import_beers():
         # Create a copy of the file data since we can't pass the file object to a background thread
         file_data = file.stream.read().decode("UTF8")
         
+        # Update global import status
+        global import_status
+        import_status["in_progress"] = True
+        import_status["last_import"] = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "success": None,
+            "imported_count": 0,
+            "errors": []
+        }
+        
         # Start the import in a background thread to avoid worker timeouts
         logger = logging.getLogger("KegDisplay")
         
@@ -373,6 +383,9 @@ def import_beers():
                                 row[field] = None
                     
                     beer_data_list.append(row)
+                
+                imported_count = 0
+                errors = []
                 
                 if synced_db:
                     # Use the bulk import method
@@ -467,10 +480,27 @@ def import_beers():
                     except Exception as e:
                         conn.rollback()
                         logger.error(f"Error in background import: {e}")
+                        errors.append(f"Database error: {str(e)}")
                     finally:
                         conn.close()
+                
+                # Update import status when complete
+                global import_status
+                import_status["in_progress"] = False
+                import_status["last_import"]["timestamp"] = datetime.now(UTC).isoformat()
+                import_status["last_import"]["success"] = True
+                import_status["last_import"]["imported_count"] = imported_count
+                import_status["last_import"]["errors"] = errors[:10]  # Limit to first 10 errors
+                
             except Exception as e:
                 logger.error(f"Unexpected error in background import: {e}")
+                
+                # Update import status with error
+                global import_status
+                import_status["in_progress"] = False
+                import_status["last_import"]["timestamp"] = datetime.now(UTC).isoformat()
+                import_status["last_import"]["success"] = False
+                import_status["last_import"]["errors"] = [f"Unexpected error: {str(e)}"]
         
         # Start the background thread
         import_thread = threading.Thread(target=background_import, daemon=True)
@@ -483,7 +513,32 @@ def import_beers():
         })
         
     except Exception as e:
+        # Update import status with error
+        global import_status
+        import_status["in_progress"] = False
+        import_status["last_import"]["timestamp"] = datetime.now(UTC).isoformat()
+        import_status["last_import"]["success"] = False
+        import_status["last_import"]["errors"] = [f"Error processing CSV: {str(e)}"]
+        
         return jsonify({"error": f"Error processing CSV: {str(e)}"}), 500
+
+@app.route('/api/beers/import-status', methods=['GET'])
+@login_required
+def get_import_status():
+    """Get the current status of beer import operations"""
+    global import_status
+    
+    # Add a timestamp to the response
+    response = {
+        "in_progress": import_status["in_progress"],
+        "current_time": datetime.now(UTC).isoformat()
+    }
+    
+    # Include last import details if available
+    if import_status["last_import"]["timestamp"]:
+        response["last_import"] = import_status["last_import"]
+    
+    return jsonify(response)
 
 @app.route('/api/beers/clear', methods=['POST'])
 @login_required
@@ -1285,3 +1340,14 @@ def start(passed_args=None):
 if __name__ == '__main__':
     # Only parse arguments when run as a script
     start(parse_args()) 
+
+# Global variable to track import status
+import_status = {
+    "in_progress": False,
+    "last_import": {
+        "timestamp": None,
+        "success": None,
+        "imported_count": 0,
+        "errors": []
+    }
+} 

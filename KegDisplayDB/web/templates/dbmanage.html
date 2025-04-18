@@ -246,18 +246,50 @@ document.addEventListener('DOMContentLoaded', function() {
             document.getElementById('import-file-name').textContent = '';
             document.getElementById('import-btn').disabled = true;
             
-            // Start a periodic check to inform user that import is still in progress
-            let updateCount = 0;
-            const maxUpdates = 15; // Show updates for about 30 seconds
-            const intervalId = setInterval(() => {
-                updateCount++;
-                if (updateCount > maxUpdates) {
-                    clearInterval(intervalId);
-                    showAlert('import-alert-container', 'info', 
-                        'Import is continuing in the background. You can continue using the application.');
-                } else {
-                    showAlert('import-alert-container', 'info', 
-                        `Import is processing in the background... (${updateCount * 2} seconds elapsed)`);
+            // Start checking the import status periodically
+            let statusChecks = 0;
+            const checkStatus = setInterval(() => {
+                statusChecks++;
+                
+                // Poll the import status API
+                fetch('/api/beers/import-status')
+                    .then(response => response.json())
+                    .then(statusData => {
+                        // If import is no longer in progress and we have last import data
+                        if (!statusData.in_progress && statusData.last_import) {
+                            clearInterval(checkStatus);
+                            
+                            const lastImport = statusData.last_import;
+                            if (lastImport.success) {
+                                let message = `Import completed successfully! ${lastImport.imported_count} beers imported.`;
+                                if (lastImport.errors && lastImport.errors.length > 0) {
+                                    message += ` There were ${lastImport.errors.length} errors during import.`;
+                                    console.error('Import errors:', lastImport.errors);
+                                }
+                                showAlert('import-alert-container', 'success', message);
+                            } else {
+                                let errorMessage = 'Import failed.';
+                                if (lastImport.errors && lastImport.errors.length > 0) {
+                                    errorMessage += ` Error: ${lastImport.errors[0]}`;
+                                    console.error('Import errors:', lastImport.errors);
+                                }
+                                showAlert('import-alert-container', 'danger', errorMessage);
+                            }
+                        } else if (statusData.in_progress) {
+                            // Still in progress, update the message
+                            showAlert('import-alert-container', 'info', 
+                                `Import is processing in the background... (${statusChecks * 2} seconds elapsed)`);
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Error checking import status:', error);
+                    });
+                
+                // Stop checking after 5 minutes to avoid endless polling
+                if (statusChecks > 150) {  // 150 * 2 seconds = 5 minutes
+                    clearInterval(checkStatus);
+                    showAlert('import-alert-container', 'warning', 
+                        'Stopped checking import status. The import is still running in the background.');
                 }
             }, 2000);
         })
