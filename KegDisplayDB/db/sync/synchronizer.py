@@ -104,6 +104,24 @@ class DatabaseSynchronizer:
         
         logger.info(f"Broadcasted database update notification, version {version}")
     
+    def notify_update_with_connection(self, conn):
+        """Notify other instances that a change has been made using existing connection
+        
+        Args:
+            conn: The database connection to use
+        """
+        # Get current database version using the provided connection
+        version = self.change_tracker.get_db_version(conn=conn)
+        
+        # Broadcast the update to all peers
+        update_message = self.protocol.create_update_message(
+            version, 
+            self.network.sync_port
+        )
+        self.network.send_broadcast(update_message)
+        
+        logger.info(f"Broadcasted database update notification, version {version}")
+    
     def handle_message(self, data, addr, is_sync=False):
         """Handle incoming messages
         
@@ -1514,15 +1532,20 @@ class DatabaseSynchronizer:
                 logger.warning(f"Exception during sync with new peer {peer_ip}: {e}")
                 # The peer is already added to the peers dictionary, which is what tests check for
     
-    def _sync_with_peer(self, peer):
+    def _sync_with_peer(self, peer, conn=None):
         """Synchronize changes with a peer in test mode
         
         Args:
             peer: Peer instance to sync with
+            conn: Optional database connection to use
         """
         try:
             # Get our version information
-            our_version = self.change_tracker.get_db_version()
+            if conn:
+                our_version = self.change_tracker.get_db_version(conn=conn)
+            else:
+                our_version = self.change_tracker.get_db_version()
+                
             our_clock = our_version.get('logical_clock', 0)
             our_node_id = our_version.get('node_id')
             logger.info(f"Syncing with peer. Our logical clock: {our_clock}")
@@ -1557,12 +1580,20 @@ class DatabaseSynchronizer:
                     logger.info(f"Successfully applied {len(changes)} changes from peer")
                     
                     # Update our logical clock after applying changes
-                    our_new_version = self.change_tracker.get_db_version()
+                    if conn:
+                        our_new_version = self.change_tracker.get_db_version(conn=conn)
+                    else:
+                        our_new_version = self.change_tracker.get_db_version()
+                        
                     our_new_clock = our_new_version.get('logical_clock', 0)
                     
                     # Make sure our clock is at least as high as the peer's
                     if peer_clock > our_new_clock:
-                        self.change_tracker.update_logical_clock(peer_clock)
+                        if conn:
+                            self.change_tracker.update_logical_clock(peer_clock, conn=conn)
+                        else:
+                            self.change_tracker.update_logical_clock(peer_clock)
+                            
                         logger.info(f"Updated our logical clock to {peer_clock} to match peer")
                     
                     logger.info(f"Updated our version to: logical clock {our_new_clock} after applying changes")

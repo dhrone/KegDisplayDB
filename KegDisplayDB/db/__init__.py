@@ -440,7 +440,8 @@ class SyncedDatabase:
                                 # Increment with longer timeout
                                 new_clock = self.change_tracker.increment_logical_clock(
                                     max_retries=3,
-                                    retry_delay=1.0
+                                    retry_delay=1.0,
+                                    conn=conn
                                 )
                                 
                                 if new_clock is None or new_clock == 0:
@@ -553,14 +554,71 @@ class SyncedDatabase:
                             (new_clock,)
                         )
                         conn.commit()
+                    
+                    # Use the same connection for notification to avoid deadlocks
+                    self.notify_update_with_connection(conn)
                 
-                self.notify_update()
                 logger.info(f"Successfully imported {success_count} beers")
             except Exception as e:
                 logger.error(f"Error notifying after import: {str(e)}")
                 errors.append(f"Error notifying after import: {str(e)}")
             
         return (success_count, errors)
+    
+    def notify_update_with_connection(self, conn):
+        """Notify other instances that a change has been made, using an existing connection
+        
+        Args:
+            conn: Database connection to use
+        """
+        try:
+            if self.test_mode:
+                # In test mode, directly sync with test peers
+                for peer in self.test_peers:
+                    try:
+                        if peer != self and hasattr(peer, 'synchronizer') and peer.synchronizer:
+                            # Only sync with peer if both have synchronizers
+                            if hasattr(self, 'synchronizer') and self.synchronizer:
+                                self.synchronizer._sync_with_peer(peer, conn)
+                    except Exception as e:
+                        logger.error(f"Error syncing with test peer: {e}")
+            else:
+                # Use synchronizer to broadcast update if available
+                if hasattr(self, 'synchronizer') and self.synchronizer:
+                    try:
+                        # Give a short timeout for network operations
+                        notify_thread = threading.Thread(
+                            target=lambda: self._notify_update_with_timeout(conn),
+                            daemon=True
+                        )
+                        notify_thread.start()
+                        notify_thread.join(timeout=2.0)  # Wait up to 2 seconds
+                        
+                        # Log success
+                        logger.info("Update notification broadcast complete or timed out")
+                    except Exception as e:
+                        logger.error(f"Error starting notification thread: {e}")
+                else:
+                    logger.warning("Notification skipped: no synchronizer available")
+        except Exception as e:
+            logger.error(f"Error in notify_update_with_connection: {e}")
+            
+    def _notify_update_with_timeout(self, conn=None):
+        """Execute the notification with timeout protection
+        
+        Args:
+            conn: Optional database connection to use
+        """
+        try:
+            # Use synchronizer to broadcast update
+            if conn is not None and hasattr(self.synchronizer, 'notify_update_with_connection'):
+                self.synchronizer.notify_update_with_connection(conn)
+            else:
+                self.synchronizer.notify_update()
+        except socket.error as e:
+            logger.error(f"Network error during notification: {e}")
+        except Exception as e:
+            logger.error(f"Error in notification thread: {e}")
     
     def clear_all_beers(self):
         """

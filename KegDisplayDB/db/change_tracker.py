@@ -168,7 +168,7 @@ class ChangeTracker:
         logger.error(f"Failed to increment logical clock after {max_retries} attempts")
         return None
     
-    def update_logical_clock(self, received_clock, max_retries=5, retry_delay=0.5):
+    def update_logical_clock(self, received_clock, max_retries=5, retry_delay=0.5, conn=None):
         """
         Update logical clock based on received clock value (Lamport algorithm)
         
@@ -176,77 +176,105 @@ class ChangeTracker:
             received_clock: Clock value received from another node
             max_retries: Number of times to retry if database is locked
             retry_delay: Time to wait between retries in seconds
+            conn: Optional database connection to use
             
         Returns:
             New clock value or None if unsuccessful
         """
-        retries = 0
-        
-        while retries < max_retries:
-            try:
-                with self.db_manager.get_connection() as conn:
-                    # Set a longer timeout for this operation
-                    conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
-                    
-                    # Get current logical clock value
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
-                    row = cursor.fetchone()
-                    
-                    if row is None:
-                        # Initialize with received_clock+1 if no row exists
-                        current_clock = 0
-                        new_clock = received_clock + 1
+        # If a connection was provided, use it directly
+        if conn:
+            return self._do_update_logical_clock(conn, received_clock)
+        else:
+            # Otherwise, use our retry logic with a new connection
+            retries = 0
+            
+            while retries < max_retries:
+                try:
+                    with self.db_manager.get_connection() as conn:
+                        # Set a longer timeout for this operation
+                        conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
                         
-                        # Insert new version record
-                        cursor.execute(
-                            "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
-                            (
-                                datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                "0",
-                                new_clock,
-                                self.node_id
-                            )
-                        )
+                        # Perform the update
+                        return self._do_update_logical_clock(conn, received_clock)
+                            
+                except sqlite3.OperationalError as e:
+                    if "database is locked" in str(e):
+                        retries += 1
+                        logger.warning(f"Database locked when updating logical clock (attempt {retries}/{max_retries}), retrying in {retry_delay}s")
+                        time.sleep(retry_delay)
+                        # Increase backoff time for subsequent retries
+                        retry_delay *= 1.5
                     else:
-                        # Lamport clock rule: local_clock = max(local_clock, received_clock) + 1
-                        current_clock = row[0] if row[0] is not None else 0
-                        new_clock = max(current_clock, received_clock) + 1
-                        
-                        # Update version record
-                        cursor.execute(
-                            "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
-                            (
-                                datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                new_clock
-                            )
-                        )
-                    
-                    # Commit the transaction
-                    conn.commit()
-                    
-                    # Log the update
-                    logger.info(f"Updated logical clock from {current_clock} to {new_clock} based on received clock {received_clock}")
-                    return new_clock
-                    
-            except sqlite3.OperationalError as e:
-                if "database is locked" in str(e):
-                    retries += 1
-                    logger.warning(f"Database locked when updating logical clock (attempt {retries}/{max_retries}), retrying in {retry_delay}s")
-                    time.sleep(retry_delay)
-                    # Increase backoff time for subsequent retries
-                    retry_delay *= 1.5
-                else:
+                        logger.error(f"Error updating logical clock: {e}")
+                        return None
+                except Exception as e:
                     logger.error(f"Error updating logical clock: {e}")
                     return None
-            except Exception as e:
-                logger.error(f"Error updating logical clock: {e}")
-                return None
+            
+            logger.error(f"Failed to update logical clock after {max_retries} attempts")
+            return None
+            
+    def _do_update_logical_clock(self, conn, received_clock):
+        """
+        Perform the actual logical clock update using a provided connection
         
-        logger.error(f"Failed to update logical clock after {max_retries} attempts")
-        return None
+        Args:
+            conn: Database connection to use
+            received_clock: Clock value received from another node
+            
+        Returns:
+            The new clock value
+        """
+        try:
+            # Get current logical clock value
+            cursor = conn.cursor()
+            cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
+            row = cursor.fetchone()
+            
+            if row is None:
+                # Initialize with received_clock+1 if no row exists
+                current_clock = 0
+                new_clock = received_clock + 1
+                
+                # Insert new version record
+                cursor.execute(
+                    "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
+                    (
+                        datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "0",
+                        new_clock,
+                        self.node_id
+                    )
+                )
+            else:
+                # Lamport clock rule: local_clock = max(local_clock, received_clock) + 1
+                current_clock = row[0] if row[0] is not None else 0
+                new_clock = max(current_clock, received_clock) + 1
+                
+                # Update version record
+                cursor.execute(
+                    "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
+                    (
+                        datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        new_clock
+                    )
+                )
+            
+            # Commit the transaction
+            conn.commit()
+            
+            # Log the update
+            logger.info(f"Updated logical clock from {current_clock} to {new_clock} based on received clock {received_clock}")
+            return new_clock
+                
+        except sqlite3.Error as e:
+            logger.error(f"SQLite error in _do_update_logical_clock: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error in _do_update_logical_clock: {e}")
+            raise
     
-    def set_logical_clock(self, new_clock, max_retries=5, retry_delay=0.5):
+    def set_logical_clock(self, new_clock, max_retries=5, retry_delay=0.5, conn=None):
         """
         Set the logical clock to a specific value
         
@@ -254,10 +282,16 @@ class ChangeTracker:
             new_clock: The clock value to set
             max_retries: Number of times to retry if database is locked
             retry_delay: Time to wait between retries in seconds
+            conn: Optional database connection to use
             
         Returns:
             The set clock value or None if unsuccessful
         """
+        # If a connection is provided, use it directly
+        if conn is not None:
+            return self._do_set_logical_clock(conn, new_clock)
+            
+        # Otherwise use retry logic with a new connection
         retries = 0
         
         while retries < max_retries:
@@ -265,41 +299,7 @@ class ChangeTracker:
                 with self.db_manager.get_connection() as conn:
                     # Set a longer timeout for this operation
                     conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
-                    
-                    # Get current logical clock value for logging
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
-                    row = cursor.fetchone()
-                    current_clock = row[0] if row and row[0] is not None else 0
-                    
-                    # Check if version row exists
-                    if row is None:
-                        # Create new version record with specified clock
-                        cursor.execute(
-                            "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
-                            (
-                                datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                "0",
-                                new_clock,
-                                self.node_id
-                            )
-                        )
-                    else:
-                        # Update existing version record
-                        cursor.execute(
-                            "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
-                            (
-                                datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                new_clock
-                            )
-                        )
-                    
-                    # Commit the transaction
-                    conn.commit()
-                    
-                    # Log the update
-                    logger.info(f"Set logical clock from {current_clock} to exact value: {new_clock}")
-                    return new_clock
+                    return self._do_set_logical_clock(conn, new_clock)
                     
             except sqlite3.OperationalError as e:
                 if "database is locked" in str(e):
@@ -317,6 +317,53 @@ class ChangeTracker:
         
         logger.error(f"Failed to set logical clock after {max_retries} attempts")
         return None
+        
+    def _do_set_logical_clock(self, conn, new_clock):
+        """
+        Do the actual work of setting the logical clock
+        
+        Args:
+            conn: Database connection to use
+            new_clock: The clock value to set
+            
+        Returns:
+            The set clock value
+        """
+        # Get current logical clock value for logging
+        cursor = conn.cursor()
+        cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
+        row = cursor.fetchone()
+        current_clock = row[0] if row and row[0] is not None else 0
+        
+        # Check if version row exists
+        if row is None:
+            # Create new version record with specified clock
+            cursor.execute(
+                "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
+                (
+                    datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "0",
+                    new_clock,
+                    self.node_id
+                )
+            )
+        else:
+            # Update existing version record
+            cursor.execute(
+                "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
+                (
+                    datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    new_clock
+                )
+            )
+        
+        # Commit the transaction only if we're using our own connection
+        if not conn.in_transaction:
+            conn.commit()
+        
+        # Log the update
+        logger.info(f"Set logical clock from {current_clock} to exact value: {new_clock}")
+        return new_clock
     
     def ensure_valid_session(self):
         """Ensure we have a valid tracking session"""
@@ -529,78 +576,102 @@ class ChangeTracker:
             logger.info(f"Found {len(all_changes)} changes since logical clock {last_clock}")
             return all_changes
     
-    def get_db_version(self):
+    def get_db_version(self, conn=None):
         """Calculate database version based on content and Lamport clock
         
+        Args:
+            conn: Optional database connection to use (to avoid nested transactions)
+            
         Returns:
             version: Dictionary with hash, logical_clock, and node_id
         """
         if not os.path.exists(self.db_manager.db_path):
             return {"hash": "0", "logical_clock": 0, "node_id": self.node_id}
         
+        # Use the provided connection or create a new one as needed
+        if conn:
+            # Use the provided connection directly
+            return self._calculate_db_version(conn)
+        else:
+            # Create our own connection if none was provided
+            try:
+                with self.db_manager.get_connection() as conn:
+                    return self._calculate_db_version(conn)
+            except Exception as e:
+                logger.error(f"Error getting database version: {e}")
+                return {"hash": "0", "logical_clock": 0, "node_id": self.node_id}
+    
+    def _calculate_db_version(self, conn):
+        """Calculate database version using provided connection
+        
+        Args:
+            conn: Database connection to use
+            
+        Returns:
+            version: Dictionary with hash, logical_clock, and node_id
+        """
         try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
+            cursor = conn.cursor()
+            
+            # Calculate content-based hash from all tracked tables
+            tables = ['beers', 'taps']
+            content_hashes = []
+            for table in tables:
+                content_hashes.append(self._get_table_hash(table))
+            content_hash = hashlib.md5(''.join(content_hashes).encode()).hexdigest()
+            
+            # Get version information from version table
+            try:
+                # Get timestamp, hash, logical_clock, and node_id from version table
+                cursor.execute("SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1 LIMIT 1")
+                row = cursor.fetchone()
                 
-                # Calculate content-based hash from all tracked tables
-                tables = ['beers', 'taps']
-                content_hashes = []
-                for table in tables:
-                    content_hashes.append(self._get_table_hash(table))
-                content_hash = hashlib.md5(''.join(content_hashes).encode()).hexdigest()
-                
-                # Get version information from version table
-                try:
-                    # Get timestamp, hash, logical_clock, and node_id from version table
-                    cursor.execute("SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1 LIMIT 1")
-                    row = cursor.fetchone()
+                if row:
+                    timestamp, stored_hash, logical_clock, node_id = row
+                    logical_clock = logical_clock if logical_clock is not None else 0
+                    node_id = node_id if node_id else self.node_id
                     
-                    if row:
-                        timestamp, stored_hash, logical_clock, node_id = row
-                        logical_clock = logical_clock if logical_clock is not None else 0
-                        node_id = node_id if node_id else self.node_id
-                        
-                        # Always update the hash to ensure it's correct
-                        cursor.execute(
-                            "UPDATE version SET hash = ?, node_id = ? WHERE id = 1", 
-                            (content_hash, self.node_id)
-                        )
-                        conn.commit()
-                    else:
-                        timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        logical_clock = 0
-                        node_id = self.node_id
-                        cursor.execute(
-                            "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
-                            (timestamp, content_hash, logical_clock, node_id)
-                        )
-                        conn.commit()
-                except sqlite3.Error as e:
-                    logger.error(f"Error accessing version table: {e}")
+                    # Always update the hash to ensure it's correct
+                    cursor.execute(
+                        "UPDATE version SET hash = ?, node_id = ? WHERE id = 1", 
+                        (content_hash, self.node_id)
+                    )
+                    conn.commit()
+                else:
                     timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
                     logical_clock = 0
                     node_id = self.node_id
-                    
-                    # Try to create the version table with proper schema
-                    try:
-                        cursor.execute('''
-                            CREATE TABLE IF NOT EXISTS version (
-                                id INTEGER PRIMARY KEY,
-                                timestamp TEXT NOT NULL,
-                                hash TEXT NOT NULL,
-                                logical_clock INTEGER DEFAULT 0,
-                                node_id TEXT
-                            )
-                        ''')
-                        cursor.execute(
-                            "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
-                            (timestamp, content_hash, logical_clock, node_id)
+                    cursor.execute(
+                        "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
+                        (timestamp, content_hash, logical_clock, node_id)
+                    )
+                    conn.commit()
+            except sqlite3.Error as e:
+                logger.error(f"Error accessing version table: {e}")
+                timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+                logical_clock = 0
+                node_id = self.node_id
+                
+                # Try to create the version table with proper schema
+                try:
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS version (
+                            id INTEGER PRIMARY KEY,
+                            timestamp TEXT NOT NULL,
+                            hash TEXT NOT NULL,
+                            logical_clock INTEGER DEFAULT 0,
+                            node_id TEXT
                         )
-                        conn.commit()
-                    except sqlite3.Error as e2:
-                        logger.error(f"Error creating version table: {e2}")
+                    ''')
+                    cursor.execute(
+                        "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
+                        (timestamp, content_hash, logical_clock, node_id)
+                    )
+                    conn.commit()
+                except sqlite3.Error as e2:
+                    logger.error(f"Error creating version table: {e2}")
         except Exception as e:
-            logger.error(f"Error getting database version: {e}")
+            logger.error(f"Error calculating database version: {e}")
             return {"hash": "0", "logical_clock": 0, "node_id": self.node_id}
             
         # Building the version object with logical clock and node_id
