@@ -272,11 +272,11 @@ class SyncedDatabase:
         changes_to_log = []
         current_time = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         
-        # First transaction: perform all beer database operations
+        # Single transaction for all operations
         with self.db_manager.get_connection() as conn:
             conn.execute("BEGIN TRANSACTION")
             try:
-                # Process all beers without logging changes yet
+                # Process all beers
                 for idx, beer_data in enumerate(beer_data_list):
                     try:
                         # Skip rows without a name
@@ -358,25 +358,11 @@ class SyncedDatabase:
                     except Exception as e:
                         errors.append(f"Error on beer {idx+1}: {str(e)}")
                 
-                # Commit the beer database changes
-                conn.commit()
-                
-            except Exception as e:
-                conn.rollback()
-                errors.append(f"Transaction error: {str(e)}")
-                logger.error(f"Error during beer import transaction: {e}")
-                # Reset since we failed
-                success_count = 0
-                changes_to_log = []
-        
-        # Second transaction: Log changes only if we have successful operations
-        if success_count > 0 and changes_to_log:
-            # Now increment the Lamport clock - only after successful commit
-            new_clock = self.change_tracker.increment_logical_clock()
-            
-            with self.db_manager.get_connection() as conn:
-                conn.execute("BEGIN TRANSACTION")
-                try:
+                # Continue only if we have successful operations
+                if success_count > 0 and changes_to_log:
+                    # Now increment the Lamport clock
+                    new_clock = self.change_tracker.increment_logical_clock()
+                    
                     cursor = conn.cursor()
                     
                     # Insert all change records with the same logical clock value
@@ -404,17 +390,20 @@ class SyncedDatabase:
                         "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
                         (current_time, new_clock)
                     )
-                    
-                    # Commit the change log entries
-                    conn.commit()
-                    
-                    # Send notification after everything is successful
+                
+                # Commit all changes in a single transaction
+                conn.commit()
+                
+                # Send notification after everything is successful
+                if success_count > 0:
                     self.notify_update()
-                    
-                except Exception as e:
-                    conn.rollback()
-                    errors.append(f"Change logging error: {str(e)}")
-                    logger.error(f"Error logging changes after import: {e}")
+                
+            except Exception as e:
+                conn.rollback()
+                errors.append(f"Transaction error: {str(e)}")
+                logger.error(f"Error during beer import transaction: {e}")
+                # Reset since we failed
+                success_count = 0
             
         return (success_count, errors)
     
