@@ -284,6 +284,10 @@ class DatabaseSynchronizer:
         
         logger.info(f"Received UPDATE notification from {peer_ip}:{peer_sync_port} with version {peer_version}")
         
+        # Update peer information in our peer list (do this before any early returns)
+        with self.lock:
+            self.peers[peer_ip] = (peer_version, time.time(), peer_sync_port)
+        
         # Get our version BEFORE updating our logical clock
         our_version = self.change_tracker.get_db_version()
         peer_clock = peer_version.get("logical_clock", 0)
@@ -312,10 +316,6 @@ class DatabaseSynchronizer:
                 self._request_sync(peer_ip, peer_sync_port)
             else:
                 logger.info(f"We win tie-breaking, not syncing")
-        
-        # Update peer information in our peer list
-        with self.lock:
-            self.peers[peer_ip] = (peer_version, time.time(), peer_sync_port)
     
     def _handle_sync_request(self, client_socket, message, addr):
         """Handle sync request from peer
