@@ -11,6 +11,7 @@ import json
 import threading
 import queue
 import hashlib
+import time
 
 logger = logging.getLogger("KegDisplay")
 
@@ -94,7 +95,9 @@ class DatabaseManager:
                     row_id INTEGER NOT NULL,
                     timestamp TEXT NOT NULL,
                     content TEXT,
-                    content_hash TEXT
+                    content_hash TEXT,
+                    logical_clock INTEGER DEFAULT 0,
+                    node_id TEXT
                 )
             ''')
             
@@ -103,7 +106,9 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS version (
                     id INTEGER PRIMARY KEY,
                     timestamp TEXT NOT NULL,
-                    hash TEXT NOT NULL
+                    hash TEXT NOT NULL,
+                    logical_clock INTEGER DEFAULT 0,
+                    node_id TEXT
                 )
             ''')
             
@@ -579,164 +584,151 @@ class DatabaseManager:
             # Start transaction
             with self.get_connection() as conn:
                 conn.execute('BEGIN TRANSACTION')
+               
+                # Track the highest logical clock from applied changes
+                highest_logical_clock = 0
+                peer_node_id = None
                 
-                # Create change_log and version tables if they don't exist
-                conn.execute('''
-                    CREATE TABLE IF NOT EXISTS change_log (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        table_name TEXT NOT NULL,
-                        operation TEXT NOT NULL,
-                        row_id INTEGER NOT NULL,
-                        timestamp TEXT NOT NULL,
-                        content TEXT NOT NULL,
-                        content_hash TEXT NOT NULL
-                    )
-                ''')
-                
-                conn.execute('''
-                    CREATE TABLE IF NOT EXISTS version (
-                        id INTEGER PRIMARY KEY,
-                        timestamp TEXT NOT NULL,
-                        hash TEXT NOT NULL
-                    )
-                ''')
-                
-                # Track the latest timestamp from applied changes
-                latest_timestamp = None
-                
-                # Apply each change
-                for i, change in enumerate(changes):
-                    if len(change) < 6:  # Should have (table_name, operation, row_id, timestamp, content, content_hash)
-                        logger.warning(f"Invalid change format: {change}")
-                        failed_changes += 1
-                        continue
-                        
-                    table_name, operation, row_id, timestamp, content, content_hash = change
-                    
-                    logger.debug(f"Processing change {i+1}/{len(changes)}: {operation} on {table_name}.{row_id}")
-                    
-                    # Track latest timestamp
-                    if latest_timestamp is None or timestamp > latest_timestamp:
-                        latest_timestamp = timestamp
-                    
-                    # Convert content to string if it's a dictionary
-                    if isinstance(content, dict):
-                        content_str = json.dumps(content)
-                    else:
-                        content_str = content
-                    
-                    # Verify content hash matches content
-                    calculated_hash = hashlib.md5(content_str.encode()).hexdigest()
-                    if calculated_hash != content_hash:
-                        logger.warning(f"Content hash mismatch for change: {table_name}.{row_id}")
-                        logger.warning(f"Expected hash: {content_hash}, calculated hash: {calculated_hash}")
-                        failed_changes += 1
-                        continue
-                    
+                # Process each change
+                for change_index, change in enumerate(changes):
                     try:
-                        # Parse content if it's JSON
-                        try:
-                            content_data = json.loads(content_str)
-                            logger.debug(f"Successfully parsed content JSON for {table_name}.{row_id}")
-                        except (json.JSONDecodeError, TypeError) as e:
-                            logger.error(f"Error parsing content JSON for {table_name}.{row_id}: {e}")
-                            logger.error(f"Content: {content_str[:100]}...")
+                        # Ensure the change has all the required fields
+                        if len(change) < 6:
+                            logger.warning(f"Change at index {change_index} is missing required fields: {change}")
                             failed_changes += 1
                             continue
                         
-                        # Apply the change based on the operation type
-                        success = False
+                        # Extract change information
+                        table_name = change[0]
+                        operation = change[1]
+                        row_id = change[2]
+                        timestamp = change[3]
+                        content = change[4]
+                        content_hash = change[5]
                         
-                        if operation == "INSERT":
-                            # Check if the row already exists
-                            cursor = conn.cursor()
+                        # Extract logical clock and node_id if present
+                        logical_clock = 0
+                        node_id = None
+                        if len(change) >= 7:
+                            logical_clock = change[6]
+                        if len(change) >= 8:
+                            node_id = change[7]
+                            # Store peer node ID for version table update
+                            if not peer_node_id:
+                                peer_node_id = node_id
+                        
+                        # Track highest logical clock
+                        if logical_clock > highest_logical_clock:
+                            highest_logical_clock = logical_clock
+                        
+                        # Verify content hash (security check)
+                        if hashlib.md5(content.encode()).hexdigest() != content_hash:
+                            logger.warning(f"Content hash mismatch for change at index {change_index}")
+                            failed_changes += 1
+                            continue
+                        
+                        logger.debug(f"Applying change: {operation} to {table_name}.{row_id} (logical clock: {logical_clock})")
+                        
+                        # Apply the change based on operation type
+                        if operation == 'INSERT' or operation == 'UPDATE':
                             try:
-                                cursor.execute(f"SELECT 1 FROM {table_name} WHERE rowid = ?", (row_id,))
-                                if cursor.fetchone():
-                                    logger.info(f"Row {row_id} already exists in {table_name}, using UPDATE instead")
-                                    self._apply_update_change(conn, table_name, row_id, content_data)
-                                else:
-                                    logger.info(f"Inserting new row {row_id} into {table_name}")
-                                    self._apply_insert_change(conn, table_name, row_id, content_data)
-                                success = True
-                            except sqlite3.Error as e:
-                                logger.error(f"Database error checking row existence in {table_name}: {e}")
+                                # Parse the content as JSON and build the SQL
+                                import json
+                                row_data = json.loads(content)
+                                
+                                if operation == 'INSERT':
+                                    # Build INSERT statement
+                                    columns = ', '.join(row_data.keys())
+                                    placeholders = ', '.join(['?'] * len(row_data))
+                                    sql = f"INSERT OR REPLACE INTO {table_name} ({columns}) VALUES ({placeholders})"
+                                    conn.execute(sql, list(row_data.values()))
+                                    
+                                elif operation == 'UPDATE':
+                                    # Build UPDATE statement
+                                    set_clause = ', '.join([f"{col} = ?" for col in row_data.keys()])
+                                    sql = f"UPDATE {table_name} SET {set_clause} WHERE rowid = ?"
+                                    params = list(row_data.values()) + [row_id]
+                                    conn.execute(sql, params)
+                                
+                                # Log the change in our change_log table
+                                conn.execute(
+                                    """
+                                    INSERT INTO change_log 
+                                    (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                    """,
+                                    (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id)
+                                )
+                                applied_changes += 1
+                                
+                            except Exception as e:
+                                logger.error(f"Error applying {operation} change to {table_name}.{row_id}: {e}")
                                 failed_changes += 1
-                                continue
-                        
-                        elif operation == "UPDATE":
-                            logger.info(f"Updating row {row_id} in {table_name}")
-                            self._apply_update_change(conn, table_name, row_id, content_data)
-                            success = True
-                        
-                        elif operation == "DELETE":
-                            logger.info(f"Deleting row {row_id} from {table_name}")
-                            self._apply_delete_change(conn, table_name, row_id)
-                            success = True
-                        
+                                
+                        elif operation == 'DELETE':
+                            try:
+                                # Execute DELETE statement
+                                sql = f"DELETE FROM {table_name} WHERE rowid = ?"
+                                conn.execute(sql, (row_id,))
+                                
+                                # Log the change in our change_log table
+                                conn.execute(
+                                    """
+                                    INSERT INTO change_log 
+                                    (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                    """,
+                                    (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id)
+                                )
+                                applied_changes += 1
+                                
+                            except Exception as e:
+                                logger.error(f"Error applying DELETE change to {table_name}.{row_id}: {e}")
+                                failed_changes += 1
                         else:
-                            logger.warning(f"Unknown operation type: {operation}")
+                            logger.warning(f"Unknown operation '{operation}' in change at index {change_index}")
                             failed_changes += 1
-                            continue
-                        
-                        # Only log the change if we successfully applied it to the destination table
-                        if success:
-                            # Log the change
-                            conn.execute('''
-                                INSERT INTO change_log (table_name, operation, row_id, timestamp, content, content_hash)
-                                VALUES (?, ?, ?, ?, ?, ?)
-                            ''', (table_name, operation, row_id, timestamp, content_str, content_hash))
-                            applied_changes += 1
-                        
-                    except Exception as e:
-                        logger.error(f"Error applying change {operation} to {table_name}.{row_id}: {e}")
-                        failed_changes += 1
-                        continue
-                
-                # Update the version table with the latest timestamp
-                if latest_timestamp:
-                    # Ensure the timestamp is in the consistent format YYYY-MM-DDThh:mm:ssZ
-                    try:
-                        # Normalize the timestamp format
-                        if '.' in latest_timestamp:
-                            # If it has milliseconds, parse accordingly
-                            dt = datetime.strptime(latest_timestamp, "%Y-%m-%dT%H:%M:%S.%f")
-                        elif 'Z' in latest_timestamp:
-                            # If it has Z timezone indicator
-                            dt = datetime.strptime(latest_timestamp.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
-                        else:
-                            # Basic ISO format without timezone
-                            dt = datetime.strptime(latest_timestamp, "%Y-%m-%dT%H:%M:%S")
                             
-                        # Convert to standard format with Z timezone indicator
-                        normalized_timestamp = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                        
-                        logger.debug(f"Normalized timestamp from '{latest_timestamp}' to '{normalized_timestamp}' for version table")
-                        latest_timestamp = normalized_timestamp
                     except Exception as e:
-                        logger.warning(f"Failed to normalize timestamp '{latest_timestamp}': {e}")
+                        logger.error(f"Error processing change at index {change_index}: {e}")
+                        failed_changes += 1
                 
-                    # Note: We don't update the hash here since that will be recalculated
-                    # when get_db_version is called
-                    conn.execute('''
-                        UPDATE version SET timestamp = ? WHERE id = 1
-                    ''', (latest_timestamp,))
+                # Update the version table with the highest logical clock
+                if highest_logical_clock > 0:
+                    # Get current logical clock
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
+                    row = cursor.fetchone()
+                    current_clock = row[0] if row and row[0] is not None else 0
+                    
+                    # Set logical clock to max of current and highest received
+                    # (We don't increment here, as the synchronizer will do that)
+                    new_clock = max(current_clock, highest_logical_clock)
+                    
+                    # Update version table with new logical clock and timestamp
+                    timestamp = datetime.now(UTC).isoformat()
+                    conn.execute(
+                        "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
+                        (timestamp, new_clock)
+                    )
                     
                     # If no row was updated, insert one
                     if conn.total_changes == 0:
-                        conn.execute('''
-                            INSERT INTO version (id, timestamp, hash) VALUES (1, ?, '0')
-                        ''', (latest_timestamp,))
+                        conn.execute(
+                            "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, '0', ?, ?)",
+                            (timestamp, new_clock, peer_node_id)
+                        )
+                    
+                    logger.info(f"Updated version with logical clock {new_clock}")
                 
-                # Commit transaction
                 conn.commit()
-                logger.info(f"Sync changes applied: {applied_changes} successful, {failed_changes} failed")
+                logger.info(f"Successfully applied {applied_changes} changes, {failed_changes} failed")
                 
         except Exception as e:
             logger.error(f"Error applying sync changes: {e}")
-            with self.get_connection() as conn:
-                conn.rollback()
-            raise
+            return False
+        
+        return applied_changes > 0
     
     def import_from_file(self, temp_db_path):
         """Import the entire database from a file without replacing the original

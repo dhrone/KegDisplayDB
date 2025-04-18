@@ -19,7 +19,7 @@ class SyncProtocol:
         """Create a discovery message
         
         Args:
-            version: Current database version
+            version: Current database version (with logical_clock and node_id)
             sync_port: Port used for sync connections
             
         Returns:
@@ -37,7 +37,7 @@ class SyncProtocol:
         """Create a heartbeat message
         
         Args:
-            version: Current database version
+            version: Current database version (with logical_clock and node_id)
             sync_port: Port used for sync connections
             
         Returns:
@@ -55,7 +55,7 @@ class SyncProtocol:
         """Create an update notification message
         
         Args:
-            version: Current database version
+            version: Current database version (with logical_clock and node_id)
             sync_port: Port used for sync connections
             
         Returns:
@@ -69,13 +69,14 @@ class SyncProtocol:
         return json.dumps(message).encode()
     
     @staticmethod
-    def create_sync_request(version, last_timestamp, sync_port):
+    def create_sync_request(version, last_clock, sync_port, node_id=None):
         """Create a sync request message
         
         Args:
-            version: Current database version
-            last_timestamp: Last known timestamp
+            version: Current database version (with logical_clock and node_id)
+            last_clock: Last known logical clock value
             sync_port: Port used for sync connections
+            node_id: Optional node ID for tie-breaking
             
         Returns:
             bytes: Encoded message
@@ -83,7 +84,8 @@ class SyncProtocol:
         message = {
             'type': 'sync_request',
             'version': version,
-            'last_timestamp': last_timestamp,
+            'last_clock': last_clock,
+            'node_id': node_id,
             'sync_port': sync_port
         }
         return json.dumps(message).encode()
@@ -93,7 +95,7 @@ class SyncProtocol:
         """Create a sync response message
         
         Args:
-            version: Current database version
+            version: Current database version (with logical_clock and node_id)
             has_changes: Whether there are changes to sync
             
         Returns:
@@ -111,7 +113,7 @@ class SyncProtocol:
         """Create a full database request message
         
         Args:
-            version: Current database version
+            version: Current database version (with logical_clock and node_id)
             sync_port: Port used for sync connections
             
         Returns:
@@ -129,7 +131,7 @@ class SyncProtocol:
         """Create a full database response message
         
         Args:
-            version: Current database version
+            version: Current database version (with logical_clock and node_id)
             db_size: Size of the database in bytes
             
         Returns:
@@ -176,6 +178,20 @@ class SyncProtocol:
             # Log the message type for debugging
             message_type = message.get('type', 'unknown')
             logger.debug(f"Successfully parsed message of type: {message_type}")
+            
+            # Check for version field and ensure backward compatibility
+            if 'version' in message:
+                version = message['version']
+                if isinstance(version, dict):
+                    # If version has timestamp but no logical_clock, add default logical_clock
+                    if 'timestamp' in version and 'logical_clock' not in version:
+                        version['logical_clock'] = 0
+                        logger.debug(f"Added default logical_clock to {message_type} message for backward compatibility")
+                    
+                    # If version has no node_id, add a placeholder
+                    if 'node_id' not in version:
+                        version['node_id'] = "legacy-node"
+                        logger.debug(f"Added placeholder node_id to {message_type} message for backward compatibility")
             
             # Special logging for update messages
             if message_type == 'update':

@@ -122,33 +122,23 @@ class TestChangeTracker(unittest.TestCase):
     
     def test_apply_changes(self):
         """Test applying changes from a changeset."""
-        # Create a test changeset (similar to what would be received from another instance)
+        # Register a beer
+        beer_id = self.db_manager.add_beer("Apply Test Beer")
+        
+        # Create a changeset with an UPDATE operation
+        timestamp = "2023-01-01T00:00:00Z"
+        content_str = '{"idBeer": 1, "Name": "Updated Beer", "ABV": 7.0}'
+        content_hash = hashlib.md5(content_str.encode()).hexdigest()
+        
+        # Test data - logical clock and node_id now included
+        logical_clock = 42
+        node_id = "test-node-id"
+        
+        # Construct a full change tuple with logical_clock and node_id
         changes = []
         
-        # Add a beer to the database to get a valid row
-        beer_id = self.db_manager.add_beer("Apply Test Beer", abv=4.0)
-        
-        # Create a timestamp
-        timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        
-        # Get the content and hash for the beer
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute(f"SELECT * FROM beers WHERE idBeer = ?", (beer_id,))
-            row = cursor.fetchone()
-            content = {
-                'name': row[1],
-                'style': row[2],
-                'abv': row[3],
-                'ibu': row[4],
-                'srm': row[5],
-                'description': row[6]
-            }
-            content_str = json.dumps(content)
-            content_hash = hashlib.md5(content_str.encode()).hexdigest()
-        
-        # Create a change
-        change = ("beers", "UPDATE", beer_id, timestamp, content, content_hash)
+        # Create a change with 8 elements (including logical_clock and node_id)
+        change = ("beers", "UPDATE", beer_id, timestamp, content_str, content_hash, logical_clock, node_id)
         changes.append(change)
         
         # Apply the changes through database manager API
@@ -158,7 +148,7 @@ class TestChangeTracker(unittest.TestCase):
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT table_name, operation, row_id, content, content_hash 
+                SELECT table_name, operation, row_id, content, content_hash, logical_clock, node_id
                 FROM change_log 
                 WHERE table_name = ? AND operation = ? AND row_id = ? AND timestamp = ?
             """, ("beers", "UPDATE", beer_id, timestamp))
@@ -170,6 +160,8 @@ class TestChangeTracker(unittest.TestCase):
             self.assertEqual(result[2], beer_id, "Row ID doesn't match")
             self.assertEqual(result[3], content_str, "Content doesn't match")
             self.assertEqual(result[4], content_hash, "Content hash doesn't match")
+            self.assertEqual(result[5], logical_clock, "Logical clock doesn't match")
+            self.assertEqual(result[6], node_id, "Node ID doesn't match")
     
     def test_get_db_version(self):
         """Test retrieving the database version."""
@@ -188,27 +180,54 @@ class TestChangeTracker(unittest.TestCase):
     
     def test_is_newer_version(self):
         """Test comparing two database versions."""
-        # Create two timestamps, one newer than the other
-        older = {"timestamp": "2023-01-01T00:00:00Z", "hash": "123"}
-        newer = {"timestamp": "2023-01-02T00:00:00Z", "hash": "456"}
+        # Create versions with logical clocks
+        older = {
+            "timestamp": "2023-01-01T00:00:00Z", 
+            "hash": "123", 
+            "logical_clock": 1, 
+            "node_id": "node-a"
+        }
+        newer = {
+            "timestamp": "2023-01-01T00:00:00Z", 
+            "hash": "456", 
+            "logical_clock": 2, 
+            "node_id": "node-a"
+        }
         
-        # Check that newer is newer than older
+        # Check that version with higher logical clock is newer
         result = self.change_tracker.is_newer_version(newer, older)
-        self.assertTrue(result, "Newer version should be considered newer")
+        self.assertTrue(result, "Version with higher logical clock should be considered newer")
         
-        # Check that older is not newer than newer
+        # Check that version with lower logical clock is not newer
         result = self.change_tracker.is_newer_version(older, newer)
-        self.assertFalse(result, "Older version should not be considered newer")
+        self.assertFalse(result, "Version with lower logical clock should not be considered newer")
         
-        # Check same timestamp but different hash
-        same_time_diff_hash1 = {"timestamp": "2023-01-01T00:00:00Z", "hash": "abc"}
-        same_time_diff_hash2 = {"timestamp": "2023-01-01T00:00:00Z", "hash": "def"}
+        # Check same logical clock but different node ID (tie-breaker)
+        same_clock_node1 = {
+            "timestamp": "2023-01-01T00:00:00Z", 
+            "hash": "abc", 
+            "logical_clock": 5, 
+            "node_id": "node-a"
+        }
+        same_clock_node2 = {
+            "timestamp": "2023-01-01T00:00:00Z", 
+            "hash": "def", 
+            "logical_clock": 5, 
+            "node_id": "node-b"
+        }
         
-        # The hash comparison is implementation-specific, so we'll just make sure it doesn't crash
-        self.change_tracker.is_newer_version(same_time_diff_hash1, same_time_diff_hash2)
+        # The node ID comparison should break ties (lexicographically higher wins)
+        result_1 = self.change_tracker.is_newer_version(same_clock_node1, same_clock_node2)
+        result_2 = self.change_tracker.is_newer_version(same_clock_node2, same_clock_node1)
+        self.assertFalse(result_1 and result_2, "Only one version can be newer in a tie")
         
         # Special case with hash "0" (considered oldest)
-        zero_hash = {"timestamp": "2023-01-01T00:00:00Z", "hash": "0"}
+        zero_hash = {
+            "timestamp": "2023-01-01T00:00:00Z", 
+            "hash": "0", 
+            "logical_clock": 0, 
+            "node_id": "node-empty"
+        }
         result = self.change_tracker.is_newer_version(newer, zero_hash)
         self.assertTrue(result, "Any version should be newer than hash 0")
     
@@ -221,16 +240,38 @@ class TestChangeTracker(unittest.TestCase):
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("DROP TABLE IF EXISTS change_log")
+            cursor.execute("DROP TABLE IF EXISTS version")
             conn.commit()
         
-        # This should recreate the table
-        self.change_tracker.ensure_valid_session()
+        # In real usage, the schema needs to be recreated by the database manager
+        # before change_tracker can use it
+        self.db_manager.initialize_tables()
         
-        # Verify table exists again
+        # Now initialize tracking based on the recreated schema
+        self.change_tracker.ensure_valid_session()
+        self.change_tracker.initialize_tracking()
+        
+        # Verify tables exist again
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='change_log'")
             self.assertIsNotNone(cursor.fetchone(), "change_log table not recreated")
+            
+            # Check for necessary columns in change_log
+            cursor.execute("PRAGMA table_info(change_log)")
+            columns = [row[1] for row in cursor.fetchall()]
+            self.assertIn("logical_clock", columns, "logical_clock column missing in change_log")
+            self.assertIn("node_id", columns, "node_id column missing in change_log")
+            
+            # Also check for version table
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='version'")
+            self.assertIsNotNone(cursor.fetchone(), "version table not recreated")
+            
+            # Check for necessary columns in version
+            cursor.execute("PRAGMA table_info(version)")
+            columns = [row[1] for row in cursor.fetchall()]
+            self.assertIn("logical_clock", columns, "logical_clock column missing in version")
+            self.assertIn("node_id", columns, "node_id column missing in version")
     
     def test_get_table_hash(self):
         """Test generating a content hash for a table."""

@@ -22,7 +22,7 @@ class TestDatabaseSynchronizer(unittest.TestCase):
         self.mock_network_manager = mock.MagicMock()
         
         # Set up the change tracker to return a test version
-        self.test_version = {"hash": "abc123", "timestamp": "2023-01-01T00:00:00Z"}
+        self.test_version = {"hash": "abc123", "timestamp": "2023-01-01T00:00:00Z", "logical_clock": 0, "node_id": "test-node-id"}
         self.mock_change_tracker.get_db_version.return_value = self.test_version
         
         # Set up network manager with test local IPs
@@ -254,13 +254,16 @@ class TestDatabaseSynchronizer(unittest.TestCase):
         # Create a test message and address with same version as our mock
         test_message = {
             'type': 'update',
-            'version': self.test_version,
+            'version': self.test_version,  # Using the exact same version object
             'sync_port': 5005
         }
         test_addr = ('192.168.1.10', 5000)  # Non-local IP
         
         # Mock the request_sync method
         self.synchronizer._request_sync = mock.MagicMock()
+        
+        # Ensure our mock change_tracker returns the same test_version
+        self.mock_change_tracker.get_db_version.return_value = self.test_version
         
         # Call the method
         self.synchronizer._handle_update(test_message, test_addr)

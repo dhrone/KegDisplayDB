@@ -223,7 +223,7 @@ class TestSyncScenarios(unittest.TestCase):
         
         # 2. Get changes from db1 and apply to db2
         print("\nDEBUG: Step 2 - Get changes from db1 and apply to db2")
-        changes_from_db1 = self.db1_tracker.get_changes_since("1970-01-01T00:00:00Z")
+        changes_from_db1 = self.db1_tracker.get_changes_since_clock(0)
         print(f"DEBUG: Got {len(changes_from_db1)} changes from db1")
         self.db2_manager.apply_sync_changes(changes_from_db1)
         
@@ -255,30 +255,25 @@ class TestSyncScenarios(unittest.TestCase):
         with sqlite3.connect(self.db1_path) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT table_name, operation, row_id, timestamp, content, content_hash 
+                SELECT table_name, operation, row_id, timestamp, content, content_hash, logical_clock 
                 FROM change_log
                 WHERE table_name = 'beers' AND operation = 'UPDATE' AND row_id = ?
             """, (beer1_id,))
             changes = cursor.fetchall()
             print(f"DEBUG: Found {len(changes)} update changes in db1 change_log")
             for c in changes:
-                print(f"DEBUG: Change: {c[0]} {c[1]} {c[2]} at {c[3]}")
+                print(f"DEBUG: Change: {c[0]} {c[1]} {c[2]} at {c[3]}, logical_clock: {c[6]}")
                 print(f"DEBUG: Content: {c[4]}")
         
         # 5. Sync both ways: 
         # 5a. Get changes from db1 since step 2 and apply to db2
         print("\nDEBUG: Step 5a - Directly applying update from db1 to db2")
-        # Find the specific update change instead of using timestamp-based filtering
-        with sqlite3.connect(self.db1_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT table_name, operation, row_id, timestamp, content, content_hash 
-                FROM change_log
-                WHERE table_name = 'beers' AND operation = 'UPDATE' AND row_id = ?
-            """, (beer1_id,))
-            update_changes = cursor.fetchall()
-            print(f"DEBUG: Found {len(update_changes)} update changes to apply")
-            
+        # Find the specific update change using logical clock
+        db1_version = self.db1_tracker.get_db_version()
+        update_changes = self.db1_tracker.get_changes_since_clock(0)
+        update_changes = [c for c in update_changes if c[1] == 'UPDATE' and c[2] == beer1_id]
+        print(f"DEBUG: Found {len(update_changes)} update changes to apply")
+        
         # Apply the update change directly to db2
         if update_changes:
             self.db2_manager.apply_sync_changes(update_changes)
@@ -292,11 +287,15 @@ class TestSyncScenarios(unittest.TestCase):
         
         # 5b. Get changes from db2 since beginning and apply to db1
         print("\nDEBUG: Step 5b - Get changes from db2 since beginning and apply to db1")
-        changes_from_db2 = self.db2_tracker.get_changes_since("1970-01-01T00:00:00Z")
+        changes_from_db2 = self.db2_tracker.get_changes_since_clock(0)
         print(f"DEBUG: Got {len(changes_from_db2)} changes from db2")
         for c in changes_from_db2:
-            print(f"DEBUG: Change from db2: {c[0]} {c[1]} {c[2]} at {c[3]}")
+            if len(c) >= 7:  # Should have logical_clock
+                print(f"DEBUG: Change from db2: {c[0]} {c[1]} {c[2]} at {c[3]}, logical_clock: {c[6]}")
+            else:
+                print(f"DEBUG: Change from db2: {c[0]} {c[1]} {c[2]} at {c[3]}")
             
+        # Apply all changes from db2 to db1
         self.db1_manager.apply_sync_changes(changes_from_db2)
         
         # 6. Verify all changes are reflected in both databases

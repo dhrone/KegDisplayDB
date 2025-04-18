@@ -11,6 +11,7 @@ import shutil
 import socket
 from datetime import datetime, UTC
 import hashlib
+import json
 
 from .protocol import SyncProtocol
 
@@ -105,46 +106,39 @@ class DatabaseSynchronizer:
         
         Args:
             data: Message data
-            addr: Address the message came from
+            addr: Address of sender
             is_sync: Whether this is a sync connection
         """
-        peer_ip = addr[0] if isinstance(addr, tuple) else addr
-        
         if is_sync:
             # Handle sync connection
-            logger.debug(f"Received sync connection from {peer_ip}")
             self._handle_sync_connection(data, addr)
             return
         
         # Parse the message
         message = self.protocol.parse_message(data)
         if not message:
-            logger.warning(f"Received invalid or empty message from {peer_ip}")
+            logger.warning(f"Failed to parse message from {addr[0]}")
             return
         
+        # Handle message based on type
         message_type = message.get('type')
-        if not message_type:
-            logger.warning(f"Received message without type from {peer_ip}")
-            return
         
-        # Add more detailed logging for update messages
-        if message_type == 'update':
-            logger.info(f"Received {message_type} message from {peer_ip}: {message}")
-        else:
-            logger.debug(f"Received {message_type} message from {peer_ip}")
-        
-        # Route message to appropriate handler
         if message_type == 'discovery':
             self._handle_discovery(message, addr)
         elif message_type == 'heartbeat':
             self._handle_heartbeat(message, addr)
         elif message_type == 'update':
-            try:
-                self._handle_update(message, addr)
-            except Exception as e:
-                logger.error(f"Error handling update message from {peer_ip}: {e}")
+            # Check if the received version has logical_clock field
+            # This is for compatibility with nodes that haven't been updated yet
+            version = message.get('version', {})
+            if 'logical_clock' not in version and 'timestamp' in version:
+                # This is an old-style message, add default logical clock value
+                version['logical_clock'] = 0
+                logger.debug(f"Added default logical_clock to message from {addr[0]}")
+            
+            self._handle_update(message, addr)
         else:
-            logger.warning(f"Received unknown message type '{message_type}' from {peer_ip}")
+            logger.warning(f"Received unknown message type '{message_type}' from {addr[0]}")
     
     def _handle_sync_connection(self, client_socket, addr):
         """Handle incoming sync connections
@@ -256,22 +250,33 @@ class DatabaseSynchronizer:
         
         logger.info(f"Received UPDATE notification from {peer_ip}:{peer_sync_port} with version {peer_version}")
         
-        # Update peer information
+        # Update our logical clock based on peer's clock
+        if 'logical_clock' in peer_version:
+            peer_clock = peer_version.get('logical_clock', 0)
+            self.change_tracker.update_logical_clock(peer_clock)
+            logger.debug(f"Updated our logical clock based on peer's clock: {peer_clock}")
+        
+        # Update peer information in our peer list
         with self.lock:
             self.peers[peer_ip] = (peer_version, time.time(), peer_sync_port)
         
         # Compare versions
         our_version = self.change_tracker.get_db_version()
-        logger.info(f"Comparing versions - Peer: {peer_version.get('hash')} / Ours: {our_version.get('hash')}")
+        logger.info(f"Comparing versions - Peer logical clock: {peer_version.get('logical_clock', 0)} / Ours: {our_version.get('logical_clock', 0)}")
         
-        if peer_version.get('hash') != our_version.get('hash'):
-            logger.info(f"Version mismatch detected from {peer_ip}, requesting sync")
-            logger.debug(f"Peer version hash: {peer_version.get('hash')}")
-            logger.debug(f"Our version hash: {our_version.get('hash')}")
+        # First check if the version hashes are identical - no need to sync in that case
+        if peer_version.get('hash') == our_version.get('hash'):
+            logger.debug(f"Version hashes match, no need to sync")
+            return
+        
+        # Check if we need to sync (if peer has newer version)
+        if self.change_tracker.is_newer_version(peer_version, our_version):
+            logger.info(f"Peer {peer_ip} has newer version, requesting sync")
+            logger.debug(f"Peer version: {peer_version}")
+            logger.debug(f"Our version: {our_version}")
             self._request_sync(peer_ip, peer_sync_port)
         else:
-            logger.debug(f"No version change detected from {peer_ip}")
-            logger.debug(f"Both using version hash: {our_version.get('hash')}")
+            logger.debug(f"No version change detected from {peer_ip} or our version is newer")
     
     def _handle_sync_request(self, client_socket, message, addr):
         """Handle sync request from peer
@@ -283,13 +288,28 @@ class DatabaseSynchronizer:
         """
         peer_ip = addr[0]
         
-        # Get the client's last timestamp
-        last_timestamp = message.get('last_timestamp', '1970-01-01T00:00:00Z')
-        logger.info(f"Getting changes since {last_timestamp} for {peer_ip}")
+        # Determine if this is a logical clock-based request or a timestamp-based request
+        using_logical_clock = 'last_clock' in message
+        
+        if using_logical_clock:
+            # Get the client's last logical clock value and node ID
+            last_clock = message.get('last_clock', 0)
+            peer_node_id = message.get('node_id')
+            logger.info(f"Getting changes since logical clock {last_clock} for {peer_ip}")
+        else:
+            # Legacy timestamp-based request
+            last_timestamp = message.get('last_timestamp', '1970-01-01T00:00:00Z')
+            logger.info(f"Getting changes since timestamp {last_timestamp} for {peer_ip} (legacy mode)")
         
         # Get our current database version for logging
         our_version = self.change_tracker.get_db_version()
-        logger.debug(f"Our database version: hash={our_version.get('hash')}, timestamp={our_version.get('timestamp')}")
+        logger.debug(f"Our database version: logical_clock={our_version.get('logical_clock', 0)}, node_id={our_version.get('node_id')}")
+        
+        # Update our logical clock based on peer's version
+        peer_version = message.get('version', {})
+        if 'logical_clock' in peer_version:
+            peer_clock = peer_version.get('logical_clock', 0)
+            self.change_tracker.update_logical_clock(peer_clock)
         
         # Get a count of all changes in our change log
         total_changes = 0
@@ -302,17 +322,22 @@ class DatabaseSynchronizer:
                     total_changes = row[0]
                 logger.debug(f"Total changes in change_log: {total_changes}")
                 
-                # Get the latest change timestamp for comparison
-                cursor.execute("SELECT MAX(timestamp) FROM change_log")
+                # Get the highest logical clock for comparison
+                cursor.execute("SELECT MAX(logical_clock) FROM change_log")
                 row = cursor.fetchone()
                 if row and row[0]:
-                    latest_change = row[0]
-                    logger.debug(f"Latest change timestamp: {latest_change}")
+                    highest_clock = row[0]
+                    logger.debug(f"Highest logical clock in change_log: {highest_clock}")
         except Exception as e:
             logger.error(f"Error getting change log stats: {e}")
         
-        # Get changes since the client's last timestamp
-        changes = self.change_tracker.get_changes_since(last_timestamp)
+        # Get changes based on request type
+        if using_logical_clock:
+            # Use the method that filters by logical clock
+            changes = self.change_tracker.get_changes_since_clock(last_clock, peer_node_id)
+        else:
+            # Use legacy timestamp method
+            changes = self.change_tracker.get_changes_since(last_timestamp)
         
         if changes:
             logger.info(f"Found {len(changes)} changes to send to {peer_ip}")
@@ -320,21 +345,12 @@ class DatabaseSynchronizer:
             # Log some details about the changes
             for i, change in enumerate(changes):
                 if i < 5:  # Log details of first 5 changes only
-                    table_name, operation, row_id, timestamp = change[0:4]
-                    logger.debug(f"Change {i+1}: {operation} on {table_name} row {row_id} at {timestamp}")
-            
-            # Verify each change has content and content_hash
-            for change in changes:
-                if len(change) < 6:  # Should have (table_name, operation, row_id, timestamp, content, content_hash)
-                    logger.warning(f"Invalid change format: {change}")
-                    continue
-                
-                # Verify content hash matches content
-                content = change[4]
-                content_hash = change[5]
-                if hashlib.md5(content.encode()).hexdigest() != content_hash:
-                    logger.warning(f"Content hash mismatch for change: {change}")
-                    continue
+                    if len(change) >= 7:  # Should have logical_clock at index 6
+                        table_name, operation, row_id, timestamp, content, content_hash, logical_clock = change[0:7]
+                        logger.debug(f"Change {i+1}: {operation} on {table_name} row {row_id} at logical clock {logical_clock}")
+                    else:
+                        table_name, operation, row_id, timestamp = change[0:4]
+                        logger.debug(f"Change {i+1}: {operation} on {table_name} row {row_id} at {timestamp}")
             
             try:
                 # Send response with changes
@@ -372,8 +388,13 @@ class DatabaseSynchronizer:
                 client_socket.close()
                 return
         else:
-            logger.info(f"No changes to send to {peer_ip}")
-            logger.debug(f"Client asked for changes since {last_timestamp}, but no changes were found with newer timestamps")
+            if using_logical_clock:
+                logger.info(f"No changes to send to {peer_ip}")
+                logger.debug(f"Client asked for changes since logical clock {last_clock}, but no changes were found with newer clock values")
+            else:
+                logger.info(f"No changes to send to {peer_ip}")
+                logger.debug(f"Client asked for changes since timestamp {last_timestamp}, but no changes were found with newer timestamps")
+            
             response = self.protocol.create_sync_response(
                 self.change_tracker.get_db_version(), 
                 False
@@ -745,28 +766,71 @@ class DatabaseSynchronizer:
             # Set socket timeout
             s.settimeout(self.socket_timeout)
             
-            # Get our last known timestamp
+            # Get our version information with logical clock
             version = self.change_tracker.get_db_version()
+            logical_clock = version.get('logical_clock', 0)
+            node_id = version.get('node_id')
             timestamp = version.get('timestamp', '1970-01-01T00:00:00Z')
             
-            # Send sync request
-            request = self.protocol.create_sync_request(
-                version,
-                timestamp,
-                self.network.sync_port
-            )
-            logger.debug(f"Sending sync request for changes since {timestamp}")
-            s.send(request)
-            
-            # Receive response
-            logger.debug(f"Waiting for sync response from {peer_ip}")
-            response_data = s.recv(self.buffer_size)
-            response = self.protocol.parse_message(response_data)
-            
-            if not response or response.get('type') != 'sync_response':
-                logger.error(f"Invalid response from peer {peer_ip}: {response}")
-                s.close()
-                return
+            # First try with logical clock (newer protocol)
+            try:
+                # Send sync request with logical clock
+                request = self.protocol.create_sync_request(
+                    version,
+                    logical_clock,
+                    self.network.sync_port,
+                    node_id
+                )
+                logger.debug(f"Sending sync request for changes since logical clock {logical_clock}")
+                s.send(request)
+                
+                # Receive response with timeout
+                s.settimeout(5)  # Shorter timeout for testing protocol compatibility
+                response_data = s.recv(self.buffer_size)
+                response = self.protocol.parse_message(response_data)
+                
+                if not response or response.get('type') != 'sync_response':
+                    logger.warning(f"Peer {peer_ip} might not support logical clocks, falling back to timestamp-based sync")
+                    raise Exception("Protocol incompatibility: No valid sync_response received")
+                    
+                # If we got a valid response, continue with normal sync process
+                s.settimeout(self.socket_timeout)  # Reset to normal timeout
+                
+            except Exception as e:
+                logger.warning(f"Logical clock sync attempt failed: {e}")
+                logger.info(f"Retrying with timestamp-based sync for compatibility")
+                
+                # Close the socket and reconnect
+                try:
+                    s.close()
+                except:
+                    pass
+                    
+                s = self.network.connect_to_peer(peer_ip, peer_sync_port)
+                if not s:
+                    logger.error(f"Failed to reconnect to peer {peer_ip}:{peer_sync_port}")
+                    return
+                    
+                s.settimeout(self.socket_timeout)
+                
+                # Create legacy sync request with timestamp
+                legacy_request = {
+                    'type': 'sync_request',
+                    'version': version,
+                    'last_timestamp': timestamp,
+                    'sync_port': self.network.sync_port
+                }
+                s.send(json.dumps(legacy_request).encode())
+                
+                # Receive response
+                logger.debug(f"Waiting for sync response from {peer_ip} (timestamp-based)")
+                response_data = s.recv(self.buffer_size)
+                response = self.protocol.parse_message(response_data)
+                
+                if not response or response.get('type') != 'sync_response':
+                    logger.error(f"Invalid response from peer {peer_ip}: {response}")
+                    s.close()
+                    return
             
             logger.info(f"Received sync response from {peer_ip}, has_changes: {response.get('has_changes', False)}")
             
@@ -793,7 +857,9 @@ class DatabaseSynchronizer:
                     
                     # Debug log the first few changes
                     for i, change in enumerate(changes[:3]):
-                        if len(change) >= 3:
+                        if len(change) >= 7:  # Should have logical_clock at index 6
+                            logger.info(f"Change {i+1}: {change[1]} on {change[0]} row {change[2]} at logical clock {change[6]}")
+                        else:
                             logger.info(f"Change {i+1}: {change[1]} on {change[0]} row {change[2]}")
                     
                     # Send acknowledgment
@@ -813,16 +879,26 @@ class DatabaseSynchronizer:
                         # Verify versions match after sync
                         peer_version = response.get('version')
                         
+                        # Update our logical clock based on peer's clock
+                        peer_clock = peer_version.get('logical_clock', 0)
+                        our_clock = our_version.get('logical_clock', 0)
+                        
+                        if peer_clock > our_clock:
+                            # Ensure our clock is at least as high as the peer's
+                            self.change_tracker.update_logical_clock(peer_clock)
+                            logger.info(f"Updated our logical clock to match peer: {peer_clock}")
+                        
+                        # Verify content hash match
                         if peer_version.get('hash') != our_version.get('hash'):
                             logger.warning(f"Version hash mismatch after sync with {peer_ip}")
                             logger.warning(f"Peer version: {peer_version}")
                             logger.warning(f"Our version: {our_version}")
                             
-                            # Only use timestamp for verification, not hash
-                            if peer_version.get('timestamp') == our_version.get('timestamp'):
-                                logger.info(f"Timestamps match ({peer_version.get('timestamp')}), accepting sync despite hash mismatch")
+                            # Use logical clock to decide whether to accept the changes
+                            if peer_clock >= our_clock:
+                                logger.info(f"Accepting sync despite hash mismatch (peer logical clock {peer_clock} >= our logical clock {our_clock})")
                                 
-                                # Update our version hash to match the peer's
+                                # Update our hash to match the peer's
                                 with self.db_manager.get_connection() as conn:
                                     conn.execute('''
                                         UPDATE version SET hash = ? WHERE id = 1
@@ -831,24 +907,16 @@ class DatabaseSynchronizer:
                                     
                                 # Remove backup after successful sync
                                 self._remove_backup(backup_path)
-                                logger.info(f"Successfully synced with {peer_ip} based on timestamp match")
+                                logger.info(f"Successfully synced with {peer_ip} based on logical clock")
                             else:
-                                # Only rollback if timestamps don't match
-                                logger.error(f"Timestamp mismatch after sync with {peer_ip}")
-                                logger.error(f"Peer timestamp: {peer_version.get('timestamp')}, our timestamp: {our_version.get('timestamp')}")
-                                # Rollback the changes since versions don't match
-                                logger.info("Restoring database from backup due to timestamp mismatch")
+                                # Rollback if our clock is actually higher
+                                logger.error(f"Logical clock inconsistency after sync with {peer_ip}")
+                                logger.error(f"Peer clock: {peer_clock}, our clock: {our_clock}")
+                                # Rollback the changes
+                                logger.info("Restoring database from backup due to logical clock inconsistency")
                                 self._restore_database(backup_path)
                         else:
-                            logger.info(f"Successfully synced with {peer_ip}, versions match")
-                            # Only update our version timestamp if the sync was successful
-                            with self.db_manager.get_connection() as conn:
-                                conn.execute('''
-                                    INSERT OR REPLACE INTO version (id, timestamp, hash)
-                                    VALUES (1, ?, ?)
-                                ''', (datetime.now(UTC).isoformat(), peer_version.get('hash')))
-                                conn.commit()
-                            
+                            logger.info(f"Successfully synced with {peer_ip}, content hashes match")
                             # Remove backup after successful sync
                             self._remove_backup(backup_path)
                     except Exception as e:
@@ -1243,29 +1311,31 @@ class DatabaseSynchronizer:
             peer: Peer instance to sync with
         """
         try:
-            # Get our last known timestamp
+            # Get our version information
             our_version = self.change_tracker.get_db_version()
-            last_timestamp = our_version.get('timestamp', '1970-01-01T00:00:00Z')
-            logger.info(f"Syncing with peer. Our last timestamp: {last_timestamp}")
+            our_clock = our_version.get('logical_clock', 0)
+            our_node_id = our_version.get('node_id')
+            logger.info(f"Syncing with peer. Our logical clock: {our_clock}")
             
             # Get peer version
             peer_version = peer.change_tracker.get_db_version()
-            logger.info(f"Peer version: {peer_version}")
+            peer_clock = peer_version.get('logical_clock', 0)
+            logger.info(f"Peer version: logical clock {peer_clock}")
             
             # Skip if versions are identical
             if our_version.get('hash') == peer_version.get('hash'):
                 logger.debug("Versions identical, skipping sync")
                 return
             
-            # Get changes from peer since our last timestamp
-            changes = peer.change_tracker.get_changes_since(last_timestamp)
+            # Get changes from peer since our logical clock
+            changes = peer.change_tracker.get_changes_since_clock(our_clock, our_node_id)
             logger.info(f"Got {len(changes)} changes from peer in test mode")
             
             # Log details of changes for debugging
             for i, change in enumerate(changes):
-                if len(change) >= 6:  # Should have (table_name, operation, row_id, timestamp, content, content_hash)
-                    table_name, operation, row_id, timestamp, content, content_hash = change
-                    logger.info(f"Change {i+1}: {operation} on {table_name} row {row_id} at {timestamp}")
+                if len(change) >= 8:  # Should have (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id)
+                    table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id = change
+                    logger.info(f"Change {i+1}: {operation} on {table_name} row {row_id} at logical clock {logical_clock}")
                     logger.debug(f"Content: {content}")
                 else:
                     logger.warning(f"Invalid change format at index {i}: {change}")
@@ -1276,9 +1346,16 @@ class DatabaseSynchronizer:
                     self.db_manager.apply_sync_changes(changes)
                     logger.info(f"Successfully applied {len(changes)} changes from peer")
                     
-                    # Update our database version after applying changes
+                    # Update our logical clock after applying changes
                     our_new_version = self.change_tracker.get_db_version()
-                    logger.info(f"Updated our version to: {our_new_version} after applying changes")
+                    our_new_clock = our_new_version.get('logical_clock', 0)
+                    
+                    # Make sure our clock is at least as high as the peer's
+                    if peer_clock > our_new_clock:
+                        self.change_tracker.update_logical_clock(peer_clock)
+                        logger.info(f"Updated our logical clock to {peer_clock} to match peer")
+                    
+                    logger.info(f"Updated our version to: logical clock {our_new_clock} after applying changes")
                     
                 except Exception as e:
                     logger.error(f"Error applying test mode changes: {e}")
@@ -1287,4 +1364,36 @@ class DatabaseSynchronizer:
                 logger.info("No changes to apply from peer in test mode")
                 
         except Exception as e:
-            logger.error(f"Test mode sync error: {e}") 
+            logger.error(f"Test mode sync error: {e}")
+    
+    def _find_latest_peer(self):
+        """Find peer with latest database version"""
+        our_version = self.change_tracker.get_db_version()
+        latest_peer = None
+        latest_port = None
+        latest_version = our_version
+        
+        logger.info(f"Looking for peers with newer database version than ours (logical clock: {our_version.get('logical_clock', 0)})")
+        
+        with self.lock:
+            logger.info(f"Found {len(self.peers)} peers during discovery")
+            
+            for ip, (version, _, port) in self.peers.items():
+                # Check if this peer's version is different from ours and potentially newer
+                peer_clock = version.get('logical_clock', 0)
+                our_clock = our_version.get('logical_clock', 0)
+                
+                if version.get("hash") != our_version.get("hash"):
+                    logger.info(f"Peer {ip} has different version: logical clock {peer_clock}")
+                    
+                    if latest_peer is None or self.change_tracker.is_newer_version(version, latest_version):
+                        latest_peer = ip
+                        latest_port = port
+                        latest_version = version
+                        logger.info(f"This is now the latest peer (logical clock: {peer_clock})")
+        
+        if latest_peer:
+            logger.info(f"Found peer with latest version: {latest_peer}, requesting full database")
+            self._request_full_database(latest_peer, latest_port)
+        else:
+            logger.info("No peers with newer database version found") 

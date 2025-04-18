@@ -15,6 +15,8 @@ class TestSyncProtocol(unittest.TestCase):
         self.test_version = {"hash": "abc123", "timestamp": "2023-01-01T00:00:00Z"}
         self.test_sync_port = 5005
         self.test_last_timestamp = "2023-01-01T00:00:00Z"
+        self.test_logical_clock = 42
+        self.test_node_id = "test-node-id"
         self.test_has_changes = True
         self.test_db_size = 1024
         self.test_changes = [
@@ -51,13 +53,14 @@ class TestSyncProtocol(unittest.TestCase):
     
     def test_create_sync_request(self):
         """Test creation of a sync request message."""
-        message = self.protocol.create_sync_request(self.test_version, self.test_last_timestamp, self.test_sync_port)
+        message = self.protocol.create_sync_request(self.test_version, self.test_logical_clock, self.test_sync_port, self.test_node_id)
         parsed = json.loads(message.decode('utf-8'))
         
         self.assertEqual(parsed['type'], 'sync_request')
         self.assertEqual(parsed['version'], self.test_version)
-        self.assertEqual(parsed['last_timestamp'], self.test_last_timestamp)
+        self.assertEqual(parsed['last_clock'], self.test_logical_clock)
         self.assertEqual(parsed['sync_port'], self.test_sync_port)
+        self.assertEqual(parsed['node_id'], self.test_node_id)
     
     def test_create_sync_response(self):
         """Test creation of a sync response message."""
