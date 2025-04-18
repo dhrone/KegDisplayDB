@@ -24,16 +24,18 @@ class DatabaseSynchronizer:
     """
     
     def __init__(self, db_manager, change_tracker, network_manager, 
-                 socket_timeout=30, buffer_size=65536, chunk_size=32768):
+                 socket_timeout=60, buffer_size=65536, chunk_size=32768,
+                 max_retries=5):
         """Initialize the database synchronizer
         
         Args:
             db_manager: DatabaseManager instance
             change_tracker: ChangeTracker instance
             network_manager: NetworkManager instance
-            socket_timeout: Socket timeout in seconds (default: 30)
+            socket_timeout: Socket timeout in seconds (default: 60)
             buffer_size: Socket buffer size in bytes (default: 64KB)
             chunk_size: Size of chunks for file transfers (default: 32KB)
+            max_retries: Maximum number of retries for chunk transfers (default: 5)
         """
         self.db_manager = db_manager
         self.change_tracker = change_tracker
@@ -48,6 +50,7 @@ class DatabaseSynchronizer:
         self.socket_timeout = socket_timeout
         self.buffer_size = buffer_size
         self.chunk_size = chunk_size
+        self.max_retries = max_retries
     
     def start(self):
         """Start the synchronization system"""
@@ -310,12 +313,6 @@ class DatabaseSynchronizer:
             else:
                 logger.info(f"We win tie-breaking, not syncing")
         
-        # Update our logical clock based on peer's clock AFTER version comparison
-        if 'logical_clock' in peer_version:
-            peer_clock = peer_version.get('logical_clock', 0)
-            self.change_tracker.update_logical_clock(peer_clock)
-            logger.debug(f"Updated our logical clock based on peer's clock: {peer_clock}")
-        
         # Update peer information in our peer list
         with self.lock:
             self.peers[peer_ip] = (peer_version, time.time(), peer_sync_port)
@@ -347,11 +344,9 @@ class DatabaseSynchronizer:
         our_version = self.change_tracker.get_db_version()
         logger.debug(f"Our database version: logical_clock={our_version.get('logical_clock', 0)}, node_id={our_version.get('node_id')}")
         
-        # Update our logical clock based on peer's version
+        # Get peer's logical clock for comparison
         peer_version = message.get('version', {})
-        if 'logical_clock' in peer_version:
-            peer_clock = peer_version.get('logical_clock', 0)
-            self.change_tracker.update_logical_clock(peer_clock)
+        peer_clock = peer_version.get('logical_clock', 0)
         
         # Get a count of all changes in our change log
         total_changes = 0
@@ -421,6 +416,12 @@ class DatabaseSynchronizer:
                     return
                 
                 logger.info(f"Sent changes to {peer_ip}")
+                
+                # Update our logical clock based on peer's version ONLY after successful transfer
+                if 'logical_clock' in peer_version:
+                    self.change_tracker.update_logical_clock(peer_clock)
+                    logger.debug(f"Updated our logical clock after successful sync with peer's clock: {peer_clock}")
+                
             except socket.timeout:
                 logger.error(f"Socket timeout while sending changes to {peer_ip}")
                 client_socket.close()
@@ -442,6 +443,11 @@ class DatabaseSynchronizer:
                 False
             )
             client_socket.send(response)
+            
+            # Even if no changes, we successfully completed the sync, so update the clock
+            if 'logical_clock' in peer_version:
+                self.change_tracker.update_logical_clock(peer_clock)
+                logger.debug(f"Updated our logical clock after successful sync (no changes) with peer's clock: {peer_clock}")
         
         client_socket.close()
     
@@ -511,16 +517,25 @@ class DatabaseSynchronizer:
         try:
             total_size = len(data)
             bytes_sent = 0
-            max_retries = 3
-            chunk_timeout = 15  # seconds - increased from 5 to 15
+            max_retries = self.max_retries
+            base_chunk_timeout = 15  # seconds - base timeout
             
-            logger.info(f"Starting chunked data transfer, total size: {total_size} bytes")
+            # Adjust timeout based on data size (longer timeout for larger transfers)
+            if total_size > 1024 * 1024:  # More than 1MB
+                chunk_timeout = 30
+            else:
+                chunk_timeout = base_chunk_timeout
+                
+            logger.info(f"Starting chunked data transfer, total size: {total_size} bytes, timeout: {chunk_timeout}s")
             # First send the total size as a 8-byte integer
             sock.sendall(total_size.to_bytes(8, byteorder='big'))
             
             # Send data in chunks
             total_chunks = (total_size + self.chunk_size - 1) // self.chunk_size
             logger.debug(f"Will send {total_chunks} chunks of maximum size {self.chunk_size}")
+            
+            # For larger transfers, adjust progress reporting frequency
+            report_frequency = max(1, min(total_chunks // 20, 10))
             
             for chunk_index in range(0, total_chunks):
                 start_pos = chunk_index * self.chunk_size
@@ -529,7 +544,7 @@ class DatabaseSynchronizer:
                 chunk_size = len(chunk)
                 
                 # Log progress more frequently for larger transfers
-                if total_chunks > 10 and chunk_index % 5 == 0:
+                if total_chunks > 10 and chunk_index % report_frequency == 0:
                     logger.info(f"Sending chunk {chunk_index+1}/{total_chunks} ({(chunk_index+1)/total_chunks:.1%})")
                 
                 for retry in range(max_retries):
@@ -556,6 +571,12 @@ class DatabaseSynchronizer:
                         logger.warning(f"Timeout waiting for acknowledgment of chunk {chunk_index}, retrying ({retry+1}/{max_retries})")
                     except ConnectionResetError:
                         logger.warning(f"Connection reset while sending chunk {chunk_index}, retrying ({retry+1}/{max_retries})")
+                        # Add a small delay before retry for connection issues
+                        time.sleep(1)
+                    except BrokenPipeError:
+                        logger.warning(f"Broken pipe while sending chunk {chunk_index}, retrying ({retry+1}/{max_retries})")
+                        # Add a delay before retry for connection issues
+                        time.sleep(2)
                     except Exception as e:
                         logger.warning(f"Error sending chunk {chunk_index}: {e}, retrying ({retry+1}/{max_retries})")
                     
@@ -564,6 +585,7 @@ class DatabaseSynchronizer:
                         logger.error(f"Failed to send chunk {chunk_index} after {max_retries} attempts")
                         raise Exception(f"Failed to send chunk {chunk_index} after {max_retries} attempts")
                 
+                # Progress reporting
                 if chunk_index % 10 == 0 and chunk_index > 0:
                     logger.debug(f"Sent {bytes_sent}/{total_size} bytes ({bytes_sent/total_size:.1%})")
             
@@ -571,7 +593,6 @@ class DatabaseSynchronizer:
             sock.sendall(b'DONE')
             logger.info(f"Completed chunked data transfer, sent {bytes_sent}/{total_size} bytes")
             
-            logger.debug(f"Sent {bytes_sent} bytes of data")
             return bytes_sent
         except Exception as e:
             logger.error(f"Error sending chunked data: {e}")
@@ -594,23 +615,49 @@ class DatabaseSynchronizer:
                 return None
             
             total_size = int.from_bytes(size_bytes, byteorder='big')
-            logger.info(f"Starting to receive chunked data, expected total size: {total_size} bytes")
+            
+            # Calculate appropriate timeout based on data size
+            if total_size > 1024 * 1024:  # More than 1MB
+                chunk_timeout = 60  # Use longer timeout for large transfers
+            else:
+                chunk_timeout = 30
+                
+            logger.info(f"Starting to receive chunked data, expected total size: {total_size} bytes, timeout: {chunk_timeout}s")
             
             # Receive data in chunks
             data = bytearray(total_size)
             bytes_received = 0
-            max_retries = 3
-            chunk_timeout = 15  # seconds - increased from 5 to 15
+            max_retries = self.max_retries  # Use class-level max_retries
             
+            # Set initial socket timeout
             sock.settimeout(chunk_timeout)
+            
+            # Calculate reporting frequency based on data size
+            report_frequency = max(1, min(10, total_size // (self.chunk_size * 20)))
+            chunk_count = 0
+            
+            # Track consecutive errors for exponential backoff
+            consecutive_errors = 0
             
             while True:
                 # Receive chunk index or done marker
                 try:
+                    # Progressive timeout - increase for consecutive errors
+                    if consecutive_errors > 0:
+                        # Exponential backoff with max of 120 seconds
+                        backoff_timeout = min(120, chunk_timeout * (1.5 ** consecutive_errors))
+                        logger.info(f"Using increased timeout of {backoff_timeout:.1f}s after {consecutive_errors} consecutive errors")
+                        sock.settimeout(backoff_timeout)
+                    else:
+                        sock.settimeout(chunk_timeout)
+                    
                     marker = sock.recv(4)
                     if marker == b'DONE':
                         logger.info(f"Received DONE marker, transfer complete")
                         break
+                    
+                    # Reset consecutive errors counter after successful reception
+                    consecutive_errors = 0
                     
                     # Parse chunk index
                     try:
@@ -618,6 +665,7 @@ class DatabaseSynchronizer:
                     except Exception as e:
                         logger.error(f"Failed to parse chunk index from marker: {marker!r}, error: {e}")
                         sock.sendall(b'ERR!')
+                        consecutive_errors += 1
                         continue
                     
                     # Receive chunk size
@@ -625,9 +673,18 @@ class DatabaseSynchronizer:
                     if not chunk_size_bytes:
                         logger.error(f"Failed to receive size for chunk {chunk_index}")
                         sock.sendall(b'ERR!')
+                        consecutive_errors += 1
                         continue
                     
                     chunk_size = int.from_bytes(chunk_size_bytes, byteorder='big')
+                    
+                    # Validate chunk size for security
+                    if chunk_size > 10 * self.chunk_size:
+                        logger.error(f"Received suspiciously large chunk size: {chunk_size} bytes, rejecting")
+                        sock.sendall(b'ERR!')
+                        consecutive_errors += 1
+                        continue
+                        
                     logger.debug(f"Receiving chunk {chunk_index} of size {chunk_size} bytes")
                     
                     # Receive the chunk data
@@ -645,18 +702,37 @@ class DatabaseSynchronizer:
                                 logger.warning(f"Incomplete chunk {chunk_index} (got {len(chunk) if chunk else 0}/{chunk_size} bytes), retrying ({retry_count+1}/{max_retries})")
                                 sock.sendall(b'ERR!')
                                 retry_count += 1
+                                consecutive_errors += 1
+                                # Add a small delay before retry
+                                time.sleep(0.5)
                         except socket.timeout:
                             logger.warning(f"Timeout receiving chunk {chunk_index}, retrying ({retry_count+1}/{max_retries})")
                             sock.sendall(b'ERR!')
                             retry_count += 1
+                            consecutive_errors += 1
+                            # Add delay before retry that increases with retry count
+                            time.sleep(min(5, retry_count * 1.0))
                         except ConnectionResetError:
                             logger.warning(f"Connection reset while receiving chunk {chunk_index}, retrying ({retry_count+1}/{max_retries})")
                             sock.sendall(b'ERR!')
                             retry_count += 1
+                            consecutive_errors += 1
+                            # Add longer delay for connection issues
+                            time.sleep(min(10, retry_count * 2.0))
+                        except BrokenPipeError:
+                            logger.warning(f"Broken pipe while receiving chunk {chunk_index}, retrying ({retry_count+1}/{max_retries})")
+                            sock.sendall(b'ERR!')
+                            retry_count += 1
+                            consecutive_errors += 1
+                            # Add longer delay for pipe issues
+                            time.sleep(min(10, retry_count * 2.0))
                         except Exception as e:
                             logger.warning(f"Error receiving chunk {chunk_index}: {e}, retrying ({retry_count+1}/{max_retries})")
                             sock.sendall(b'ERR!')
                             retry_count += 1
+                            consecutive_errors += 1
+                            # Add delay proportional to retry count
+                            time.sleep(min(5, retry_count * 1.0))
                     
                     if not success:
                         logger.error(f"Failed to receive chunk {chunk_index} after {max_retries} attempts")
@@ -665,22 +741,57 @@ class DatabaseSynchronizer:
                     # Store the chunk in the right position
                     start_pos = chunk_index * self.chunk_size
                     end_pos = min(start_pos + chunk_size, total_size)
-                    data[start_pos:end_pos] = chunk
-                    bytes_received += chunk_size
+                    try:
+                        data[start_pos:end_pos] = chunk
+                        bytes_received += chunk_size
+                    except Exception as e:
+                        logger.error(f"Error storing chunk {chunk_index} at position {start_pos}:{end_pos}: {e}")
+                        logger.error(f"Chunk size: {chunk_size}, data length: {len(data)}, total size: {total_size}")
+                        sock.sendall(b'ERR!')
+                        consecutive_errors += 1
+                        continue
                     
                     # Send acknowledgment
                     sock.sendall(b'ACK!')
                     logger.debug(f"Sent ACK for chunk {chunk_index}")
                     
-                    if bytes_received % (self.chunk_size * 10) == 0 and bytes_received > 0:
-                        logger.debug(f"Received {bytes_received}/{total_size} bytes ({bytes_received/total_size:.1%})")
+                    # Progress reporting
+                    chunk_count += 1
+                    if chunk_count % report_frequency == 0:
+                        logger.info(f"Received {bytes_received}/{total_size} bytes ({bytes_received/total_size:.1%})")
                 
                 except socket.timeout:
-                    logger.error(f"Timeout during chunk reception")
-                    raise
+                    logger.warning(f"Timeout during chunk reception, continuing to next iteration")
+                    consecutive_errors += 1
+                    # Don't raise - try to continue receiving
+                    continue
+                except ConnectionResetError as e:
+                    logger.error(f"Connection reset during chunk reception: {e}")
+                    consecutive_errors += 1
+                    # If we've had too many consecutive errors, raise
+                    if consecutive_errors > max_retries:
+                        raise
+                    # Add a significant delay before continuing
+                    time.sleep(3.0)
+                    continue
+                except BrokenPipeError as e:
+                    logger.error(f"Broken pipe during chunk reception: {e}")
+                    consecutive_errors += 1
+                    # If we've had too many consecutive errors, raise
+                    if consecutive_errors > max_retries:
+                        raise
+                    # Add a significant delay before continuing
+                    time.sleep(3.0)
+                    continue
                 except Exception as e:
                     logger.error(f"Error receiving chunk: {e}")
-                    raise
+                    consecutive_errors += 1
+                    # If we've had too many consecutive errors, raise
+                    if consecutive_errors > max_retries:
+                        raise
+                    # Wait a bit and try again
+                    time.sleep(1.0)
+                    continue
             
             logger.info(f"Completed chunked data transfer, received {bytes_received}/{total_size} bytes")
             return bytes(data)
@@ -689,7 +800,7 @@ class DatabaseSynchronizer:
             raise
     
     def _recv_all(self, sock, n):
-        """Receive exactly n bytes from socket
+        """Receive exactly n bytes from socket with improved error handling
         
         Args:
             sock: Socket to receive from
@@ -699,12 +810,43 @@ class DatabaseSynchronizer:
             data: Received data
         """
         data = bytearray()
-        while len(data) < n:
-            packet = sock.recv(n - len(data))
-            if not packet:
+        remaining = n
+        retries = 0
+        max_retries = 3
+        
+        while remaining > 0 and retries < max_retries:
+            try:
+                packet = sock.recv(remaining)
+                if not packet:
+                    # Connection closed prematurely
+                    if retries < max_retries - 1:
+                        logger.warning(f"Empty packet received with {remaining} bytes remaining, retrying ({retries+1}/{max_retries})")
+                        retries += 1
+                        time.sleep(0.5)
+                        continue
+                    else:
+                        logger.error(f"Connection closed with {remaining} bytes remaining")
+                        return None
+                
+                # Reset retry counter on successful receive
+                retries = 0
+                
+                # Append data and update remaining count
+                data.extend(packet)
+                remaining -= len(packet)
+                
+            except socket.timeout:
+                retries += 1
+                if retries >= max_retries:
+                    logger.error(f"Timeout receiving data after {max_retries} retries")
+                    return None
+                logger.warning(f"Timeout receiving data, retrying ({retries}/{max_retries})")
+                time.sleep(0.5)
+            except Exception as e:
+                logger.error(f"Error in _recv_all: {e}")
                 return None
-            data.extend(packet)
-        return data
+                
+        return data if len(data) == n else None
     
     def _send_database_file(self, client_socket):
         """Send database file over socket
@@ -935,33 +1077,33 @@ class DatabaseSynchronizer:
                             logger.info(f"Updated our logical clock to match peer: {peer_clock}")
                             our_clock = peer_clock
                         
-                        # Check if content hashes match - this is just for verification
-                        if peer_version.get('hash') != our_new_version.get('hash'):
-                            logger.warning(f"Content hash mismatch after sync with {peer_ip}")
-                            logger.warning(f"Peer version: {peer_version}")
-                            logger.warning(f"Our version: {our_new_version}")
-                            
-                            # We'll trust the logical clock to decide if the sync was successful
-                            if our_clock >= peer_clock:
-                                logger.info(f"Accepting sync despite hash mismatch (logical clock: {our_clock})")
+                            # Check if content hashes match - this is just for verification
+                            if peer_version.get('hash') != our_new_version.get('hash'):
+                                logger.warning(f"Content hash mismatch after sync with {peer_ip}")
+                                logger.warning(f"Peer version: {peer_version}")
+                                logger.warning(f"Our version: {our_new_version}")
                                 
-                                # We don't force our hash to match the peer anymore
-                                # This will get recalculated as needed based on actual content
-                                
+                                # We'll trust the logical clock to decide if the sync was successful
+                                if our_clock >= peer_clock:
+                                    logger.info(f"Accepting sync despite hash mismatch (logical clock: {our_clock})")
+                                    
+                                    # We don't force our hash to match the peer anymore
+                                    # This will get recalculated as needed based on actual content
+                                    
+                                    # Remove backup after successful sync
+                                    self._remove_backup(backup_path)
+                                    logger.info(f"Successfully synced with {peer_ip} based on logical clock")
+                                else:
+                                    # This case shouldn't happen if our code is working correctly
+                                    logger.error(f"Logical clock inconsistency after sync with {peer_ip}")
+                                    logger.error(f"Peer clock: {peer_clock}, our clock: {our_clock}")
+                                    # Rollback the changes
+                                    logger.info("Restoring database from backup due to logical clock inconsistency")
+                                    self._restore_database(backup_path)
+                            else:
+                                logger.info(f"Successfully synced with {peer_ip}, content hashes match")
                                 # Remove backup after successful sync
                                 self._remove_backup(backup_path)
-                                logger.info(f"Successfully synced with {peer_ip} based on logical clock")
-                            else:
-                                # This case shouldn't happen if our code is working correctly
-                                logger.error(f"Logical clock inconsistency after sync with {peer_ip}")
-                                logger.error(f"Peer clock: {peer_clock}, our clock: {our_clock}")
-                                # Rollback the changes
-                                logger.info("Restoring database from backup due to logical clock inconsistency")
-                                self._restore_database(backup_path)
-                        else:
-                            logger.info(f"Successfully synced with {peer_ip}, content hashes match")
-                            # Remove backup after successful sync
-                            self._remove_backup(backup_path)
                     except Exception as e:
                         logger.error(f"Error applying changes: {e}")
                         logger.info("Restoring database from backup due to error")

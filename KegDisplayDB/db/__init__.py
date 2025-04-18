@@ -6,6 +6,12 @@ from .database import DatabaseManager
 from .change_tracker import ChangeTracker
 from .sync.synchronizer import DatabaseSynchronizer
 from .sync.network import NetworkManager
+from datetime import datetime, UTC
+import json
+import hashlib
+import logging
+
+logger = logging.getLogger(__name__)
 
 class SyncedDatabase:
     """
@@ -263,66 +269,152 @@ class SyncedDatabase:
         """
         success_count = 0
         errors = []
+        changes_to_log = []
+        current_time = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         
-        for idx, beer_data in enumerate(beer_data_list):
+        # First transaction: perform all beer database operations
+        with self.db_manager.get_connection() as conn:
+            conn.execute("BEGIN TRANSACTION")
             try:
-                # Skip rows without a name
-                if not beer_data.get('Name'):
-                    continue
-                
-                # Handle existing beer with same ID
-                beer_id = beer_data.get('idBeer')
-                existing_beer = None
-                
-                if beer_id and str(beer_id).strip() and str(beer_id) != '':
+                # Process all beers without logging changes yet
+                for idx, beer_data in enumerate(beer_data_list):
                     try:
-                        beer_id = int(beer_id)
-                        existing_beer = self.get_beer(beer_id)
-                    except (ValueError, TypeError):
-                        beer_id = None
+                        # Skip rows without a name
+                        if not beer_data.get('Name'):
+                            continue
+                        
+                        # Handle existing beer with same ID
+                        beer_id = beer_data.get('idBeer')
+                        existing_beer = None
+                        
+                        if beer_id and str(beer_id).strip() and str(beer_id) != '':
+                            try:
+                                beer_id = int(beer_id)
+                                existing_beer = self.db_manager.get_beer(beer_id)
+                            except (ValueError, TypeError):
+                                beer_id = None
+                        
+                        # Use database operations
+                        if existing_beer:
+                            # Update existing beer
+                            success = self.db_manager.update_beer(
+                                beer_id=beer_id,
+                                name=beer_data.get('Name'),
+                                abv=beer_data.get('ABV'),
+                                ibu=beer_data.get('IBU'),
+                                color=beer_data.get('Color'),
+                                og=beer_data.get('OriginalGravity'),
+                                fg=beer_data.get('FinalGravity'),
+                                description=beer_data.get('Description'),
+                                brewed=beer_data.get('Brewed'),
+                                kegged=beer_data.get('Kegged'),
+                                tapped=beer_data.get('Tapped'),
+                                notes=beer_data.get('Notes')
+                            )
+                            if success:
+                                # Get content for the row for change tracking
+                                content = self.change_tracker._get_row_content("beers", beer_id, conn)
+                                content_hash = hashlib.md5(content.encode()).hexdigest()
+                                
+                                # Store change to log later
+                                changes_to_log.append({
+                                    "table_name": "beers",
+                                    "operation": "UPDATE",
+                                    "row_id": beer_id,
+                                    "content": content,
+                                    "content_hash": content_hash
+                                })
+                                success_count += 1
+                        else:
+                            # Add new beer
+                            beer_id = self.db_manager.add_beer(
+                                name=beer_data.get('Name'),
+                                abv=beer_data.get('ABV'),
+                                ibu=beer_data.get('IBU'),
+                                color=beer_data.get('Color'),
+                                og=beer_data.get('OriginalGravity'),
+                                fg=beer_data.get('FinalGravity'),
+                                description=beer_data.get('Description'),
+                                brewed=beer_data.get('Brewed'),
+                                kegged=beer_data.get('Kegged'),
+                                tapped=beer_data.get('Tapped'),
+                                notes=beer_data.get('Notes')
+                            )
+                            if beer_id:
+                                # Get content for the row for change tracking
+                                content = self.change_tracker._get_row_content("beers", beer_id, conn)
+                                content_hash = hashlib.md5(content.encode()).hexdigest()
+                                
+                                # Store change to log later
+                                changes_to_log.append({
+                                    "table_name": "beers",
+                                    "operation": "INSERT",
+                                    "row_id": beer_id,
+                                    "content": content,
+                                    "content_hash": content_hash
+                                })
+                                success_count += 1
+                        
+                    except Exception as e:
+                        errors.append(f"Error on beer {idx+1}: {str(e)}")
                 
-                # Use main methods with notify=False for individual operations
-                if existing_beer:
-                    # Update existing beer
-                    self.update_beer(
-                        beer_id=beer_id,
-                        name=beer_data.get('Name'),
-                        abv=beer_data.get('ABV'),
-                        ibu=beer_data.get('IBU'),
-                        color=beer_data.get('Color'),
-                        og=beer_data.get('OriginalGravity'),
-                        fg=beer_data.get('FinalGravity'),
-                        description=beer_data.get('Description'),
-                        brewed=beer_data.get('Brewed'),
-                        kegged=beer_data.get('Kegged'),
-                        tapped=beer_data.get('Tapped'),
-                        notes=beer_data.get('Notes'),
-                        notify=False
-                    )
-                else:
-                    # Add new beer
-                    self.add_beer(
-                        name=beer_data.get('Name'),
-                        abv=beer_data.get('ABV'),
-                        ibu=beer_data.get('IBU'),
-                        color=beer_data.get('Color'),
-                        og=beer_data.get('OriginalGravity'),
-                        fg=beer_data.get('FinalGravity'),
-                        description=beer_data.get('Description'),
-                        brewed=beer_data.get('Brewed'),
-                        kegged=beer_data.get('Kegged'),
-                        tapped=beer_data.get('Tapped'),
-                        notes=beer_data.get('Notes'),
-                        notify=False
-                    )
+                # Commit the beer database changes
+                conn.commit()
                 
-                success_count += 1
             except Exception as e:
-                errors.append(f"Error on beer {idx+1}: {str(e)}")
+                conn.rollback()
+                errors.append(f"Transaction error: {str(e)}")
+                logger.error(f"Error during beer import transaction: {e}")
+                # Reset since we failed
+                success_count = 0
+                changes_to_log = []
         
-        # Send a single notification after all operations are complete
-        if success_count > 0:
-            self.notify_update()
+        # Second transaction: Log changes only if we have successful operations
+        if success_count > 0 and changes_to_log:
+            # Now increment the Lamport clock - only after successful commit
+            new_clock = self.change_tracker.increment_logical_clock()
+            
+            with self.db_manager.get_connection() as conn:
+                conn.execute("BEGIN TRANSACTION")
+                try:
+                    cursor = conn.cursor()
+                    
+                    # Insert all change records with the same logical clock value
+                    for change in changes_to_log:
+                        cursor.execute(
+                            """
+                            INSERT INTO change_log 
+                            (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                change["table_name"],
+                                change["operation"],
+                                change["row_id"],
+                                current_time,
+                                change["content"],
+                                change["content_hash"],
+                                new_clock,  # Use the same clock value for all changes in the batch
+                                self.change_tracker.node_id
+                            )
+                        )
+                    
+                    # Update version table with the new clock value
+                    cursor.execute(
+                        "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
+                        (current_time, new_clock)
+                    )
+                    
+                    # Commit the change log entries
+                    conn.commit()
+                    
+                    # Send notification after everything is successful
+                    self.notify_update()
+                    
+                except Exception as e:
+                    conn.rollback()
+                    errors.append(f"Change logging error: {str(e)}")
+                    logger.error(f"Error logging changes after import: {e}")
             
         return (success_count, errors)
     
