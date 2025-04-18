@@ -73,39 +73,96 @@ class SyncedDatabase:
     # ---- Beer Management Methods ----
     
     def add_beer(self, name, abv=None, ibu=None, color=None, og=None, fg=None, 
-                description=None, brewed=None, kegged=None, tapped=None, notes=None):
-        """Add a new beer to the database"""
+                description=None, brewed=None, kegged=None, tapped=None, notes=None, notify=True):
+        """
+        Add a new beer to the database
+        
+        Args:
+            name: Beer name (required)
+            abv: Alcohol by volume (optional)
+            ibu: International bitterness units (optional)
+            color: Beer color (optional)
+            og: Original gravity (optional)
+            fg: Final gravity (optional)
+            description: Beer description (optional)
+            brewed: Date brewed (optional)
+            kegged: Date kegged (optional)
+            tapped: Date tapped (optional)
+            notes: Additional notes (optional)
+            notify: Whether to notify peers about this change (default: True)
+            
+        Returns:
+            beer_id: ID of the added beer
+        """
         beer_id = self.db_manager.add_beer(name, abv, ibu, color, og, fg, 
                                          description, brewed, kegged, tapped, notes)
         self.change_tracker.log_change("beers", "INSERT", beer_id)
-        self.notify_update()
+        
+        if notify:
+            self.notify_update()
+            
         return beer_id
     
     def update_beer(self, beer_id, name=None, abv=None, ibu=None, color=None, og=None, fg=None,
-                   description=None, brewed=None, kegged=None, tapped=None, notes=None):
-        """Update an existing beer in the database"""
+                   description=None, brewed=None, kegged=None, tapped=None, notes=None, notify=True):
+        """
+        Update an existing beer in the database
+        
+        Args:
+            beer_id: ID of the beer to update
+            name: Beer name (optional)
+            abv: Alcohol by volume (optional)
+            ibu: International bitterness units (optional)
+            color: Beer color (optional)
+            og: Original gravity (optional)
+            fg: Final gravity (optional)
+            description: Beer description (optional)
+            brewed: Date brewed (optional)
+            kegged: Date kegged (optional)
+            tapped: Date tapped (optional)
+            notes: Additional notes (optional)
+            notify: Whether to notify peers about this change (default: True)
+            
+        Returns:
+            bool: Success or failure
+        """
         success = self.db_manager.update_beer(beer_id, name, abv, ibu, color, 
                                             og, fg, description, brewed, 
                                             kegged, tapped, notes)
         if success:
             self.change_tracker.log_change("beers", "UPDATE", beer_id)
-            self.notify_update()
+            
+            if notify:
+                self.notify_update()
+                
         return success
     
-    def delete_beer(self, beer_id):
-        """Delete a beer from the database"""
+    def delete_beer(self, beer_id, notify=True):
+        """
+        Delete a beer from the database
+        
+        Args:
+            beer_id: ID of the beer to delete
+            notify: Whether to notify peers about this change (default: True)
+            
+        Returns:
+            bool: Success or failure
+        """
         # First check for taps using this beer
         taps_with_beer = self.get_tap_with_beer(beer_id)
         
         # Update those taps first
         for tap_id in taps_with_beer:
-            self.update_tap(tap_id, None)
+            self.update_tap(tap_id, None, notify=False)
         
         # Now delete the beer
         success = self.db_manager.delete_beer(beer_id)
         if success:
             self.change_tracker.log_change("beers", "DELETE", beer_id)
-            self.notify_update()
+            
+            if notify:
+                self.notify_update()
+                
         return success
     
     def get_beer(self, beer_id):
@@ -118,28 +175,66 @@ class SyncedDatabase:
     
     # ---- Tap Management Methods ----
     
-    def add_tap(self, tap_id=None, beer_id=None):
-        """Add a new tap to the database"""
+    def add_tap(self, tap_id=None, beer_id=None, notify=True):
+        """
+        Add a new tap to the database
+        
+        Args:
+            tap_id: Optional tap ID (auto-assigned if not provided)
+            beer_id: Optional beer ID to assign to this tap
+            notify: Whether to notify peers about this change (default: True)
+            
+        Returns:
+            int: ID of the new tap
+        """
         tap_id = self.db_manager.add_tap(tap_id, beer_id)
         if tap_id:
             self.change_tracker.log_change("taps", "INSERT", tap_id)
-            self.notify_update()
+            
+            if notify:
+                self.notify_update()
+                
         return tap_id
     
-    def update_tap(self, tap_id, beer_id):
-        """Update a tap's beer assignment"""
+    def update_tap(self, tap_id, beer_id, notify=True):
+        """
+        Update a tap's beer assignment
+        
+        Args:
+            tap_id: ID of the tap to update
+            beer_id: ID of beer to assign (or None to clear)
+            notify: Whether to notify peers about this change (default: True)
+            
+        Returns:
+            bool: Success or failure
+        """
         success = self.db_manager.update_tap(tap_id, beer_id)
         if success:
             self.change_tracker.log_change("taps", "UPDATE", tap_id)
-            self.notify_update()
+            
+            if notify:
+                self.notify_update()
+                
         return success
     
-    def delete_tap(self, tap_id):
-        """Delete a tap from the database"""
+    def delete_tap(self, tap_id, notify=True):
+        """
+        Delete a tap from the database
+        
+        Args:
+            tap_id: ID of the tap to delete
+            notify: Whether to notify peers about this change (default: True)
+            
+        Returns:
+            bool: Success or failure
+        """
         success = self.db_manager.delete_tap(tap_id)
         if success:
             self.change_tracker.log_change("taps", "DELETE", tap_id)
-            self.notify_update()
+            
+            if notify:
+                self.notify_update()
+                
         return success
     
     def get_tap(self, tap_id):
@@ -186,10 +281,10 @@ class SyncedDatabase:
                     except (ValueError, TypeError):
                         beer_id = None
                 
-                # Disable automatic notifications for each beer change
+                # Use main methods with notify=False for individual operations
                 if existing_beer:
                     # Update existing beer
-                    self._update_beer_without_notify(
+                    self.update_beer(
                         beer_id=beer_id,
                         name=beer_data.get('Name'),
                         abv=beer_data.get('ABV'),
@@ -201,11 +296,12 @@ class SyncedDatabase:
                         brewed=beer_data.get('Brewed'),
                         kegged=beer_data.get('Kegged'),
                         tapped=beer_data.get('Tapped'),
-                        notes=beer_data.get('Notes')
+                        notes=beer_data.get('Notes'),
+                        notify=False
                     )
                 else:
                     # Add new beer
-                    self._add_beer_without_notify(
+                    self.add_beer(
                         name=beer_data.get('Name'),
                         abv=beer_data.get('ABV'),
                         ibu=beer_data.get('IBU'),
@@ -216,7 +312,8 @@ class SyncedDatabase:
                         brewed=beer_data.get('Brewed'),
                         kegged=beer_data.get('Kegged'),
                         tapped=beer_data.get('Tapped'),
-                        notes=beer_data.get('Notes')
+                        notes=beer_data.get('Notes'),
+                        notify=False
                     )
                 
                 success_count += 1
@@ -244,11 +341,11 @@ class SyncedDatabase:
         taps = self.get_all_taps()
         for tap in taps:
             if tap['idBeer']:
-                self._update_tap_without_notify(tap['idTap'], None)
+                self.update_tap(tap['idTap'], None, notify=False)
         
         # Delete all beers without individual notifications
         for beer in beers:
-            self._delete_beer_without_notify(beer['idBeer'])
+            self.delete_beer(beer['idBeer'], notify=False)
         
         # Send a single notification for all changes
         if beer_count > 0:
@@ -278,63 +375,15 @@ class SyncedDatabase:
             # Delete taps from highest number to lowest
             for i in range(current_count, count, -1):
                 tap_id = i
-                self._delete_tap_without_notify(tap_id)
+                self.delete_tap(tap_id, notify=False)
         
         # If increasing, add new taps
         elif count > current_count:
             # Add new taps with sequential IDs
             for i in range(current_count + 1, count + 1):
                 tap_id = i
-                self._add_tap_without_notify(tap_id, None)
+                self.add_tap(tap_id, None, notify=False)
         
         # Send a single notification after all changes
         self.notify_update()
-        return True
-    
-    # ---- Internal methods (no notification) ----
-    
-    def _add_beer_without_notify(self, name, abv=None, ibu=None, color=None, og=None, fg=None, 
-                   description=None, brewed=None, kegged=None, tapped=None, notes=None):
-        """Add a beer without sending notification"""
-        beer_id = self.db_manager.add_beer(name, abv, ibu, color, og, fg, 
-                                         description, brewed, kegged, tapped, notes)
-        self.change_tracker.log_change("beers", "INSERT", beer_id)
-        return beer_id
-    
-    def _update_beer_without_notify(self, beer_id, name=None, abv=None, ibu=None, color=None, og=None, fg=None,
-                   description=None, brewed=None, kegged=None, tapped=None, notes=None):
-        """Update a beer without sending notification"""
-        success = self.db_manager.update_beer(beer_id, name, abv, ibu, color, 
-                                            og, fg, description, brewed, 
-                                            kegged, tapped, notes)
-        if success:
-            self.change_tracker.log_change("beers", "UPDATE", beer_id)
-        return success
-    
-    def _delete_beer_without_notify(self, beer_id):
-        """Delete a beer without sending notification"""
-        success = self.db_manager.delete_beer(beer_id)
-        if success:
-            self.change_tracker.log_change("beers", "DELETE", beer_id)
-        return success
-    
-    def _add_tap_without_notify(self, tap_id=None, beer_id=None):
-        """Add a tap without sending notification"""
-        tap_id = self.db_manager.add_tap(tap_id, beer_id)
-        if tap_id:
-            self.change_tracker.log_change("taps", "INSERT", tap_id)
-        return tap_id
-    
-    def _update_tap_without_notify(self, tap_id, beer_id):
-        """Update a tap without sending notification"""
-        success = self.db_manager.update_tap(tap_id, beer_id)
-        if success:
-            self.change_tracker.log_change("taps", "UPDATE", tap_id)
-        return success
-    
-    def _delete_tap_without_notify(self, tap_id):
-        """Delete a tap without sending notification"""
-        success = self.db_manager.delete_tap(tap_id)
-        if success:
-            self.change_tracker.log_change("taps", "DELETE", tap_id)
-        return success 
+        return True 
