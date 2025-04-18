@@ -169,23 +169,29 @@ class ChangeTracker:
                     else:
                         dt = datetime.strptime(base_timestamp, "%Y-%m-%dT%H:%M:%S")
                     
+                    # Add UTC timezone info
+                    dt = dt.replace(tzinfo=UTC)
+                    
                     logger.debug(f"Parsed timestamp with timezone offset: {base_timestamp}")
                 # Handle standard formats
                 elif '.' in last_timestamp:
                     # If it has milliseconds, parse accordingly
                     dt = datetime.strptime(last_timestamp, "%Y-%m-%dT%H:%M:%S.%f")
+                    dt = dt.replace(tzinfo=UTC)
                 elif 'Z' in last_timestamp:
                     # If it has Z timezone indicator
                     dt = datetime.strptime(last_timestamp.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
+                    dt = dt.replace(tzinfo=UTC)
                 else:
                     # Basic ISO format without timezone
                     dt = datetime.strptime(last_timestamp, "%Y-%m-%dT%H:%M:%S")
+                    dt = dt.replace(tzinfo=UTC)
             except ValueError as e:
                 logger.warning(f"Error parsing timestamp '{last_timestamp}': {e}")
-                dt = datetime(1970, 1, 1, 0, 0, 0)  # Use epoch start if parsing fails
+                dt = datetime(1970, 1, 1, 0, 0, 0, tzinfo=UTC)  # Use epoch start if parsing fails
                 
             # Convert back to a standard ISO format without timezone for consistent comparison
-            normalized_timestamp = dt.strftime("%Y-%m-%dT%H:%M:%S")
+            normalized_timestamp = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             
             logger.debug(f"Normalized timestamp from '{last_timestamp}' to '{normalized_timestamp}'")
             
@@ -220,16 +226,27 @@ class ChangeTracker:
                                 change_dt = datetime.strptime(base_timestamp, "%Y-%m-%dT%H:%M:%S.%f")
                             else:
                                 change_dt = datetime.strptime(base_timestamp, "%Y-%m-%dT%H:%M:%S")
+                                
+                            # Add UTC timezone info
+                            change_dt = change_dt.replace(tzinfo=UTC)
                         # Handle standard formats
                         elif '.' in change_timestamp:
                             change_dt = datetime.strptime(change_timestamp, "%Y-%m-%dT%H:%M:%S.%f")
+                            change_dt = change_dt.replace(tzinfo=UTC)
                         elif 'Z' in change_timestamp:
                             change_dt = datetime.strptime(change_timestamp.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
+                            change_dt = change_dt.replace(tzinfo=UTC)
                         else:
                             change_dt = datetime.strptime(change_timestamp, "%Y-%m-%dT%H:%M:%S")
+                            change_dt = change_dt.replace(tzinfo=UTC)
                             
-                        # Compare with our timestamp
-                        if change_dt > dt:
+                        # Convert both to a standard format for string comparison
+                        change_normalized = change_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        
+                        logger.debug(f"Comparing normalized timestamps: change={change_normalized}, last={normalized_timestamp}")
+                            
+                        # Compare with our timestamp using the normalized string format
+                        if change_normalized > normalized_timestamp:
                             filtered_changes.append(change)
                             
                     except ValueError as e:
@@ -430,31 +447,37 @@ class ChangeTracker:
                 if '.' in ts1_str:
                     # Handle milliseconds format
                     timestamp1 = datetime.strptime(ts1_str, "%Y-%m-%dT%H:%M:%S.%f")
+                    timestamp1 = timestamp1.replace(tzinfo=UTC)
                 elif 'Z' in ts1_str:
                     # Handle Z timezone format
                     timestamp1 = datetime.strptime(ts1_str.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
+                    timestamp1 = timestamp1.replace(tzinfo=UTC)
                 else:
                     # Handle basic format
                     timestamp1 = datetime.strptime(ts1_str, "%Y-%m-%dT%H:%M:%S")
+                    timestamp1 = timestamp1.replace(tzinfo=UTC)
             except ValueError:
                 # If parsing fails, default to epoch start
                 logger.warning(f"Failed to parse timestamp1: {ts1_str}, using epoch start")
-                timestamp1 = datetime(1970, 1, 1, 0, 0, 0)
+                timestamp1 = datetime(1970, 1, 1, 0, 0, 0, tzinfo=UTC)
                 
             try:
                 if '.' in ts2_str:
                     # Handle milliseconds format
                     timestamp2 = datetime.strptime(ts2_str, "%Y-%m-%dT%H:%M:%S.%f")
+                    timestamp2 = timestamp2.replace(tzinfo=UTC)
                 elif 'Z' in ts2_str:
                     # Handle Z timezone format
                     timestamp2 = datetime.strptime(ts2_str.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
+                    timestamp2 = timestamp2.replace(tzinfo=UTC)
                 else:
                     # Handle basic format
                     timestamp2 = datetime.strptime(ts2_str, "%Y-%m-%dT%H:%M:%S")
+                    timestamp2 = timestamp2.replace(tzinfo=UTC)
             except ValueError:
                 # If parsing fails, default to epoch start
                 logger.warning(f"Failed to parse timestamp2: {ts2_str}, using epoch start")
-                timestamp2 = datetime(1970, 1, 1, 0, 0, 0)
+                timestamp2 = datetime(1970, 1, 1, 0, 0, 0, tzinfo=UTC)
             
             logger.debug(f"Comparing timestamps: {timestamp1} vs {timestamp2}")
             return timestamp1 > timestamp2

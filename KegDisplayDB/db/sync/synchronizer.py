@@ -42,6 +42,9 @@ class DatabaseSynchronizer:
         self.lock = threading.Lock()
         self.running = False
         self.threads = []
+        self.has_pending_sync = False
+        self.enable_sync = True
+        self.last_sync_attempt = None
         
         # Network configuration
         self.socket_timeout = socket_timeout
@@ -169,7 +172,7 @@ class DatabaseSynchronizer:
             logger.info(f"Received {message_type} request from {addr[0]}")
             
             if message_type == 'sync_request':
-                self._handle_sync_request(client_socket, message, addr)
+                self._handle_sync_request(addr[0], addr[0], message)
             elif message_type == 'full_db_request':
                 self._handle_full_db_request(client_socket, message, addr)
             else:
@@ -293,6 +296,7 @@ class DatabaseSynchronizer:
         
         # Get a count of all changes in our change log
         total_changes = 0
+        latest_change_timestamp = None
         try:
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
@@ -306,10 +310,44 @@ class DatabaseSynchronizer:
                 cursor.execute("SELECT MAX(timestamp) FROM change_log")
                 row = cursor.fetchone()
                 if row and row[0]:
-                    latest_change = row[0]
-                    logger.debug(f"Latest change timestamp: {latest_change}")
+                    latest_change_timestamp = row[0]
+                    logger.info(f"Latest change timestamp: {latest_change_timestamp}")
+                
+                # Log all changes in the change_log table for debugging
+                if total_changes > 0:
+                    cursor.execute("SELECT table_name, operation, row_id, timestamp FROM change_log ORDER BY timestamp DESC LIMIT 10")
+                    rows = cursor.fetchall()
+                    logger.info(f"Recent changes in change_log:")
+                    for i, row in enumerate(rows):
+                        logger.info(f"  Change {i+1}: {row[1]} on {row[0]} row {row[2]} at {row[3]}")
         except Exception as e:
             logger.error(f"Error getting change log stats: {e}")
+        
+        # Standardize the timestamp format to avoid comparison issues
+        try:
+            # Convert to ISO format if it's not already
+            from datetime import datetime
+            if isinstance(last_timestamp, str) and 'T' in last_timestamp:
+                # Already in ISO format, just normalize
+                if '+' in last_timestamp:
+                    # Has timezone info
+                    try:
+                        dt = datetime.fromisoformat(last_timestamp.replace('Z', '+00:00'))
+                        last_timestamp = dt.isoformat()
+                    except ValueError:
+                        # Keep as is if parsing fails
+                        pass
+                elif last_timestamp.endswith('Z'):
+                    # UTC designator
+                    try:
+                        dt = datetime.fromisoformat(last_timestamp.replace('Z', '+00:00'))
+                        last_timestamp = dt.isoformat()
+                    except ValueError:
+                        # Keep as is if parsing fails
+                        pass
+            logger.info(f"Normalized timestamp for comparison: {last_timestamp}")
+        except Exception as e:
+            logger.warning(f"Error normalizing timestamp: {e}")
         
         # Get changes since the client's last timestamp
         changes = self.change_tracker.get_changes_since(last_timestamp)
@@ -374,6 +412,113 @@ class DatabaseSynchronizer:
         else:
             logger.info(f"No changes to send to {peer_ip}")
             logger.debug(f"Client asked for changes since {last_timestamp}, but no changes were found with newer timestamps")
+            
+            # Add more detailed debugging for this case
+            if latest_change_timestamp:
+                logger.info(f"Latest change timestamp: {latest_change_timestamp}, client timestamp: {last_timestamp}")
+                
+                # Try to determine if there's a timezone or format issue
+                try:
+                    from datetime import datetime
+                    
+                    # Format timestamps for comparison
+                    client_dt = None
+                    latest_dt = None
+                    
+                    try:
+                        # Handle various timestamp formats
+                        if 'T' in last_timestamp:
+                            if last_timestamp.endswith('Z'):
+                                client_dt = datetime.fromisoformat(last_timestamp.replace('Z', '+00:00'))
+                            elif '+' in last_timestamp:
+                                client_dt = datetime.fromisoformat(last_timestamp)
+                            else:
+                                client_dt = datetime.fromisoformat(last_timestamp)
+                        else:
+                            # Try generic parsing
+                            client_dt = datetime.fromisoformat(last_timestamp)
+                            
+                        logger.info(f"Parsed client timestamp as: {client_dt}")
+                    except ValueError as e:
+                        logger.warning(f"Could not parse client timestamp: {e}")
+                        
+                    try:
+                        if isinstance(latest_change_timestamp, str):
+                            if 'T' in latest_change_timestamp:
+                                if latest_change_timestamp.endswith('Z'):
+                                    latest_dt = datetime.fromisoformat(latest_change_timestamp.replace('Z', '+00:00'))
+                                elif '+' in latest_change_timestamp:
+                                    latest_dt = datetime.fromisoformat(latest_change_timestamp)
+                                else:
+                                    latest_dt = datetime.fromisoformat(latest_change_timestamp)
+                            else:
+                                latest_dt = datetime.fromisoformat(latest_change_timestamp)
+                        logger.info(f"Parsed latest timestamp as: {latest_dt}")
+                    except ValueError as e:
+                        logger.warning(f"Could not parse latest timestamp: {e}")
+                        
+                    # Compare if both could be parsed
+                    if client_dt and latest_dt:
+                        logger.info(f"Timestamp comparison: client_dt {client_dt} {'>' if client_dt > latest_dt else '<='} latest_dt {latest_dt}")
+                        
+                        # If the client timestamp is earlier, we should have changes to send
+                        if client_dt > latest_dt:
+                            logger.warning(f"Client timestamp is newer than latest change, this is likely why no changes were found")
+                        else:
+                            logger.warning(f"Client timestamp is older than latest change, but no changes were found. This may indicate a filtering issue.")
+                            
+                            # Force a direct SQL query to see if any changes should have been found
+                            try:
+                                with self.db_manager.get_connection() as conn:
+                                    cursor = conn.cursor()
+                                    cursor.execute("SELECT COUNT(*) FROM change_log WHERE timestamp > ?", (last_timestamp,))
+                                    count = cursor.fetchone()[0]
+                                    logger.info(f"Direct SQL query found {count} changes newer than client timestamp")
+                                    
+                                    if count > 0:
+                                        # We should have found changes, so send them anyway
+                                        cursor.execute("SELECT * FROM change_log WHERE timestamp > ?", (last_timestamp,))
+                                        forced_changes = cursor.fetchall()
+                                        logger.info(f"Forcing send of {len(forced_changes)} changes")
+                                        
+                                        # Create and send a response with these changes
+                                        response = self.protocol.create_sync_response(
+                                            self.change_tracker.get_db_version(), 
+                                            True
+                                        )
+                                        client_socket.send(response)
+                                        
+                                        # Wait for acknowledgment
+                                        try:
+                                            data = client_socket.recv(self.buffer_size)
+                                            if data != self.protocol.create_ack_message():
+                                                logger.warning(f"Invalid acknowledgment from {peer_ip}")
+                                                client_socket.close()
+                                                return
+                                            
+                                            # Send the changes in chunks
+                                            changes_data = self.protocol.serialize_changes(forced_changes)
+                                            self._send_data_chunked(client_socket, changes_data)
+                                            
+                                            # Wait for acknowledgment
+                                            data = client_socket.recv(self.buffer_size)
+                                            if data != self.protocol.create_ack_message():
+                                                logger.warning(f"Invalid acknowledgment from {peer_ip}")
+                                                client_socket.close()
+                                                return
+                                            
+                                            logger.info(f"Sent forced changes to {peer_ip}")
+                                            client_socket.close()
+                                            return
+                                        except Exception as e:
+                                            logger.error(f"Error sending forced changes: {e}")
+                                    else:
+                                        logger.info("Direct SQL query also found no changes, sending empty response")
+                            except Exception as e:
+                                logger.error(f"Error performing direct SQL query: {e}")
+                except Exception as e:
+                    logger.error(f"Error in timestamp comparison debugging: {e}")
+            
             response = self.protocol.create_sync_response(
                 self.change_tracker.get_db_version(), 
                 False
@@ -749,6 +894,9 @@ class DatabaseSynchronizer:
             version = self.change_tracker.get_db_version()
             timestamp = version.get('timestamp', '1970-01-01T00:00:00Z')
             
+            # Log our current state before sync
+            logger.info(f"Our version before sync: hash={version.get('hash')}, timestamp={timestamp}")
+            
             # Send sync request
             request = self.protocol.create_sync_request(
                 version,
@@ -767,6 +915,10 @@ class DatabaseSynchronizer:
                 logger.error(f"Invalid response from peer {peer_ip}: {response}")
                 s.close()
                 return
+            
+            # Log peer version for comparison
+            peer_version = response.get('version', {})
+            logger.info(f"Peer version: hash={peer_version.get('hash')}, timestamp={peer_version.get('timestamp')}")
             
             logger.info(f"Received sync response from {peer_ip}, has_changes: {response.get('has_changes', False)}")
             
@@ -863,7 +1015,67 @@ class DatabaseSynchronizer:
                     logger.error(f"Error receiving changes: {e}")
                     self._restore_database(backup_path)
             else:
+                # Log more details about the response
                 logger.info(f"Peer {peer_ip} has no changes for us")
+                logger.info(f"Our requested timestamp: {timestamp}")
+                logger.info(f"Peer version timestamp: {peer_version.get('timestamp')}")
+                
+                # Check if we should perform a direct sync check
+                try:
+                    from datetime import datetime
+                    
+                    our_dt = None
+                    peer_dt = None
+                    
+                    # Parse our timestamp
+                    try:
+                        if isinstance(timestamp, str):
+                            if timestamp.endswith('Z'):
+                                our_dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            elif '+' in timestamp:
+                                our_dt = datetime.fromisoformat(timestamp)
+                            else:
+                                our_dt = datetime.fromisoformat(timestamp)
+                    except ValueError as e:
+                        logger.warning(f"Could not parse our timestamp: {e}")
+                        
+                    # Parse peer timestamp
+                    try:
+                        peer_timestamp = peer_version.get('timestamp')
+                        if isinstance(peer_timestamp, str):
+                            if peer_timestamp.endswith('Z'):
+                                peer_dt = datetime.fromisoformat(peer_timestamp.replace('Z', '+00:00'))
+                            elif '+' in peer_timestamp:
+                                peer_dt = datetime.fromisoformat(peer_timestamp)
+                            else:
+                                peer_dt = datetime.fromisoformat(peer_timestamp)
+                    except ValueError as e:
+                        logger.warning(f"Could not parse peer timestamp: {e}")
+                        
+                    # Compare timestamps if we have both
+                    if our_dt and peer_dt:
+                        logger.info(f"Timestamp comparison: our_dt={our_dt}, peer_dt={peer_dt}")
+                        
+                        if peer_dt > our_dt:
+                            logger.warning(f"Peer timestamp is newer than ours, but no changes were reported. This might indicate a sync issue.")
+                            
+                            # In this case, we might want to consider a full database request instead
+                            should_request_full = True
+                            
+                            # Check if the hashes are different as well
+                            if peer_version.get('hash') != version.get('hash'):
+                                logger.info(f"Hash values also differ. Our hash: {version.get('hash')}, peer hash: {peer_version.get('hash')}. Requesting full database.")
+                                
+                                # Close this connection and request a full database
+                                s.close()
+                                
+                                if should_request_full:
+                                    logger.info(f"Requesting full database from {peer_ip} due to timestamp/hash mismatch")
+                                    self._request_full_database(peer_ip, peer_sync_port)
+                                    return
+                except Exception as e:
+                    logger.warning(f"Error in timestamp comparison: {e}")
+                
                 # Remove backup as no changes were made
                 self._remove_backup(backup_path)
             
@@ -1287,4 +1499,150 @@ class DatabaseSynchronizer:
                 logger.info("No changes to apply from peer in test mode")
                 
         except Exception as e:
-            logger.error(f"Test mode sync error: {e}") 
+            logger.error(f"Test mode sync error: {e}")
+
+    def synchronize(self, force=False):
+        """Synchronize the database with peers
+        
+        Args:
+            force: Force synchronization even if no broadcast was received
+        """
+        if not self.enable_sync:
+            logger.info("Synchronization is disabled")
+            return
+        
+        if not force and not self.has_pending_sync:
+            # No pending synchronization
+            logger.debug("No pending synchronization")
+            return
+        
+        # Reset pending sync flag
+        self.has_pending_sync = False
+        self.last_sync_attempt = datetime.now(UTC).isoformat()
+        
+        # Get the list of known peers
+        peers = self.get_peers()
+        
+        if not peers:
+            logger.info("No peers available for synchronization")
+            return
+        
+        logger.info(f"Starting synchronization with {len(peers)} peers")
+        
+        # Verify database state before sync
+        before_sync_stats = self._check_database_stats()
+        logger.info(f"Database stats before sync: {len(before_sync_stats['row_counts'])} tables, {sum(before_sync_stats['row_counts'].values())} total rows")
+        
+        # Loop through each peer and try to sync with them
+        for peer in peers:
+            peer_ip = peer[0]
+            peer_sync_port = peer[1]
+            
+            logger.info(f"Synchronizing with peer {peer_ip}:{peer_sync_port}")
+            
+            self._request_sync(peer_ip, peer_sync_port)
+        
+        # Verify database state after sync
+        after_sync_stats = self._check_database_stats()
+        logger.info(f"Database stats after sync: {len(after_sync_stats['row_counts'])} tables, {sum(after_sync_stats['row_counts'].values())} total rows")
+        
+        # Check for changes in sync using the dedicated method
+        updates_detected = self._detect_updates(before_sync_stats, after_sync_stats)
+        if updates_detected:
+            logger.info("Updates were successfully received and applied during synchronization")
+        else:
+            logger.info("No updates were detected during synchronization")
+
+    def _check_database_stats(self):
+        """Get database table row counts for verification purposes"""
+        stats = {}
+        row_counts = {}
+        tables = ['taps', 'beers', 'styles', 'breweries']
+        
+        with self.db_manager.get_connection() as conn:
+            for table in tables:
+                try:
+                    cursor = conn.execute(f"SELECT COUNT(*) FROM {table}")
+                    count = cursor.fetchone()[0]
+                    row_counts[table] = count
+                except Exception as e:
+                    logger.error(f"Error getting stats for table {table}: {e}")
+                    row_counts[table] = -1
+            
+            stats['row_counts'] = row_counts
+                    
+            # Also get the latest change entry
+            try:
+                cursor = conn.execute("SELECT MAX(created_at) FROM change_log")
+                latest_change = cursor.fetchone()[0]
+                stats['latest_change'] = latest_change
+                
+                # Get the most recent rows from change_log for diagnostic purposes
+                cursor = conn.execute("""
+                    SELECT table_name, operation, row_id, created_at 
+                    FROM change_log 
+                    ORDER BY created_at DESC 
+                    LIMIT 10
+                """)
+                recent_changes = cursor.fetchall()
+                stats['recent_changes'] = [
+                    {
+                        'table_name': row[0],
+                        'action': row[1],
+                        'row_id': row[2],
+                        'timestamp': row[3]
+                    }
+                    for row in recent_changes
+                ]
+            except Exception as e:
+                logger.error(f"Error getting change_log stats: {e}")
+                stats['latest_change'] = None
+                stats['recent_changes'] = []
+                
+            # Get version information
+            try:
+                cursor = conn.execute("SELECT timestamp, hash FROM version WHERE id = 1")
+                version = cursor.fetchone()
+                if version:
+                    stats['version'] = {'timestamp': version[0], 'hash': version[1]}
+                else:
+                    stats['version'] = {'timestamp': None, 'hash': None}
+            except Exception as e:
+                logger.error(f"Error getting version info: {e}")
+                stats['version'] = {'timestamp': None, 'hash': None}
+                
+        return stats
+        
+    def _detect_updates(self, before_stats, after_stats):
+        """Detect if any updates were received during synchronization
+        
+        Args:
+            before_stats: Database statistics before synchronization
+            after_stats: Database statistics after synchronization
+            
+        Returns:
+            bool: True if updates were detected, False otherwise
+        """
+        updates_detected = False
+        
+        # Check if row counts changed for any table
+        for table in before_stats['row_counts']:
+            if table in after_stats['row_counts']:
+                if before_stats['row_counts'][table] != after_stats['row_counts'][table]:
+                    logging.info(f"Updates detected in table '{table}': "
+                                f"Before: {before_stats['row_counts'][table]}, "
+                                f"After: {after_stats['row_counts'][table]}")
+                    updates_detected = True
+        
+        # Check recent changes
+        if len(after_stats['recent_changes']) > len(before_stats['recent_changes']):
+            new_changes = [change for change in after_stats['recent_changes'] 
+                          if change not in before_stats['recent_changes']]
+            
+            if new_changes:
+                logging.info(f"New changes detected during sync: {len(new_changes)}")
+                for change in new_changes[:5]:  # Log first 5 new changes
+                    logging.info(f"  - {change['table_name']}: {change['action']} at {change['timestamp']}")
+                updates_detected = True
+                
+        return updates_detected 
