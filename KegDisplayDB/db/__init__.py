@@ -274,7 +274,7 @@ class SyncedDatabase:
         current_time = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         
         # Process beers in smaller batches to prevent long transactions
-        BATCH_SIZE = 10
+        BATCH_SIZE = 200
         total_beers = len(beer_data_list)
         
         for batch_start in range(0, total_beers, BATCH_SIZE):

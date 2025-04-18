@@ -12,6 +12,7 @@ import threading
 import queue
 import hashlib
 import time
+import uuid
 
 logger = logging.getLogger("KegDisplay")
 
@@ -854,6 +855,49 @@ class DatabaseManager:
                     
                     for tap in taps:
                         main_cursor.execute(tap_insert_sql, tap)
+                
+                # Get the version information from the temp database
+                try:
+                    # Get our local node_id
+                    main_cursor.execute("SELECT node_id FROM version WHERE id = 1")
+                    local_node_id_row = main_cursor.fetchone()
+                    local_node_id = local_node_id_row[0] if local_node_id_row else None
+                    
+                    if not local_node_id:
+                        # If we don't have a node_id, generate one
+                        local_node_id = str(uuid.uuid4())
+                        logger.info(f"Generated new node_id for import: {local_node_id}")
+                    
+                    # Check if version table exists and has logical_clock column
+                    temp_cursor.execute("PRAGMA table_info(version)")
+                    version_columns = [col[1] for col in temp_cursor.fetchall()]
+                    
+                    if 'logical_clock' in version_columns:
+                        temp_cursor.execute("SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1")
+                        version_row = temp_cursor.fetchone()
+                        if version_row:
+                            timestamp, db_hash, logical_clock, node_id = version_row
+                            
+                            # Preserve the imported logical clock value
+                            logger.info(f"Importing version data with logical_clock {logical_clock}")
+                            
+                            # Check if version table exists in our DB
+                            main_cursor.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='version'")
+                            if main_cursor.fetchone()[0] > 0:
+                                # Update our version table with the imported values but keep our node_id
+                                main_cursor.execute("""
+                                    UPDATE version 
+                                    SET timestamp = ?, hash = ?, logical_clock = ?
+                                    WHERE id = 1
+                                """, (timestamp, db_hash, logical_clock))
+                            else:
+                                # Create version record if it doesn't exist
+                                main_cursor.execute("""
+                                    INSERT INTO version (id, timestamp, hash, logical_clock, node_id)
+                                    VALUES (1, ?, ?, ?, ?)
+                                """, (timestamp, db_hash, logical_clock, local_node_id))
+                except Exception as e:
+                    logger.warning(f"Could not import version information: {e}")
                 
                 # Commit transaction
                 main_conn.commit()

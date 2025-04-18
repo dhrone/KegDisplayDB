@@ -14,6 +14,7 @@ import subprocess
 import shutil
 from pathlib import Path
 import threading
+import uuid
 
 # Import log configuration
 from ..utils.log_config import configure_logging
@@ -412,6 +413,7 @@ def import_beers():
                         # Process each row in the CSV
                         imported_count = 0
                         errors = []
+                        pending_changes = []  # Track changes to log at the end
                         
                         for idx, row in enumerate(beer_data_list):
                             try:
@@ -452,7 +454,7 @@ def import_beers():
                                         row.get('Notes'),
                                         beer_id
                                     ))
-                                    log_change(conn, "beers", "UPDATE", beer_id, skip_notify=True)
+                                    pending_changes.append(('beers', 'UPDATE', beer_id))
                                 else:
                                     # Add new beer
                                     cursor.execute('''
@@ -474,12 +476,71 @@ def import_beers():
                                         row.get('Notes')
                                     ))
                                     beer_id = cursor.lastrowid
-                                    log_change(conn, "beers", "INSERT", beer_id, skip_notify=True)
+                                    pending_changes.append(('beers', 'INSERT', beer_id))
                                 
                                 imported_count += 1
                                 
                             except Exception as e:
                                 errors.append(f"Error on row {idx+1}: {str(e)}")
+                        
+                        # Update the Lamport logical clock only once for the entire batch
+                        timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        
+                        # Check if version table has logical_clock field
+                        cursor = conn.cursor()
+                        cursor.execute("PRAGMA table_info(version)")
+                        version_columns = [col[1] for col in cursor.fetchall()]
+                        
+                        # If we have Lamport clock support, update the logical clock
+                        if 'logical_clock' in version_columns and 'node_id' in version_columns:
+                            # Get current logical clock and node ID
+                            cursor.execute("SELECT logical_clock, node_id FROM version WHERE id = 1")
+                            clock_row = cursor.fetchone()
+                            
+                            logical_clock = 0
+                            node_id = None
+                            
+                            if clock_row:
+                                current_clock, node_id = clock_row
+                                # Increment the logical clock
+                                logical_clock = current_clock + 1 if current_clock is not None else 1
+                            else:
+                                # No entry yet, start at 1 and generate a node_id
+                                logical_clock = 1
+                                node_id = str(uuid.uuid4())
+                            
+                            # Now log all changes with the same incremented logical clock
+                            for table_name, operation, row_id in pending_changes:
+                                # Calculate content hash for the table
+                                cursor.execute(f"SELECT * FROM {table_name} WHERE rowid = ?", (row_id,))
+                                row = cursor.fetchone()
+                                if row:
+                                    content_hash = str(row)
+                                else:
+                                    content_hash = "0"
+                                
+                                # Insert into change_log with logical clock
+                                cursor.execute('''
+                                    INSERT INTO change_log 
+                                    (table_name, operation, row_id, timestamp, content_hash, logical_clock, node_id) 
+                                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                                ''', (table_name, operation, row_id, timestamp, content_hash, logical_clock, node_id))
+                            
+                            # Update version table with the incremented logical clock
+                            cursor.execute(
+                                "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
+                                (timestamp, logical_clock)
+                            )
+                            if cursor.rowcount == 0:
+                                # If no rows affected, insert a new row
+                                cursor.execute(
+                                    "INSERT OR REPLACE INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
+                                    (timestamp, "0", logical_clock, node_id)
+                                )
+                        else:
+                            # Legacy method - no Lamport clock support
+                            for table_name, operation, row_id in pending_changes:
+                                log_change(conn, table_name, operation, row_id, skip_notify=True)
                         
                         # Commit all changes at once
                         conn.commit()
@@ -622,14 +683,52 @@ def log_change(conn, table_name, operation, row_id, skip_notify=False):
     else:
         content_hash = "0"
     
-    cursor.execute('''
-        INSERT INTO change_log (table_name, operation, row_id, timestamp, content_hash)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (table_name, operation, row_id, timestamp, content_hash))
+    # First check if version table has logical_clock field and node_id
+    cursor.execute("PRAGMA table_info(version)")
+    version_columns = [col[1] for col in cursor.fetchall()]
     
-    # Update version timestamp
-    try:
-        # Update timestamp in the version table
+    # If we have Lamport clock support, update the logical clock
+    logical_clock = 0
+    node_id = None
+    
+    if 'logical_clock' in version_columns and 'node_id' in version_columns:
+        # Get current logical clock
+        cursor.execute("SELECT logical_clock, node_id FROM version WHERE id = 1")
+        clock_row = cursor.fetchone()
+        if clock_row:
+            current_clock, node_id = clock_row
+            # Increment the logical clock
+            logical_clock = current_clock + 1 if current_clock is not None else 1
+        else:
+            # No entry yet, start at 1 and generate a node_id
+            logical_clock = 1
+            node_id = str(uuid.uuid4())
+            
+        # Insert with the logical clock and node_id
+        cursor.execute('''
+            INSERT INTO change_log (table_name, operation, row_id, timestamp, content_hash, logical_clock, node_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (table_name, operation, row_id, timestamp, content_hash, logical_clock, node_id))
+        
+        # Update version table with logical clock
+        cursor.execute(
+            "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
+            (timestamp, logical_clock)
+        )
+        if cursor.rowcount == 0:
+            # If no rows affected, insert a new row
+            cursor.execute(
+                "INSERT OR REPLACE INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
+                (timestamp, "0", logical_clock, node_id)
+            )
+    else:
+        # Legacy mode - no Lamport clock support
+        cursor.execute('''
+            INSERT INTO change_log (table_name, operation, row_id, timestamp, content_hash)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (table_name, operation, row_id, timestamp, content_hash))
+        
+        # Update version timestamp
         cursor.execute(
             "UPDATE version SET timestamp = ? WHERE id = 1",
             (timestamp,)
@@ -640,8 +739,6 @@ def log_change(conn, table_name, operation, row_id, skip_notify=False):
                 "INSERT OR REPLACE INTO version (id, timestamp, hash) VALUES (1, ?, ?)",
                 (timestamp, "0")
             )
-    except sqlite3.Error as e:
-        logger.error(f"Error updating version table: {e}")
     
     conn.commit()
     
