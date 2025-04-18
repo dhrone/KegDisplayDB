@@ -250,17 +250,7 @@ class DatabaseSynchronizer:
         
         logger.info(f"Received UPDATE notification from {peer_ip}:{peer_sync_port} with version {peer_version}")
         
-        # Update our logical clock based on peer's clock
-        if 'logical_clock' in peer_version:
-            peer_clock = peer_version.get('logical_clock', 0)
-            self.change_tracker.update_logical_clock(peer_clock)
-            logger.debug(f"Updated our logical clock based on peer's clock: {peer_clock}")
-        
-        # Update peer information in our peer list
-        with self.lock:
-            self.peers[peer_ip] = (peer_version, time.time(), peer_sync_port)
-        
-        # Compare versions
+        # Get our version BEFORE updating our logical clock
         our_version = self.change_tracker.get_db_version()
         logger.info(f"Comparing versions - Peer logical clock: {peer_version.get('logical_clock', 0)} / Ours: {our_version.get('logical_clock', 0)}")
         
@@ -277,6 +267,16 @@ class DatabaseSynchronizer:
             self._request_sync(peer_ip, peer_sync_port)
         else:
             logger.debug(f"No version change detected from {peer_ip} or our version is newer")
+        
+        # Update our logical clock based on peer's clock AFTER version comparison
+        if 'logical_clock' in peer_version:
+            peer_clock = peer_version.get('logical_clock', 0)
+            self.change_tracker.update_logical_clock(peer_clock)
+            logger.debug(f"Updated our logical clock based on peer's clock: {peer_clock}")
+        
+        # Update peer information in our peer list
+        with self.lock:
+            self.peers[peer_ip] = (peer_version, time.time(), peer_sync_port)
     
     def _handle_sync_request(self, client_socket, message, addr):
         """Handle sync request from peer
