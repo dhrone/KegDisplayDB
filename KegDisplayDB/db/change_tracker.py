@@ -589,10 +589,6 @@ class ChangeTracker:
         Returns:
             is_newer: True if version1 is newer than version2
         """
-        # If version2 is empty database, any other version is newer
-        if version2.get("hash") == "0":
-            return True
-        
         # If hashes are the same, they are the same version
         if version1.get("hash") == version2.get("hash"):
             return False
