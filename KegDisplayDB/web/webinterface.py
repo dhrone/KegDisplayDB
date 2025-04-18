@@ -281,14 +281,23 @@ def db_manage():
 @login_required
 def backup_beers():
     # Get all beers from the database
-    with db_manager.get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM beers")
-        beers = cursor.fetchall()
-        
-        # Get column names
-        cursor.execute("PRAGMA table_info(beers)")
-        columns = [info[1] for info in cursor.fetchall()]
+    if synced_db:
+        beers = synced_db.get_all_beers()
+        # Get column names from the first beer or use predefined columns
+        if beers:
+            columns = beers[0].keys()
+        else:
+            columns = ['idBeer', 'Name', 'ABV', 'IBU', 'Color', 'OriginalGravity', 'FinalGravity',
+                      'Description', 'Brewed', 'Kegged', 'Tapped', 'Notes']
+    else:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM beers")
+            beers = cursor.fetchall()
+            
+            # Get column names
+            cursor.execute("PRAGMA table_info(beers)")
+            columns = [info[1] for info in cursor.fetchall()]
     
     # Create a CSV string
     output = io.StringIO()
@@ -299,7 +308,10 @@ def backup_beers():
     
     # Write data
     for beer in beers:
-        writer.writerow(beer)
+        if isinstance(beer, dict):
+            writer.writerow([beer.get(col) for col in columns])
+        else:
+            writer.writerow(beer)
     
     # Prepare response
     csv_content = output.getvalue()
@@ -331,133 +343,117 @@ def import_beers():
         stream = io.StringIO(file.stream.read().decode("UTF8"), newline=None)
         reader = csv.DictReader(stream)
         
-        imported_count = 0
-        errors = []
-        
-        # Process each row in the CSV
+        # Convert CSV rows to a list of dictionaries
+        beer_data_list = []
         for row in reader:
-            try:
-                # Skip rows without a name
-                if not row.get('Name'):
-                    continue
-                    
-                # Convert empty strings to None for numeric fields
-                for field in ['ABV', 'IBU', 'Color', 'OriginalGravity', 'FinalGravity']:
-                    if field in row and (not row[field] or row[field].strip() == ''):
-                        row[field] = None
-                    elif field in row:
-                        try:
-                            row[field] = float(row[field])
-                        except (ValueError, TypeError):
-                            row[field] = None
+            # Skip rows without a name
+            if not row.get('Name'):
+                continue
                 
-                # Handle existing beer with same ID
-                beer_id = row.get('idBeer')
-                existing_beer = None
-                
-                if beer_id and beer_id.strip() and beer_id != '':
+            # Convert empty strings to None for numeric fields
+            for field in ['ABV', 'IBU', 'Color', 'OriginalGravity', 'FinalGravity']:
+                if field in row and (not row[field] or row[field].strip() == ''):
+                    row[field] = None
+                elif field in row:
                     try:
-                        beer_id = int(beer_id)
-                        if synced_db:
-                            existing_beer = synced_db.get_beer(beer_id)
-                        else:
-                            conn = sqlite3.connect(DB_PATH)
-                            conn.row_factory = sqlite3.Row
-                            cursor = conn.cursor()
-                            cursor.execute("SELECT * FROM beers WHERE idBeer = ?", (beer_id,))
-                            existing_beer = cursor.fetchone()
-                            conn.close()
+                        row[field] = float(row[field])
                     except (ValueError, TypeError):
-                        beer_id = None
+                        row[field] = None
+            
+            beer_data_list.append(row)
+        
+        if synced_db:
+            # Use the new bulk import method
+            imported_count, errors = synced_db.import_beers_from_data(beer_data_list)
+        else:
+            # Use a single connection for all operations
+            conn = sqlite3.connect(DB_PATH)
+            
+            try:
+                # Process each row in the CSV
+                imported_count = 0
+                errors = []
                 
-                # If beer exists, update it; otherwise add new beer
-                if existing_beer:
-                    if synced_db:
-                        synced_db.update_beer(
-                            beer_id=beer_id,
-                            name=row.get('Name'),
-                            abv=row.get('ABV'),
-                            ibu=row.get('IBU'),
-                            color=row.get('Color'),
-                            og=row.get('OriginalGravity'),
-                            fg=row.get('FinalGravity'),
-                            description=row.get('Description'),
-                            brewed=row.get('Brewed'),
-                            kegged=row.get('Kegged'),
-                            tapped=row.get('Tapped'),
-                            notes=row.get('Notes')
-                        )
-                    else:
-                        conn = sqlite3.connect(DB_PATH)
-                        cursor = conn.cursor()
-                        cursor.execute('''
-                            UPDATE beers SET
-                                Name = ?, ABV = ?, IBU = ?, Color = ?, OriginalGravity = ?, FinalGravity = ?,
-                                Description = ?, Brewed = ?, Kegged = ?, Tapped = ?, Notes = ?
-                            WHERE idBeer = ?
-                        ''', (
-                            row.get('Name'),
-                            row.get('ABV'),
-                            row.get('IBU'),
-                            row.get('Color'),
-                            row.get('OriginalGravity'),
-                            row.get('FinalGravity'),
-                            row.get('Description'),
-                            row.get('Brewed'),
-                            row.get('Kegged'),
-                            row.get('Tapped'),
-                            row.get('Notes'),
-                            beer_id
-                        ))
-                        log_change(conn, "beers", "UPDATE", beer_id)
-                        conn.commit()
-                        conn.close()
-                else:
-                    # Add new beer
-                    if synced_db:
-                        synced_db.add_beer(
-                            name=row.get('Name'),
-                            abv=row.get('ABV'),
-                            ibu=row.get('IBU'),
-                            color=row.get('Color'),
-                            og=row.get('OriginalGravity'),
-                            fg=row.get('FinalGravity'),
-                            description=row.get('Description'),
-                            brewed=row.get('Brewed'),
-                            kegged=row.get('Kegged'),
-                            tapped=row.get('Tapped'),
-                            notes=row.get('Notes')
-                        )
-                    else:
-                        conn = sqlite3.connect(DB_PATH)
-                        cursor = conn.cursor()
-                        cursor.execute('''
-                            INSERT INTO beers (
-                                Name, ABV, IBU, Color, OriginalGravity, FinalGravity,
-                                Description, Brewed, Kegged, Tapped, Notes
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', (
-                            row.get('Name'),
-                            row.get('ABV'),
-                            row.get('IBU'),
-                            row.get('Color'),
-                            row.get('OriginalGravity'),
-                            row.get('FinalGravity'),
-                            row.get('Description'),
-                            row.get('Brewed'),
-                            row.get('Kegged'),
-                            row.get('Tapped'),
-                            row.get('Notes')
-                        ))
-                        beer_id = cursor.lastrowid
-                        log_change(conn, "beers", "INSERT", beer_id)
-                        conn.commit()
-                        conn.close()
+                for idx, row in enumerate(beer_data_list):
+                    try:
+                        # Handle existing beer with same ID
+                        beer_id = row.get('idBeer')
+                        existing_beer = None
+                        
+                        if beer_id and str(beer_id).strip() and str(beer_id) != '':
+                            try:
+                                beer_id = int(beer_id)
+                                cursor = conn.cursor()
+                                conn.row_factory = sqlite3.Row
+                                cursor.execute("SELECT * FROM beers WHERE idBeer = ?", (beer_id,))
+                                existing_beer = cursor.fetchone()
+                            except (ValueError, TypeError):
+                                beer_id = None
+                        
+                        cursor = conn.cursor()  # Create a new cursor for each operation
+                        
+                        # If beer exists, update it; otherwise add new beer
+                        if existing_beer:
+                            cursor.execute('''
+                                UPDATE beers SET
+                                    Name = ?, ABV = ?, IBU = ?, Color = ?, OriginalGravity = ?, FinalGravity = ?,
+                                    Description = ?, Brewed = ?, Kegged = ?, Tapped = ?, Notes = ?
+                                WHERE idBeer = ?
+                            ''', (
+                                row.get('Name'),
+                                row.get('ABV'),
+                                row.get('IBU'),
+                                row.get('Color'),
+                                row.get('OriginalGravity'),
+                                row.get('FinalGravity'),
+                                row.get('Description'),
+                                row.get('Brewed'),
+                                row.get('Kegged'),
+                                row.get('Tapped'),
+                                row.get('Notes'),
+                                beer_id
+                            ))
+                            log_change(conn, "beers", "UPDATE", beer_id, skip_notify=True)
+                        else:
+                            # Add new beer
+                            cursor.execute('''
+                                INSERT INTO beers (
+                                    Name, ABV, IBU, Color, OriginalGravity, FinalGravity,
+                                    Description, Brewed, Kegged, Tapped, Notes
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ''', (
+                                row.get('Name'),
+                                row.get('ABV'),
+                                row.get('IBU'),
+                                row.get('Color'),
+                                row.get('OriginalGravity'),
+                                row.get('FinalGravity'),
+                                row.get('Description'),
+                                row.get('Brewed'),
+                                row.get('Kegged'),
+                                row.get('Tapped'),
+                                row.get('Notes')
+                            ))
+                            beer_id = cursor.lastrowid
+                            log_change(conn, "beers", "INSERT", beer_id, skip_notify=True)
+                        
+                        imported_count += 1
+                        
+                    except Exception as e:
+                        errors.append(f"Error on row {idx+1}: {str(e)}")
                 
-                imported_count += 1
+                # Commit all changes at once
+                conn.commit()
                 
+                # Send a single notification after all updates
+                if imported_count > 0 and synced_db:
+                    synced_db.notify_update()
+                    
             except Exception as e:
-                errors.append(f"Error on row {reader.line_num}: {str(e)}")
+                conn.rollback()
+                raise e
+            finally:
+                conn.close()
         
         result = {
             "success": True,
@@ -483,42 +479,43 @@ def clear_beers():
     try:
         # Get count of beers before clearing
         if synced_db:
-            beers = synced_db.get_all_beers()
-            beer_count = len(beers)
-            
-            # Clear all taps first
-            taps = synced_db.get_all_taps()
-            for tap in taps:
-                if tap['idBeer']:
-                    synced_db.update_tap(tap['idTap'], None)
-            
-            # Delete each beer individually to trigger proper sync events
-            for beer in beers:
-                synced_db.delete_beer(beer['idBeer'])
+            # Use the new clear_all_beers method
+            beer_count = synced_db.clear_all_beers()
         else:
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
             
-            # Get beer count
-            cursor.execute("SELECT COUNT(*) FROM beers")
-            beer_count = cursor.fetchone()[0]
-            
-            # Clear all tap assignments first
-            cursor.execute("UPDATE taps SET idBeer = NULL")
-            
-            # Get all beer IDs for logging
-            cursor.execute("SELECT idBeer FROM beers")
-            beer_ids = [row[0] for row in cursor.fetchall()]
-            
-            # Delete all beers
-            cursor.execute("DELETE FROM beers")
-            
-            # Log each deletion
-            for beer_id in beer_ids:
-                log_change(conn, "beers", "DELETE", beer_id)
-            
-            conn.commit()
-            conn.close()
+            try:
+                # Get beer count
+                cursor.execute("SELECT COUNT(*) FROM beers")
+                beer_count = cursor.fetchone()[0]
+                
+                # Clear all tap assignments first
+                cursor.execute("UPDATE taps SET idBeer = NULL")
+                
+                # Get all beer IDs for logging
+                cursor.execute("SELECT idBeer FROM beers")
+                beer_ids = [row[0] for row in cursor.fetchall()]
+                
+                # Delete all beers
+                cursor.execute("DELETE FROM beers")
+                
+                # Log each deletion but skip notifications
+                for beer_id in beer_ids:
+                    log_change(conn, "beers", "DELETE", beer_id, skip_notify=True)
+                
+                # Commit all changes at once
+                conn.commit()
+                
+                # Send a single notification after all updates
+                if beer_count > 0 and synced_db:
+                    synced_db.notify_update()
+                    
+            except Exception as e:
+                conn.rollback()
+                raise e
+            finally:
+                conn.close()
         
         return jsonify({
             "success": True,
@@ -530,7 +527,7 @@ def clear_beers():
 
 # This function is now used by the web interface to log changes
 # The SyncedDatabase handles the synchronization
-def log_change(conn, table_name, operation, row_id):
+def log_change(conn, table_name, operation, row_id, skip_notify=False):
     """Log a database change and trigger synchronization"""
     cursor = conn.cursor()
     timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -566,8 +563,8 @@ def log_change(conn, table_name, operation, row_id):
     
     conn.commit()
     
-    # Notify peers about the change if sync is enabled
-    if synced_db:
+    # Notify peers about the change if sync is enabled and notification is not skipped
+    if synced_db and not skip_notify:
         logger = logging.getLogger("KegDisplay")
         
         if table_name == 'beers':
@@ -585,20 +582,35 @@ def log_change(conn, table_name, operation, row_id):
 def api_get_taps():
     """Get all taps with beer information"""
     try:
-        with db_manager.get_connection() as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+        if synced_db:
+            # Get all taps using SyncedDatabase
+            taps = synced_db.get_all_taps()
             
-            # Get all taps with beer information
-            cursor.execute("""
-                SELECT t.idTap, t.idBeer, 
-                       b.Name as BeerName, b.ABV, b.IBU, b.Description 
-                FROM taps t
-                LEFT JOIN beers b ON t.idBeer = b.idBeer
-                ORDER BY t.idTap
-            """)
-            
-            taps = [dict(row) for row in cursor.fetchall()]
+            # Enhance with additional beer information
+            for tap in taps:
+                if tap['idBeer']:
+                    beer = synced_db.get_beer(tap['idBeer'])
+                    if beer:
+                        tap['BeerName'] = beer['Name']
+                        tap['ABV'] = beer['ABV']
+                        tap['IBU'] = beer['IBU'] 
+                        tap['Description'] = beer['Description']
+        else:
+            # Fallback to direct database connection
+            with db_manager.get_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                
+                # Get all taps with beer information
+                cursor.execute("""
+                    SELECT t.idTap, t.idBeer, 
+                           b.Name as BeerName, b.ABV, b.IBU, b.Description 
+                    FROM taps t
+                    LEFT JOIN beers b ON t.idBeer = b.idBeer
+                    ORDER BY t.idTap
+                """)
+                
+                taps = [dict(row) for row in cursor.fetchall()]
             
         return jsonify(taps)
     except Exception as e:
@@ -615,6 +627,8 @@ def api_get_tap(tap_id):
             if beer:
                 tap['BeerName'] = beer['Name']
                 tap['ABV'] = beer['ABV']
+                tap['IBU'] = beer['IBU']
+                tap['Description'] = beer['Description']
                 
         if tap:
             return jsonify(tap)
@@ -627,7 +641,7 @@ def api_get_tap(tap_id):
         cursor = conn.cursor()
         
         cursor.execute('''
-            SELECT t.*, b.Name as BeerName, b.ABV 
+            SELECT t.*, b.Name as BeerName, b.ABV, b.IBU, b.Description 
             FROM taps t
             LEFT JOIN beers b ON t.idBeer = b.idBeer
             WHERE t.idTap = ?
@@ -651,40 +665,60 @@ def api_add_tap():
         # Get beer_id if provided, otherwise use NULL
         beer_id = data.get('idBeer')
         
-        with db_manager.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Find the next available tap ID
-            cursor.execute("SELECT MAX(idTap) FROM taps")
-            result = cursor.fetchone()
-            next_tap_id = 1 if result[0] is None else result[0] + 1
-            
-            # Insert the new tap
-            cursor.execute(
-                "INSERT INTO taps (idTap, idBeer) VALUES (?, ?)",
-                (next_tap_id, beer_id)
-            )
-            
-            conn.commit()
-            
-            # Get the new tap with beer info if applicable
-            if beer_id:
-                cursor.execute("""
-                    SELECT t.idTap, t.idBeer, 
-                           b.Name as BeerName, b.ABV, b.IBU, b.Description 
-                    FROM taps t
-                    LEFT JOIN beers b ON t.idBeer = b.idBeer
-                    WHERE t.idTap = ?
-                """, (next_tap_id,))
-            else:
-                cursor.execute("SELECT idTap, idBeer FROM taps WHERE idTap = ?", (next_tap_id,))
-            
-            tap = dict(cursor.fetchone())
-        
-        # Notify peers of the update if using synced database
         if synced_db:
-            synced_db.notify_update()
+            # Get the next available tap ID
+            existing_taps = synced_db.get_all_taps()
+            tap_ids = [tap['idTap'] for tap in existing_taps]
+            next_tap_id = 1 if not tap_ids else max(tap_ids) + 1
             
+            # Add the tap using SyncedDatabase
+            tap_id = synced_db.add_tap(next_tap_id, beer_id)
+            
+            # Get the new tap with beer info
+            tap = synced_db.get_tap(tap_id)
+            
+            # Add beer info if applicable
+            if beer_id:
+                beer = synced_db.get_beer(beer_id)
+                if beer:
+                    tap['BeerName'] = beer['Name']
+                    tap['ABV'] = beer['ABV'] 
+                    tap['IBU'] = beer['IBU']
+                    tap['Description'] = beer['Description']
+        else:
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Find the next available tap ID
+                cursor.execute("SELECT MAX(idTap) FROM taps")
+                result = cursor.fetchone()
+                next_tap_id = 1 if result[0] is None else result[0] + 1
+                
+                # Insert the new tap
+                cursor.execute(
+                    "INSERT INTO taps (idTap, idBeer) VALUES (?, ?)",
+                    (next_tap_id, beer_id)
+                )
+                
+                conn.commit()
+                
+                # Get the new tap with beer info if applicable
+                if beer_id:
+                    cursor.execute("""
+                        SELECT t.idTap, t.idBeer, 
+                               b.Name as BeerName, b.ABV, b.IBU, b.Description 
+                        FROM taps t
+                        LEFT JOIN beers b ON t.idBeer = b.idBeer
+                        WHERE t.idTap = ?
+                    """, (next_tap_id,))
+                else:
+                    cursor.execute("SELECT idTap, idBeer FROM taps WHERE idTap = ?", (next_tap_id,))
+                
+                tap = dict(cursor.fetchone())
+                
+                # Notify peers of the update
+                log_change(conn, "taps", "INSERT", next_tap_id)
+        
         return jsonify(tap), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1043,25 +1077,11 @@ def api_set_tap_count():
         return jsonify({"error": "Valid tap count is required (must be positive integer)"}), 400
     
     if synced_db:
-        # Get current taps
-        existing_taps = synced_db.get_all_taps()
-        current_count = len(existing_taps)
-        
-        # If decreasing, delete excess taps
-        if count < current_count:
-            # Delete taps from highest number to lowest
-            for i in range(current_count, count, -1):
-                tap_id = i
-                synced_db.delete_tap(tap_id)
-        
-        # If increasing, add new taps
-        elif count > current_count:
-            # Add new taps with sequential IDs
-            for i in range(current_count + 1, count + 1):
-                tap_id = i
-                synced_db.add_tap(tap_id, None)
-        
-        return jsonify({"success": True, "tap_count": count})
+        # Use the new set_tap_count method
+        if synced_db.set_tap_count(count):
+            return jsonify({"success": True, "tap_count": count})
+        else:
+            return jsonify({"error": "Failed to set tap count"}), 500
     else:
         # Fallback if synced_db is not available
         conn = sqlite3.connect(DB_PATH)
