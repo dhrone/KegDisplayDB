@@ -22,6 +22,17 @@ from ..utils.log_config import configure_logging
 from ..db import SyncedDatabase
 from ..db.database import DatabaseManager
 
+# Global variable to track import status
+import_status = {
+    "in_progress": False,
+    "last_import": {
+        "timestamp": None,
+        "success": None,
+        "imported_count": 0,
+        "errors": []
+    }
+}
+
 # Import Gunicorn at module level
 try:
     from gunicorn.app.base import BaseApplication
@@ -329,6 +340,8 @@ def backup_beers():
 @app.route('/api/beers/import', methods=['POST'])
 @login_required
 def import_beers():
+    global import_status  # Move global declaration to the beginning
+    
     if 'file' not in request.files:
         return jsonify({"error": "No file provided"}), 400
     
@@ -345,7 +358,6 @@ def import_beers():
         file_data = file.stream.read().decode("UTF8")
         
         # Update global import status
-        global import_status
         import_status["in_progress"] = True
         import_status["last_import"] = {
             "timestamp": datetime.now(UTC).isoformat(),
@@ -358,6 +370,7 @@ def import_beers():
         logger = logging.getLogger("KegDisplay")
         
         def background_import():
+            global import_status  # Move global declaration to the beginning
             try:
                 logger.info("Starting background beer import process")
                 
@@ -485,7 +498,6 @@ def import_beers():
                         conn.close()
                 
                 # Update import status when complete
-                global import_status
                 import_status["in_progress"] = False
                 import_status["last_import"]["timestamp"] = datetime.now(UTC).isoformat()
                 import_status["last_import"]["success"] = True
@@ -496,7 +508,6 @@ def import_beers():
                 logger.error(f"Unexpected error in background import: {e}")
                 
                 # Update import status with error
-                global import_status
                 import_status["in_progress"] = False
                 import_status["last_import"]["timestamp"] = datetime.now(UTC).isoformat()
                 import_status["last_import"]["success"] = False
@@ -514,7 +525,6 @@ def import_beers():
         
     except Exception as e:
         # Update import status with error
-        global import_status
         import_status["in_progress"] = False
         import_status["last_import"]["timestamp"] = datetime.now(UTC).isoformat()
         import_status["last_import"]["success"] = False
@@ -1340,14 +1350,3 @@ def start(passed_args=None):
 if __name__ == '__main__':
     # Only parse arguments when run as a script
     start(parse_args()) 
-
-# Global variable to track import status
-import_status = {
-    "in_progress": False,
-    "last_import": {
-        "timestamp": None,
-        "success": None,
-        "imported_count": 0,
-        "errors": []
-    }
-} 
