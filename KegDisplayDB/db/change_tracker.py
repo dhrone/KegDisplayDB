@@ -86,7 +86,7 @@ class ChangeTracker:
             logger.warning(f"Using temporary node ID: {temp_id}")
             return temp_id
     
-    def increment_logical_clock(self, max_retries=5, retry_delay=0.5):
+    def increment_logical_clock(self, max_retries=5, retry_delay=0.5, conn=None):
         """
         Increment the logical clock in the version table
         
@@ -97,54 +97,59 @@ class ChangeTracker:
         Returns:
             New logical clock value or None if unsuccessful
         """
-        retries = 0
+        def db_manager_or_conn(conn):
+            # Set a longer timeout for this operation
+            conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
+            
+            # Get current logical clock value
+            cursor = conn.cursor()
+            cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
+            row = cursor.fetchone()
+            
+            if row is None:
+                # Initialize with 1 if no row exists
+                current_clock = 0
+                new_clock = 1
+                
+                # Insert new version record
+                cursor.execute(
+                    "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
+                    (
+                        datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "0",
+                        new_clock,
+                        self.node_id
+                    )
+                )
+            else:
+                # Increment existing clock
+                current_clock = row[0] if row[0] is not None else 0
+                new_clock = current_clock + 1
+                
+                # Update version record
+                cursor.execute(
+                    "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
+                    (
+                        datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        new_clock
+                    )
+                )
+            
+            # Commit the transaction
+            conn.commit()
+            
+            # Log the update
+            logger.info(f"Incremented logical clock from {current_clock} to {new_clock}")
+            return new_clock
         
+        retries = 0
         while retries < max_retries:
             try:
-                with self.db_manager.get_connection() as conn:
-                    # Set a longer timeout for this operation
-                    conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
-                    
-                    # Get current logical clock value
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
-                    row = cursor.fetchone()
-                    
-                    if row is None:
-                        # Initialize with 1 if no row exists
-                        current_clock = 0
-                        new_clock = 1
-                        
-                        # Insert new version record
-                        cursor.execute(
-                            "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
-                            (
-                                datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                "0",
-                                new_clock,
-                                self.node_id
-                            )
-                        )
-                    else:
-                        # Increment existing clock
-                        current_clock = row[0] if row[0] is not None else 0
-                        new_clock = current_clock + 1
-                        
-                        # Update version record
-                        cursor.execute(
-                            "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
-                            (
-                                datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                new_clock
-                            )
-                        )
-                    
-                    # Commit the transaction
-                    conn.commit()
-                    
-                    # Log the update
-                    logger.info(f"Incremented logical clock from {current_clock} to {new_clock}")
-                    return new_clock
+                if conn is None:    
+                    with self.db_manager.get_connection() as conn:
+                        return db_manager_or_conn(conn)
+                else:
+                    return db_manager_or_conn(conn)
                     
             except sqlite3.OperationalError as e:
                 if "database is locked" in str(e):
