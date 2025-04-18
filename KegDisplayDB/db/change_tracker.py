@@ -556,6 +556,29 @@ class ChangeTracker:
             logger.error(f"Error accessing table {table_name}: {e}")
             return "0"
     
+    def is_database_empty(self):
+        """Check if the database is empty (no beers or taps)
+        
+        Returns:
+            bool: True if database has no content, False otherwise
+        """
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Check beers table
+                cursor.execute("SELECT COUNT(*) FROM beers")
+                beer_count = cursor.fetchone()[0]
+                
+                # Check taps table
+                cursor.execute("SELECT COUNT(*) FROM taps")
+                tap_count = cursor.fetchone()[0]
+                
+                return beer_count == 0 and tap_count == 0
+        except Exception as e:
+            logger.error(f"Error checking if database is empty: {e}")
+            return True  # Assume empty if we can't check
+
     def is_newer_version(self, version1, version2):
         """Determine if version1 is newer than version2 based on logical clocks
         

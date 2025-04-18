@@ -230,6 +230,26 @@ class DatabaseSynchronizer:
             
             if old_version != peer_version:
                 logger.debug(f"Updated peer {peer_ip} version to {peer_version}")
+                
+                # Check if we need to sync due to hash mismatch
+                our_version = self.change_tracker.get_db_version()
+                
+                # If we have different content hashes, check if we need to sync
+                if peer_version.get("hash") != our_version.get("hash"):
+                    logger.info(f"Detected hash mismatch with peer {peer_ip}: {peer_version.get('hash')} vs our {our_version.get('hash')}")
+                    
+                    # Check if our database is empty but peer has data
+                    if self.change_tracker.is_database_empty():
+                        logger.info(f"We have empty database but peer has data, initiating sync")
+                        self._request_sync(peer_ip, peer_sync_port)
+                    # Also check if peer's logical clock is higher
+                    elif peer_version.get("logical_clock", 0) > our_version.get("logical_clock", 0):
+                        logger.info(f"Peer has higher logical clock ({peer_version.get('logical_clock', 0)}) than ours ({our_version.get('logical_clock', 0)}), initiating sync")
+                        self._request_sync(peer_ip, peer_sync_port)
+                    # Alternatively, try using is_newer_version directly
+                    elif self.change_tracker.is_newer_version(peer_version, our_version):
+                        logger.info(f"Peer has newer version according to is_newer_version, initiating sync")
+                        self._request_sync(peer_ip, peer_sync_port)
     
     def _handle_update(self, message, addr):
         """Handle update notification messages
@@ -1206,19 +1226,36 @@ class DatabaseSynchronizer:
         latest_port = None
         latest_version = self.change_tracker.get_db_version()
         
+        our_hash = latest_version.get("hash", "")
+        our_clock = latest_version.get("logical_clock", 0)
+        is_empty = self.change_tracker.is_database_empty()
+        
         with self.lock:
             logger.info(f"Found {len(self.peers)} peers during discovery")
             
             for ip, (version, _, port) in self.peers.items():
                 # Check if this peer's version is different from ours
-                if version.get("hash") != latest_version.get("hash"):
-                    logger.info(f"Peer {ip} has different version: {version}")
+                peer_hash = version.get("hash", "")
+                peer_clock = version.get("logical_clock", 0)
+                
+                if peer_hash != our_hash:
+                    logger.info(f"Peer {ip} has different hash: {peer_hash} vs our {our_hash}")
                     
-                    if latest_peer is None or self.change_tracker.is_newer_version(version, latest_version):
-                        latest_peer = ip
-                        latest_port = port
-                        latest_version = version
-                        logger.info(f"This is now the latest peer")
+                    # Special case for empty database
+                    if is_empty:
+                        logger.info(f"We have empty database but peer has data, considering peer newer")
+                        if latest_peer is None or self.change_tracker.is_newer_version(version, latest_version):
+                            latest_peer = ip
+                            latest_port = port
+                            latest_version = version
+                            logger.info(f"This is now the latest peer (empty database case)")
+                    # Check if this peer's version appears newer
+                    elif peer_clock > our_clock or self.change_tracker.is_newer_version(version, latest_version):
+                        if latest_peer is None or self.change_tracker.is_newer_version(version, latest_version):
+                            latest_peer = ip
+                            latest_port = port
+                            latest_version = version
+                            logger.info(f"This is now the latest peer (logical clock: {peer_clock})")
         
         if latest_peer:
             logger.info(f"Found peer with latest version: {latest_peer}, requesting full database")
