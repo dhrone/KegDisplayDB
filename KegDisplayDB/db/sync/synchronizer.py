@@ -108,19 +108,26 @@ class DatabaseSynchronizer:
             addr: Address the message came from
             is_sync: Whether this is a sync connection
         """
+        peer_ip = addr[0] if isinstance(addr, tuple) else addr
+        
         if is_sync:
             # Handle sync connection
+            logger.debug(f"Received sync connection from {peer_ip}")
             self._handle_sync_connection(data, addr)
             return
         
         # Parse the message
         message = self.protocol.parse_message(data)
         if not message:
+            logger.warning(f"Received invalid or empty message from {peer_ip}")
             return
         
         message_type = message.get('type')
         if not message_type:
+            logger.warning(f"Received message without type from {peer_ip}")
             return
+        
+        logger.debug(f"Received {message_type} message from {peer_ip}")
         
         # Route message to appropriate handler
         if message_type == 'discovery':
@@ -129,6 +136,8 @@ class DatabaseSynchronizer:
             self._handle_heartbeat(message, addr)
         elif message_type == 'update':
             self._handle_update(message, addr)
+        else:
+            logger.warning(f"Received unknown message type '{message_type}' from {peer_ip}")
     
     def _handle_sync_connection(self, client_socket, addr):
         """Handle incoming sync connections
@@ -238,14 +247,18 @@ class DatabaseSynchronizer:
         peer_version = message.get('version')
         peer_sync_port = message.get('sync_port', self.network.sync_port)
         
+        logger.info(f"Received UPDATE notification from {peer_ip}:{peer_sync_port} with version {peer_version}")
+        
         # Update peer information
         with self.lock:
             self.peers[peer_ip] = (peer_version, time.time(), peer_sync_port)
         
         # Compare versions
         our_version = self.change_tracker.get_db_version()
+        logger.info(f"Comparing versions - Peer: {peer_version.get('hash')} / Ours: {our_version.get('hash')}")
+        
         if peer_version.get('hash') != our_version.get('hash'):
-            logger.info(f"Detected version change from {peer_ip}, requesting sync")
+            logger.info(f"Version mismatch detected from {peer_ip}, requesting sync")
             logger.debug(f"Peer version hash: {peer_version.get('hash')}")
             logger.debug(f"Our version hash: {our_version.get('hash')}")
             self._request_sync(peer_ip, peer_sync_port)
@@ -431,11 +444,14 @@ class DatabaseSynchronizer:
             max_retries = 3
             chunk_timeout = 15  # seconds - increased from 5 to 15
             
+            logger.info(f"Starting chunked data transfer, total size: {total_size} bytes")
             # First send the total size as a 8-byte integer
             sock.sendall(total_size.to_bytes(8, byteorder='big'))
             
             # Send data in chunks
             total_chunks = (total_size + self.chunk_size - 1) // self.chunk_size
+            logger.debug(f"Will send {total_chunks} chunks of maximum size {self.chunk_size}")
+            
             for chunk_index in range(0, total_chunks):
                 start_pos = chunk_index * self.chunk_size
                 end_pos = min(start_pos + self.chunk_size, total_size)
@@ -452,6 +468,7 @@ class DatabaseSynchronizer:
                         sock.sendall(chunk_index.to_bytes(4, byteorder='big'))
                         sock.sendall(chunk_size.to_bytes(4, byteorder='big'))
                         
+                        logger.debug(f"Sending chunk {chunk_index} of size {chunk_size} bytes")
                         # Send the chunk data
                         sock.sendall(chunk)
                         
@@ -460,6 +477,7 @@ class DatabaseSynchronizer:
                         ack = sock.recv(4)
                         if ack == b'ACK!':
                             bytes_sent += chunk_size
+                            logger.debug(f"Received ACK for chunk {chunk_index}")
                             break
                         else:
                             # Log the actual unexpected response
@@ -481,6 +499,7 @@ class DatabaseSynchronizer:
             
             # Send end marker
             sock.sendall(b'DONE')
+            logger.info(f"Completed chunked data transfer, sent {bytes_sent}/{total_size} bytes")
             
             logger.debug(f"Sent {bytes_sent} bytes of data")
             return bytes_sent
@@ -505,6 +524,7 @@ class DatabaseSynchronizer:
                 return None
             
             total_size = int.from_bytes(size_bytes, byteorder='big')
+            logger.info(f"Starting to receive chunked data, expected total size: {total_size} bytes")
             
             # Receive data in chunks
             data = bytearray(total_size)
@@ -519,6 +539,7 @@ class DatabaseSynchronizer:
                 try:
                     marker = sock.recv(4)
                     if marker == b'DONE':
+                        logger.info(f"Received DONE marker, transfer complete")
                         break
                     
                     # Parse chunk index
@@ -537,6 +558,7 @@ class DatabaseSynchronizer:
                         continue
                     
                     chunk_size = int.from_bytes(chunk_size_bytes, byteorder='big')
+                    logger.debug(f"Receiving chunk {chunk_index} of size {chunk_size} bytes")
                     
                     # Receive the chunk data
                     chunk = bytearray()
@@ -548,6 +570,7 @@ class DatabaseSynchronizer:
                             chunk = self._recv_all(sock, chunk_size)
                             if chunk and len(chunk) == chunk_size:
                                 success = True
+                                logger.debug(f"Successfully received chunk {chunk_index}")
                             else:
                                 logger.warning(f"Incomplete chunk {chunk_index} (got {len(chunk) if chunk else 0}/{chunk_size} bytes), retrying ({retry_count+1}/{max_retries})")
                                 sock.sendall(b'ERR!')
@@ -577,6 +600,7 @@ class DatabaseSynchronizer:
                     
                     # Send acknowledgment
                     sock.sendall(b'ACK!')
+                    logger.debug(f"Sent ACK for chunk {chunk_index}")
                     
                     if bytes_received % (self.chunk_size * 10) == 0 and bytes_received > 0:
                         logger.debug(f"Received {bytes_received}/{total_size} bytes ({bytes_received/total_size:.1%})")
@@ -588,7 +612,7 @@ class DatabaseSynchronizer:
                     logger.error(f"Error receiving chunk: {e}")
                     raise
             
-            logger.debug(f"Received {bytes_received} bytes of data")
+            logger.info(f"Completed chunked data transfer, received {bytes_received}/{total_size} bytes")
             return bytes(data)
         except Exception as e:
             logger.error(f"Error receiving chunked data: {e}")
@@ -703,10 +727,13 @@ class DatabaseSynchronizer:
         
         try:
             # Connect to peer
+            logger.debug(f"Attempting to connect to peer at {peer_ip}:{peer_sync_port}")
             s = self.network.connect_to_peer(peer_ip, peer_sync_port)
             if not s:
                 logger.error(f"Failed to connect to peer {peer_ip}:{peer_sync_port}")
                 return
+            
+            logger.info(f"Successfully connected to peer {peer_ip}:{peer_sync_port}")
             
             # Set socket timeout
             s.settimeout(self.socket_timeout)
@@ -721,25 +748,31 @@ class DatabaseSynchronizer:
                 timestamp,
                 self.network.sync_port
             )
+            logger.debug(f"Sending sync request for changes since {timestamp}")
             s.send(request)
             
             # Receive response
+            logger.debug(f"Waiting for sync response from {peer_ip}")
             response_data = s.recv(self.buffer_size)
             response = self.protocol.parse_message(response_data)
             
             if not response or response.get('type') != 'sync_response':
-                logger.error(f"Invalid response from peer {peer_ip}")
+                logger.error(f"Invalid response from peer {peer_ip}: {response}")
                 s.close()
                 return
+            
+            logger.info(f"Received sync response from {peer_ip}, has_changes: {response.get('has_changes', False)}")
             
             if response.get('has_changes', False):
                 logger.info(f"Peer {peer_ip} has changes for us")
                 
                 # Send acknowledgment
+                logger.debug(f"Sending ACK to {peer_ip}")
                 s.send(self.protocol.create_ack_message())
                 
                 # Receive changes as chunked data
                 try:
+                    logger.debug(f"Starting to receive changes data from {peer_ip}")
                     changes_data = self._receive_data_chunked(s)
                     if not changes_data:
                         logger.error(f"Failed to receive changes from {peer_ip}")
@@ -752,6 +785,7 @@ class DatabaseSynchronizer:
                     logger.info(f"Received {len(changes)} changes from {peer_ip}")
                     
                     # Send acknowledgment
+                    logger.debug(f"Sending final ACK to {peer_ip}")
                     s.send(self.protocol.create_ack_message())
                     
                     # Apply the changes through database manager API

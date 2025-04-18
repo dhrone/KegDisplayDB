@@ -6,6 +6,7 @@ Handles socket management and network communications.
 import socket
 import logging
 import threading
+import time
 
 logger = logging.getLogger("KegDisplay")
 
@@ -125,11 +126,19 @@ class NetworkManager:
             message: Message to broadcast (bytes)
         """
         if self.broadcast_socket is None:
+            logger.info("Setting up sockets before broadcast")
             self.setup_sockets()
         
         try:
+            # Try to decode the first part of the message for logging
+            try:
+                msg_preview = message[:50].decode('utf-8', errors='replace')
+                logger.info(f"Broadcasting message ({len(message)} bytes): {msg_preview}...")
+            except Exception as e:
+                logger.info(f"Broadcasting message ({len(message)} bytes), preview decode failed: {e}")
+            
             self.broadcast_socket.sendto(message, ('<broadcast>', self.broadcast_port))
-            logger.debug(f"Broadcast message sent: {message[:50]}...")
+            logger.debug(f"Broadcast message sent to port {self.broadcast_port}")
         except Exception as e:
             logger.error(f"Error sending broadcast: {e}")
     
@@ -172,17 +181,41 @@ class NetworkManager:
     def _broadcast_listener(self):
         """Listen for broadcast messages from peers"""
         logger.info(f"Starting broadcast listener on port {self.broadcast_port}")
+        recv_count = 0
+        last_log_time = time.time()
+        
         while self.running:
             try:
                 data, addr = self.broadcast_socket.recvfrom(1024)
+                recv_count += 1
+                
+                # Periodic logging to ensure the listener is active
+                current_time = time.time()
+                if current_time - last_log_time > 60:  # Log activity every minute
+                    logger.info(f"Broadcast listener active, received {recv_count} messages in the last minute")
+                    recv_count = 0
+                    last_log_time = current_time
                 
                 # Skip messages from our own IP
                 if addr[0] not in self.local_ips:
-                    logger.debug(f"Received broadcast from {addr[0]}")
+                    logger.info(f"Received broadcast from {addr[0]}, data length: {len(data)}")
+                    
+                    # Try to log the first part of the message for debugging
+                    try:
+                        msg_preview = data[:50].decode('utf-8', errors='replace')
+                        logger.debug(f"Message preview: {msg_preview}...")
+                    except Exception as e:
+                        logger.debug(f"Could not decode message preview: {e}")
                     
                     # Call the message handler if set
                     if self.message_handler:
+                        logger.debug(f"Calling message handler for broadcast from {addr[0]}")
                         self.message_handler(data, addr)
+                    else:
+                        logger.warning(f"No message handler set for broadcast from {addr[0]}")
+                else:
+                    logger.debug(f"Ignoring broadcast from own IP {addr[0]}")
+                    
             except socket.timeout:
                 continue
             except Exception as e:
