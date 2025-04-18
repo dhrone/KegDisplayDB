@@ -154,9 +154,24 @@ class ChangeTracker:
         
         try:
             # Normalize the timestamp format to ensure consistent comparison
-            # Handle both formats: '2025-04-16T23:30:33.348840' and '2025-04-16T22:31:01Z'
+            # Handle various timestamp formats including those with timezone info
             try:
-                if '.' in last_timestamp:
+                dt = None
+                # Handle timezone offsets like +00:00
+                if '+' in last_timestamp and not last_timestamp.endswith('Z'):
+                    # Split at the + and parse the main part
+                    timestamp_parts = last_timestamp.split('+')
+                    base_timestamp = timestamp_parts[0]
+                    
+                    # Parse the base timestamp
+                    if '.' in base_timestamp:
+                        dt = datetime.strptime(base_timestamp, "%Y-%m-%dT%H:%M:%S.%f")
+                    else:
+                        dt = datetime.strptime(base_timestamp, "%Y-%m-%dT%H:%M:%S")
+                    
+                    logger.debug(f"Parsed timestamp with timezone offset: {base_timestamp}")
+                # Handle standard formats
+                elif '.' in last_timestamp:
                     # If it has milliseconds, parse accordingly
                     dt = datetime.strptime(last_timestamp, "%Y-%m-%dT%H:%M:%S.%f")
                 elif 'Z' in last_timestamp:
@@ -193,8 +208,20 @@ class ChangeTracker:
                     change_timestamp = change[3]  # timestamp is at index 3
                     
                     try:
-                        # Parse the change timestamp
-                        if '.' in change_timestamp:
+                        # Parse the change timestamp with the same flexible logic
+                        change_dt = None
+                        
+                        # Handle timezone offsets
+                        if '+' in change_timestamp and not change_timestamp.endswith('Z'):
+                            timestamp_parts = change_timestamp.split('+')
+                            base_timestamp = timestamp_parts[0]
+                            
+                            if '.' in base_timestamp:
+                                change_dt = datetime.strptime(base_timestamp, "%Y-%m-%dT%H:%M:%S.%f")
+                            else:
+                                change_dt = datetime.strptime(base_timestamp, "%Y-%m-%dT%H:%M:%S")
+                        # Handle standard formats
+                        elif '.' in change_timestamp:
                             change_dt = datetime.strptime(change_timestamp, "%Y-%m-%dT%H:%M:%S.%f")
                         elif 'Z' in change_timestamp:
                             change_dt = datetime.strptime(change_timestamp.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")

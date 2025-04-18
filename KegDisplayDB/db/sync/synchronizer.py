@@ -429,17 +429,22 @@ class DatabaseSynchronizer:
             total_size = len(data)
             bytes_sent = 0
             max_retries = 3
-            chunk_timeout = 5  # seconds
+            chunk_timeout = 15  # seconds - increased from 5 to 15
             
             # First send the total size as a 8-byte integer
             sock.sendall(total_size.to_bytes(8, byteorder='big'))
             
             # Send data in chunks
-            for chunk_index in range(0, (total_size + self.chunk_size - 1) // self.chunk_size):
+            total_chunks = (total_size + self.chunk_size - 1) // self.chunk_size
+            for chunk_index in range(0, total_chunks):
                 start_pos = chunk_index * self.chunk_size
                 end_pos = min(start_pos + self.chunk_size, total_size)
                 chunk = data[start_pos:end_pos]
                 chunk_size = len(chunk)
+                
+                # Log progress more frequently for larger transfers
+                if total_chunks > 10 and chunk_index % 5 == 0:
+                    logger.info(f"Sending chunk {chunk_index+1}/{total_chunks} ({(chunk_index+1)/total_chunks:.1%})")
                 
                 for retry in range(max_retries):
                     try:
@@ -457,9 +462,12 @@ class DatabaseSynchronizer:
                             bytes_sent += chunk_size
                             break
                         else:
-                            logger.warning(f"Invalid acknowledgment received for chunk {chunk_index}, retrying ({retry+1}/{max_retries})")
+                            # Log the actual unexpected response
+                            logger.warning(f"Invalid acknowledgment received for chunk {chunk_index}: {ack!r}, retrying ({retry+1}/{max_retries})")
                     except socket.timeout:
                         logger.warning(f"Timeout waiting for acknowledgment of chunk {chunk_index}, retrying ({retry+1}/{max_retries})")
+                    except ConnectionResetError:
+                        logger.warning(f"Connection reset while sending chunk {chunk_index}, retrying ({retry+1}/{max_retries})")
                     except Exception as e:
                         logger.warning(f"Error sending chunk {chunk_index}: {e}, retrying ({retry+1}/{max_retries})")
                     
@@ -502,7 +510,7 @@ class DatabaseSynchronizer:
             data = bytearray(total_size)
             bytes_received = 0
             max_retries = 3
-            chunk_timeout = 5  # seconds
+            chunk_timeout = 15  # seconds - increased from 5 to 15
             
             sock.settimeout(chunk_timeout)
             
@@ -514,7 +522,12 @@ class DatabaseSynchronizer:
                         break
                     
                     # Parse chunk index
-                    chunk_index = int.from_bytes(marker, byteorder='big')
+                    try:
+                        chunk_index = int.from_bytes(marker, byteorder='big')
+                    except Exception as e:
+                        logger.error(f"Failed to parse chunk index from marker: {marker!r}, error: {e}")
+                        sock.sendall(b'ERR!')
+                        continue
                     
                     # Receive chunk size
                     chunk_size_bytes = self._recv_all(sock, 4)
@@ -536,11 +549,15 @@ class DatabaseSynchronizer:
                             if chunk and len(chunk) == chunk_size:
                                 success = True
                             else:
-                                logger.warning(f"Incomplete chunk {chunk_index}, retrying ({retry_count+1}/{max_retries})")
+                                logger.warning(f"Incomplete chunk {chunk_index} (got {len(chunk) if chunk else 0}/{chunk_size} bytes), retrying ({retry_count+1}/{max_retries})")
                                 sock.sendall(b'ERR!')
                                 retry_count += 1
                         except socket.timeout:
                             logger.warning(f"Timeout receiving chunk {chunk_index}, retrying ({retry_count+1}/{max_retries})")
+                            sock.sendall(b'ERR!')
+                            retry_count += 1
+                        except ConnectionResetError:
+                            logger.warning(f"Connection reset while receiving chunk {chunk_index}, retrying ({retry_count+1}/{max_retries})")
                             sock.sendall(b'ERR!')
                             retry_count += 1
                         except Exception as e:
@@ -564,6 +581,9 @@ class DatabaseSynchronizer:
                     if bytes_received % (self.chunk_size * 10) == 0 and bytes_received > 0:
                         logger.debug(f"Received {bytes_received}/{total_size} bytes ({bytes_received/total_size:.1%})")
                 
+                except socket.timeout:
+                    logger.error(f"Timeout during chunk reception")
+                    raise
                 except Exception as e:
                     logger.error(f"Error receiving chunk: {e}")
                     raise
