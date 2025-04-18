@@ -428,18 +428,51 @@ class DatabaseSynchronizer:
         try:
             total_size = len(data)
             bytes_sent = 0
+            max_retries = 3
+            chunk_timeout = 5  # seconds
             
             # First send the total size as a 8-byte integer
             sock.sendall(total_size.to_bytes(8, byteorder='big'))
             
             # Send data in chunks
-            for i in range(0, total_size, self.chunk_size):
-                chunk = data[i:i + self.chunk_size]
-                sock.sendall(chunk)
-                bytes_sent += len(chunk)
+            for chunk_index in range(0, (total_size + self.chunk_size - 1) // self.chunk_size):
+                start_pos = chunk_index * self.chunk_size
+                end_pos = min(start_pos + self.chunk_size, total_size)
+                chunk = data[start_pos:end_pos]
+                chunk_size = len(chunk)
                 
-                if i % (self.chunk_size * 10) == 0 and i > 0:
+                for retry in range(max_retries):
+                    try:
+                        # Send chunk index and size
+                        sock.sendall(chunk_index.to_bytes(4, byteorder='big'))
+                        sock.sendall(chunk_size.to_bytes(4, byteorder='big'))
+                        
+                        # Send the chunk data
+                        sock.sendall(chunk)
+                        
+                        # Wait for acknowledgment with timeout
+                        sock.settimeout(chunk_timeout)
+                        ack = sock.recv(4)
+                        if ack == b'ACK!':
+                            bytes_sent += chunk_size
+                            break
+                        else:
+                            logger.warning(f"Invalid acknowledgment received for chunk {chunk_index}, retrying ({retry+1}/{max_retries})")
+                    except socket.timeout:
+                        logger.warning(f"Timeout waiting for acknowledgment of chunk {chunk_index}, retrying ({retry+1}/{max_retries})")
+                    except Exception as e:
+                        logger.warning(f"Error sending chunk {chunk_index}: {e}, retrying ({retry+1}/{max_retries})")
+                    
+                    # If we reach here, we need to retry
+                    if retry == max_retries - 1:
+                        logger.error(f"Failed to send chunk {chunk_index} after {max_retries} attempts")
+                        raise Exception(f"Failed to send chunk {chunk_index} after {max_retries} attempts")
+                
+                if chunk_index % 10 == 0 and chunk_index > 0:
                     logger.debug(f"Sent {bytes_sent}/{total_size} bytes ({bytes_sent/total_size:.1%})")
+            
+            # Send end marker
+            sock.sendall(b'DONE')
             
             logger.debug(f"Sent {bytes_sent} bytes of data")
             return bytes_sent
@@ -466,22 +499,74 @@ class DatabaseSynchronizer:
             total_size = int.from_bytes(size_bytes, byteorder='big')
             
             # Receive data in chunks
-            data = bytearray()
+            data = bytearray(total_size)
             bytes_received = 0
+            max_retries = 3
+            chunk_timeout = 5  # seconds
             
-            while bytes_received < total_size:
-                bytes_to_receive = min(self.chunk_size, total_size - bytes_received)
-                chunk = self._recv_all(sock, bytes_to_receive)
+            sock.settimeout(chunk_timeout)
+            
+            while True:
+                # Receive chunk index or done marker
+                try:
+                    marker = sock.recv(4)
+                    if marker == b'DONE':
+                        break
+                    
+                    # Parse chunk index
+                    chunk_index = int.from_bytes(marker, byteorder='big')
+                    
+                    # Receive chunk size
+                    chunk_size_bytes = self._recv_all(sock, 4)
+                    if not chunk_size_bytes:
+                        logger.error(f"Failed to receive size for chunk {chunk_index}")
+                        sock.sendall(b'ERR!')
+                        continue
+                    
+                    chunk_size = int.from_bytes(chunk_size_bytes, byteorder='big')
+                    
+                    # Receive the chunk data
+                    chunk = bytearray()
+                    retry_count = 0
+                    success = False
+                    
+                    while retry_count < max_retries and not success:
+                        try:
+                            chunk = self._recv_all(sock, chunk_size)
+                            if chunk and len(chunk) == chunk_size:
+                                success = True
+                            else:
+                                logger.warning(f"Incomplete chunk {chunk_index}, retrying ({retry_count+1}/{max_retries})")
+                                sock.sendall(b'ERR!')
+                                retry_count += 1
+                        except socket.timeout:
+                            logger.warning(f"Timeout receiving chunk {chunk_index}, retrying ({retry_count+1}/{max_retries})")
+                            sock.sendall(b'ERR!')
+                            retry_count += 1
+                        except Exception as e:
+                            logger.warning(f"Error receiving chunk {chunk_index}: {e}, retrying ({retry_count+1}/{max_retries})")
+                            sock.sendall(b'ERR!')
+                            retry_count += 1
+                    
+                    if not success:
+                        logger.error(f"Failed to receive chunk {chunk_index} after {max_retries} attempts")
+                        raise Exception(f"Failed to receive chunk {chunk_index} after {max_retries} attempts")
+                    
+                    # Store the chunk in the right position
+                    start_pos = chunk_index * self.chunk_size
+                    end_pos = min(start_pos + chunk_size, total_size)
+                    data[start_pos:end_pos] = chunk
+                    bytes_received += chunk_size
+                    
+                    # Send acknowledgment
+                    sock.sendall(b'ACK!')
+                    
+                    if bytes_received % (self.chunk_size * 10) == 0 and bytes_received > 0:
+                        logger.debug(f"Received {bytes_received}/{total_size} bytes ({bytes_received/total_size:.1%})")
                 
-                if not chunk:
-                    logger.error("Connection closed before receiving all data")
-                    return None
-                
-                data.extend(chunk)
-                bytes_received += len(chunk)
-                
-                if bytes_received % (self.chunk_size * 10) == 0 and bytes_received > 0:
-                    logger.debug(f"Received {bytes_received}/{total_size} bytes ({bytes_received/total_size:.1%})")
+                except Exception as e:
+                    logger.error(f"Error receiving chunk: {e}")
+                    raise
             
             logger.debug(f"Received {bytes_received} bytes of data")
             return bytes(data)
