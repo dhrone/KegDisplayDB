@@ -884,8 +884,9 @@ class DatabaseSynchronizer:
                         our_clock = our_version.get('logical_clock', 0)
                         
                         if peer_clock > our_clock:
-                            # Ensure our clock is at least as high as the peer's
-                            self.change_tracker.update_logical_clock(peer_clock)
+                            # Use the new set_logical_clock method to set the exact value
+                            # rather than incrementing beyond the peer's clock
+                            self.change_tracker.set_logical_clock(peer_clock)
                             logger.info(f"Updated our logical clock to match peer: {peer_clock}")
                         
                         # Verify content hash match

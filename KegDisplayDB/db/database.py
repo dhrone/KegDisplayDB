@@ -701,9 +701,9 @@ class DatabaseManager:
                     row = cursor.fetchone()
                     current_clock = row[0] if row and row[0] is not None else 0
                     
-                    # Set logical clock to max of current and highest received
-                    # (We don't increment here, as the synchronizer will do that)
-                    new_clock = max(current_clock, highest_logical_clock)
+                    # Set logical clock to exactly the highest received value
+                    # We should not increment or calculate a max here - just use the value from the changes
+                    new_clock = highest_logical_clock
                     
                     # Update version table with new logical clock and timestamp
                     timestamp = datetime.now(UTC).isoformat()

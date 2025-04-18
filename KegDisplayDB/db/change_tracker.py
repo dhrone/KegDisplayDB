@@ -141,6 +141,29 @@ class ChangeTracker:
             logger.error(f"Error updating logical clock: {e}")
             return 0
     
+    def set_logical_clock(self, new_clock):
+        """Set the logical clock to a specific value
+        
+        Args:
+            new_clock: The clock value to set
+            
+        Returns:
+            int: The new clock value
+        """
+        try:
+            with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE version SET logical_clock = ? WHERE id = 1",
+                    (new_clock,)
+                )
+                conn.commit()
+                logger.debug(f"Set logical clock to exact value: {new_clock}")
+                return new_clock
+        except Exception as e:
+            logger.error(f"Error setting logical clock: {e}")
+            return 0
+    
     def ensure_valid_session(self):
         """Ensure we have a valid tracking session"""
         try:
