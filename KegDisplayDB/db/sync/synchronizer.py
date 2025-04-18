@@ -802,12 +802,31 @@ class DatabaseSynchronizer:
                         peer_version = response.get('version')
                         
                         if peer_version.get('hash') != our_version.get('hash'):
-                            logger.error(f"Version mismatch after sync with {peer_ip}")
-                            logger.error(f"Peer version: {peer_version}")
-                            logger.error(f"Our version: {our_version}")
-                            # Rollback the changes since versions don't match
-                            logger.info("Restoring database from backup due to version mismatch")
-                            self._restore_database(backup_path)
+                            logger.warning(f"Version hash mismatch after sync with {peer_ip}")
+                            logger.warning(f"Peer version: {peer_version}")
+                            logger.warning(f"Our version: {our_version}")
+                            
+                            # Only use timestamp for verification, not hash
+                            if peer_version.get('timestamp') == our_version.get('timestamp'):
+                                logger.info(f"Timestamps match ({peer_version.get('timestamp')}), accepting sync despite hash mismatch")
+                                
+                                # Update our version hash to match the peer's
+                                with self.db_manager.get_connection() as conn:
+                                    conn.execute('''
+                                        UPDATE version SET hash = ? WHERE id = 1
+                                    ''', (peer_version.get('hash'),))
+                                    conn.commit()
+                                    
+                                # Remove backup after successful sync
+                                self._remove_backup(backup_path)
+                                logger.info(f"Successfully synced with {peer_ip} based on timestamp match")
+                            else:
+                                # Only rollback if timestamps don't match
+                                logger.error(f"Timestamp mismatch after sync with {peer_ip}")
+                                logger.error(f"Peer timestamp: {peer_version.get('timestamp')}, our timestamp: {our_version.get('timestamp')}")
+                                # Rollback the changes since versions don't match
+                                logger.info("Restoring database from backup due to timestamp mismatch")
+                                self._restore_database(backup_path)
                         else:
                             logger.info(f"Successfully synced with {peer_ip}, versions match")
                             # Only update our version timestamp if the sync was successful

@@ -332,9 +332,39 @@ class ChangeTracker:
                     if count == 0:
                         return "0"
                     
-                    cursor.execute(f"SELECT * FROM {table_name} ORDER BY rowid")
+                    # Get column names for sorting and consistent data representation
+                    cursor.execute(f"PRAGMA table_info({table_name})")
+                    column_info = cursor.fetchall()
+                    column_names = [col[1] for col in column_info]  # col[1] is the column name in PRAGMA result
+                    
+                    # Query all rows from the table
+                    cursor.execute(f"SELECT * FROM {table_name}")
                     rows = cursor.fetchall()
-                    return hashlib.md5(str(rows).encode()).hexdigest()
+                    
+                    # Create a sorted, normalized representation for hashing
+                    normalized_data = []
+                    for row in rows:
+                        # Sort the values by column name to ensure consistent ordering
+                        row_dict = {}
+                        for i, col_name in enumerate(column_names):
+                            # Convert value to string, handle None values
+                            val = row[i]
+                            if val is None:
+                                val = "NULL"
+                            else:
+                                val = str(val)
+                            row_dict[col_name] = val
+                        normalized_data.append(row_dict)
+                    
+                    # Sort rows based on primary key (first column) for consistent ordering
+                    if column_names and len(normalized_data) > 0:
+                        primary_key = column_names[0]
+                        normalized_data.sort(key=lambda x: x.get(primary_key, ""))
+                    
+                    # Generate hash from normalized data
+                    data_str = json.dumps(normalized_data, sort_keys=True)
+                    logger.debug(f"Generating hash for {table_name} with data: {data_str[:100]}...")
+                    return hashlib.md5(data_str.encode()).hexdigest()
                 except sqlite3.Error as e:
                     logger.error(f"Error calculating hash for {table_name}: {e}")
                     return "0"
