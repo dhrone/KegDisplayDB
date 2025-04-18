@@ -7,6 +7,7 @@ import socket
 import logging
 import threading
 import time
+import json
 
 logger = logging.getLogger("KegDisplay")
 
@@ -203,7 +204,16 @@ class NetworkManager:
                     # Try to log the first part of the message for debugging
                     try:
                         msg_preview = data[:50].decode('utf-8', errors='replace')
-                        logger.debug(f"Message preview: {msg_preview}...")
+                        logger.info(f"Message preview: {msg_preview}...")
+                        
+                        # Try to parse the message to check if it's an update
+                        try:
+                            msg_data = json.loads(data.decode('utf-8'))
+                            if msg_data.get('type') == 'update':
+                                logger.info(f"Received UPDATE message from {addr[0]}: {msg_data}")
+                        except json.JSONDecodeError:
+                            logger.debug(f"Could not parse message as JSON")
+                            
                     except Exception as e:
                         logger.debug(f"Could not decode message preview: {e}")
                     

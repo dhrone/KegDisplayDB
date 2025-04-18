@@ -166,14 +166,33 @@ class SyncProtocol:
             if data == b'ACK':
                 return {'type': 'ack'}
             
+            # Show first part of the data for debugging
+            preview = data[:50].decode('utf-8', errors='replace')
+            logger.debug(f"Parsing message data: {preview}...")
+            
             # Try to parse as JSON
             message = json.loads(data.decode())
+            
+            # Log the message type for debugging
+            message_type = message.get('type', 'unknown')
+            logger.debug(f"Successfully parsed message of type: {message_type}")
+            
+            # Special logging for update messages
+            if message_type == 'update':
+                logger.info(f"Parsed UPDATE message: {message}")
+                
             return message
         except json.JSONDecodeError as e:
+            # More detailed logging for JSON errors
             logger.error(f"Invalid message format: {e}")
+            logger.error(f"Message data (first 100 bytes): {repr(data[:100])}")
             return None
         except UnicodeDecodeError as e:
             logger.error(f"Error decoding message: {e}")
+            logger.error(f"Message data (first 100 bytes hex): {data[:100].hex()}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error parsing message: {e}")
             return None
         
     @staticmethod

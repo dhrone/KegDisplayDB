@@ -127,7 +127,11 @@ class DatabaseSynchronizer:
             logger.warning(f"Received message without type from {peer_ip}")
             return
         
-        logger.debug(f"Received {message_type} message from {peer_ip}")
+        # Add more detailed logging for update messages
+        if message_type == 'update':
+            logger.info(f"Received {message_type} message from {peer_ip}: {message}")
+        else:
+            logger.debug(f"Received {message_type} message from {peer_ip}")
         
         # Route message to appropriate handler
         if message_type == 'discovery':
@@ -135,7 +139,10 @@ class DatabaseSynchronizer:
         elif message_type == 'heartbeat':
             self._handle_heartbeat(message, addr)
         elif message_type == 'update':
-            self._handle_update(message, addr)
+            try:
+                self._handle_update(message, addr)
+            except Exception as e:
+                logger.error(f"Error handling update message from {peer_ip}: {e}")
         else:
             logger.warning(f"Received unknown message type '{message_type}' from {peer_ip}")
     
@@ -783,6 +790,11 @@ class DatabaseSynchronizer:
                     changes = self.protocol.deserialize_changes(changes_data)
                     
                     logger.info(f"Received {len(changes)} changes from {peer_ip}")
+                    
+                    # Debug log the first few changes
+                    for i, change in enumerate(changes[:3]):
+                        if len(change) >= 3:
+                            logger.info(f"Change {i+1}: {change[1]} on {change[0]} row {change[2]}")
                     
                     # Send acknowledgment
                     logger.debug(f"Sending final ACK to {peer_ip}")
