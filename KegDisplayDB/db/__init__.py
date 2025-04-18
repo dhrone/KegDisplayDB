@@ -114,7 +114,7 @@ class SyncedDatabase:
     # ---- Beer Management Methods ----
     
     def add_beer(self, name, abv=None, ibu=None, color=None, og=None, fg=None, 
-                description=None, brewed=None, kegged=None, tapped=None, notes=None, notify=True):
+                description=None, brewed=None, kegged=None, tapped=None, notes=None, notify=True, conn=None):
         """
         Add a new beer to the database
         
@@ -131,12 +131,19 @@ class SyncedDatabase:
             tapped: Date tapped (optional)
             notes: Additional notes (optional)
             notify: Whether to notify peers about this change (default: True)
+            conn: Database connection to use (optional)
             
         Returns:
             beer_id: ID of the added beer
         """
-        beer_id = self.db_manager.add_beer(name, abv, ibu, color, og, fg, 
-                                         description, brewed, kegged, tapped, notes)
+        # Pass the connection if provided, otherwise let db_manager create one
+        if conn:
+            beer_id = self.db_manager.add_beer(name, abv, ibu, color, og, fg, 
+                                            description, brewed, kegged, tapped, notes, conn=conn)
+        else:
+            beer_id = self.db_manager.add_beer(name, abv, ibu, color, og, fg, 
+                                            description, brewed, kegged, tapped, notes)
+                                            
         self.change_tracker.log_change("beers", "INSERT", beer_id)
         
         if notify:
@@ -145,7 +152,7 @@ class SyncedDatabase:
         return beer_id
     
     def update_beer(self, beer_id, name=None, abv=None, ibu=None, color=None, og=None, fg=None,
-                   description=None, brewed=None, kegged=None, tapped=None, notes=None, notify=True):
+                   description=None, brewed=None, kegged=None, tapped=None, notes=None, notify=True, conn=None):
         """
         Update an existing beer in the database
         
@@ -163,13 +170,21 @@ class SyncedDatabase:
             tapped: Date tapped (optional)
             notes: Additional notes (optional)
             notify: Whether to notify peers about this change (default: True)
+            conn: Database connection to use (optional)
             
         Returns:
             bool: Success or failure
         """
-        success = self.db_manager.update_beer(beer_id, name, abv, ibu, color, 
-                                            og, fg, description, brewed, 
-                                            kegged, tapped, notes)
+        # Pass the connection if provided, otherwise let db_manager create one
+        if conn:
+            success = self.db_manager.update_beer(beer_id, name, abv, ibu, color, 
+                                                og, fg, description, brewed, 
+                                                kegged, tapped, notes, conn=conn)
+        else:
+            success = self.db_manager.update_beer(beer_id, name, abv, ibu, color, 
+                                                og, fg, description, brewed, 
+                                                kegged, tapped, notes)
+                                                
         if success:
             self.change_tracker.log_change("beers", "UPDATE", beer_id)
             
@@ -344,45 +359,9 @@ class SyncedDatabase:
                             
                             # Update existing beer or add new one
                             if existing_beer:
-                                # Update the beer
-                                cursor = conn.cursor()
-                                cursor.execute('''
-                                    UPDATE beers SET
-                                        Name = ?, ABV = ?, IBU = ?, Color = ?, OriginalGravity = ?, FinalGravity = ?,
-                                        Description = ?, Brewed = ?, Kegged = ?, Tapped = ?, Notes = ?
-                                    WHERE idBeer = ?
-                                ''', (
-                                    beer_data.get('Name'),
-                                    beer_data.get('ABV'),
-                                    beer_data.get('IBU'),
-                                    beer_data.get('Color'),
-                                    beer_data.get('OriginalGravity'),
-                                    beer_data.get('FinalGravity'),
-                                    beer_data.get('Description'),
-                                    beer_data.get('Brewed'),
-                                    beer_data.get('Kegged'),
-                                    beer_data.get('Tapped'),
-                                    beer_data.get('Notes'),
-                                    beer_id
-                                ))
-                                
-                                # Get content for the row for change tracking
-                                content = self.change_tracker._get_row_content("beers", beer_id, conn)
-                                content_hash = hashlib.md5(content.encode()).hexdigest()
-                                
-                                # Store change to log later
-                                batch_changes.append({
-                                    "table_name": "beers",
-                                    "operation": "UPDATE",
-                                    "row_id": beer_id,
-                                    "content": content,
-                                    "content_hash": content_hash
-                                })
-                                batch_success_count += 1
-                                logger.info(f"Updated beer '{beer_data.get('Name')}' with ID {beer_id}")
-                            else:
-                                # Add new beer
-                                beer_id = self.add_beer(
+                                # Update the beer using the db_manager directly with the connection
+                                success = self.db_manager.update_beer(
+                                    beer_id,
                                     name=beer_data.get('Name'),
                                     abv=beer_data.get('ABV'),
                                     ibu=beer_data.get('IBU'),
@@ -394,7 +373,39 @@ class SyncedDatabase:
                                     kegged=beer_data.get('Kegged'),
                                     tapped=beer_data.get('Tapped'),
                                     notes=beer_data.get('Notes'),
-                                    conn=conn  # Pass the existing connection
+                                    conn=conn
+                                )
+                                
+                                if success:
+                                    # Get content for the row for change tracking
+                                    content = self.change_tracker._get_row_content("beers", beer_id, conn)
+                                    content_hash = hashlib.md5(content.encode()).hexdigest()
+                                    
+                                    # Store change to log later
+                                    batch_changes.append({
+                                        "table_name": "beers",
+                                        "operation": "UPDATE",
+                                        "row_id": beer_id,
+                                        "content": content,
+                                        "content_hash": content_hash
+                                    })
+                                    batch_success_count += 1
+                                    logger.info(f"Updated beer '{beer_data.get('Name')}' with ID {beer_id}")
+                            else:
+                                # Add new beer directly using db_manager
+                                beer_id = self.db_manager.add_beer(
+                                    name=beer_data.get('Name'),
+                                    abv=beer_data.get('ABV'),
+                                    ibu=beer_data.get('IBU'),
+                                    color=beer_data.get('Color'),
+                                    og=beer_data.get('OriginalGravity'),
+                                    fg=beer_data.get('FinalGravity'),
+                                    description=beer_data.get('Description'),
+                                    brewed=beer_data.get('Brewed'),
+                                    kegged=beer_data.get('Kegged'),
+                                    tapped=beer_data.get('Tapped'),
+                                    notes=beer_data.get('Notes'),
+                                    conn=conn
                                 )
                                 if beer_id:
                                     # Get content for the row for change tracking
