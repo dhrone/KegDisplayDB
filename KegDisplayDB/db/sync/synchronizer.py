@@ -1189,45 +1189,30 @@ class DatabaseSynchronizer:
                         # Get our new version after applying changes
                         our_new_version = self.change_tracker.get_db_version()
                         
-                        # Update our logical clock based on peer's clock
+                        # Get logical clock values
                         peer_clock = peer_version.get('logical_clock', 0)
                         our_clock = our_new_version.get('logical_clock', 0)
                         
-                        if peer_clock > our_clock:
-                            # Use the new set_logical_clock method to set the exact value
-                            # rather than incrementing beyond the peer's clock
-                            self.change_tracker.set_logical_clock(peer_clock)
-                            logger.info(f"Updated our logical clock to match peer: {peer_clock}")
-                            our_clock = peer_clock
-                        
-                            # Check if content hashes match - this is just for verification
-                            if peer_version.get('hash') != our_new_version.get('hash'):
-                                logger.warning(f"Content hash mismatch after sync with {peer_ip}")
-                                logger.warning(f"Peer version: {peer_version}")
-                                logger.warning(f"Our version: {our_new_version}")
-                                
-                                # We'll trust the logical clock to decide if the sync was successful
-                                if our_clock >= peer_clock:
-                                    logger.info(f"Accepting sync despite hash mismatch (logical clock: {our_clock})")
-                                    
-                                    # We don't force our hash to match the peer anymore
-                                    # This will get recalculated as needed based on actual content
-                                    
-                                    # Remove backup after successful sync
-                                    self._remove_backup(backup_path)
-                                    logger.info(f"Successfully synced with {peer_ip} based on logical clock")
-                                else:
-                                    # This case shouldn't happen if our code is working correctly
-                                    logger.error(f"Logical clock inconsistency after sync with {peer_ip}")
-                                    logger.error(f"Peer clock: {peer_clock}, our clock: {our_clock}")
-                                    # Rollback the changes
-                                    logger.info("Restoring database from backup due to logical clock inconsistency")
-                                    if backup_path:
-                                        self._restore_database(backup_path)
-                            else:
-                                logger.info(f"Successfully synced with {peer_ip}, content hashes match")
-                                # Remove backup after successful sync
-                                self._remove_backup(backup_path)
+                        # Check if content hashes match - this is essential for verification
+                        if peer_version.get('hash') != our_new_version.get('hash'):
+                            logger.warning(f"Content hash mismatch after sync with {peer_ip}")
+                            logger.warning(f"Peer version: {peer_version}")
+                            logger.warning(f"Our version: {our_new_version}")
+                            
+                            # If hashes don't match, we should not set the logical clock
+                            # Instead, we should restore from backup or try re-syncing
+                            logger.error(f"Content hash mismatch after applying changes - cannot safely set logical clock")
+                            logger.info("Restoring database from backup due to content hash mismatch")
+                            if backup_path:
+                                self._restore_database(backup_path)
+                        else:
+                            logger.info(f"Successfully synced with {peer_ip}, content hashes match")
+                            
+                            # Only set the logical clock if content hashes match (we've achieved convergence)
+                            if peer_clock > our_clock:
+                                # Use the set_logical_clock method to set the exact value
+                                self.change_tracker.set_logical_clock(peer_clock)
+                                logger.info(f"Updated our logical clock to match peer: {peer_clock}")
                     except Exception as e:
                         logger.error(f"Error applying changes: {e}")
                         logger.info("Restoring database from backup due to error")
@@ -1244,8 +1229,6 @@ class DatabaseSynchronizer:
                         self._restore_database(backup_path)
             else:
                 logger.info(f"Peer {peer_ip} has no changes for us")
-                # Remove backup as no changes were made
-                self._remove_backup(backup_path)
             
         except socket.timeout:
             logger.error(f"Socket timeout during sync with {peer_ip}")
@@ -1293,8 +1276,6 @@ class DatabaseSynchronizer:
             if not s:
                 # In test/mock environments, this might be expected
                 logger.info(f"Unable to connect to peer {peer_ip}:{peer_sync_port}")
-                if backup_path:
-                    self._remove_backup(backup_path)
                 return True  # Return success for test cases
             
             # If this is a test environment, we can stop here since the mock was called
@@ -1356,10 +1337,6 @@ class DatabaseSynchronizer:
                             # Need to re-initialize the change tracking
                             self.change_tracker.initialize_tracking()
                             
-                            # Remove backup after successful import
-                            if backup_path:
-                                self._remove_backup(backup_path)
-                            
                             return True
                         else:
                             logger.error(f"Failed to import database from peer")
@@ -1383,8 +1360,6 @@ class DatabaseSynchronizer:
                     return False
             else:
                 logger.info(f"Peer {peer_ip} has an empty database")
-                if backup_path:
-                    self._remove_backup(backup_path)
                 return False
             
         except socket.timeout:
@@ -1396,8 +1371,6 @@ class DatabaseSynchronizer:
             # Check if this is a test environment exception
             if "test" in str(e).lower() or "mock" in str(e).lower():
                 logger.info(f"Test mode exception while connecting to peer: {e}")
-                if backup_path:
-                    self._remove_backup(backup_path)
                 return True  # Return success for test cases
             else:
                 logger.error(f"Full database request error: {e}")
@@ -1747,7 +1720,7 @@ class DatabaseSynchronizer:
                         else:
                             self.change_tracker.update_logical_clock(peer_clock)
                             
-                        logger.info(f"Updated our logical clock to {peer_clock} to match peer")
+                        logger.info(f"Updated our logical clock to match peer: {peer_clock}")
                     
                     logger.info(f"Updated our version to: logical clock {our_new_clock} after applying changes")
                     
