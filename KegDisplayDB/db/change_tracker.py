@@ -467,7 +467,8 @@ class ChangeTracker:
             changes: List of changes
         """
         # Legacy function, maintained for backward compatibility
-        # In the future, this could be replaced with a get_changes_since_clock method
+        # DEPRECATED: This method will be removed in future versions. Use get_changes_since_clock instead.
+        logger.warning("DEPRECATED: get_changes_since() is deprecated and will be removed in a future version. Use get_changes_since_clock() instead.")
         
         # Make sure we have a valid session
         self.ensure_valid_session()

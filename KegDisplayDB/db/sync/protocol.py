@@ -183,19 +183,10 @@ class SyncProtocol:
             if 'version' in message:
                 version = message['version']
                 if isinstance(version, dict):
-                    # If version has timestamp but no logical_clock, add default logical_clock
-                    if 'timestamp' in version and 'logical_clock' not in version:
-                        version['logical_clock'] = 0
-                        logger.debug(f"Added default logical_clock to {message_type} message for backward compatibility")
-                    
                     # If version has no node_id, add a placeholder
                     if 'node_id' not in version:
                         version['node_id'] = "legacy-node"
                         logger.debug(f"Added placeholder node_id to {message_type} message for backward compatibility")
-            
-            # Special logging for update messages
-            if message_type == 'update':
-                logger.info(f"Parsed UPDATE message: {message}")
                 
             return message
         except json.JSONDecodeError as e:

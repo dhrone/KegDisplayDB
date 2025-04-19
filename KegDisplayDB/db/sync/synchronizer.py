@@ -263,14 +263,6 @@ class DatabaseSynchronizer:
                 self._request_sync(peer_ip, peer_sync_port)
             else:
                 logger.info(f"We win tie-breaking, not syncing")
-                
-        elif peer_clock == our_clock and not content_differs:
-            # Receive broadcast; incomingClock = localClock & state-hash equals
-            # 1. localClock += 1
-            # 2. version_table.clock = localClock
-            # 3. No further action (you're in sync)
-            logger.info(f"Equal logical clocks ({peer_clock}) with matching hash, incrementing our clock (already in sync)")
-            self.change_tracker.increment_logical_clock()
             
         elif peer_clock < our_clock:
             # Receive broadcast; incomingClock < localClock
@@ -349,14 +341,6 @@ class DatabaseSynchronizer:
                 self._request_sync(peer_ip, peer_sync_port)
             else:
                 logger.info(f"We win tie-breaking, not syncing")
-                
-        elif peer_clock == our_clock and not content_differs:
-            # Receive broadcast; incomingClock = localClock & state-hash equals
-            # 1. localClock += 1
-            # 2. version_table.clock = localClock
-            # 3. No further action (you're in sync)
-            logger.info(f"Equal logical clocks ({peer_clock}) with matching hash, incrementing our clock (already in sync)")
-            self.change_tracker.increment_logical_clock()
             
         elif peer_clock < our_clock:
             # Receive broadcast; incomingClock < localClock
@@ -436,7 +420,7 @@ class DatabaseSynchronizer:
                 self._request_sync(peer_ip, peer_sync_port)
             else:
                 logger.info(f"We win tie-breaking, not syncing")
-                
+            
         elif peer_clock == our_clock and not content_differs:
             # Receive broadcast; incomingClock = localClock & state-hash equals
             # 1. localClock += 1
@@ -468,18 +452,10 @@ class DatabaseSynchronizer:
         """
         peer_ip = addr[0]
         
-        # Determine if this is a logical clock-based request or a timestamp-based request
-        using_logical_clock = 'last_clock' in message
-        
-        if using_logical_clock:
-            # Get the client's last logical clock value and node ID
-            last_clock = message.get('last_clock', 0)
-            peer_node_id = message.get('node_id')
-            logger.info(f"Getting changes since logical clock {last_clock} for {peer_ip}")
-        else:
-            # Legacy timestamp-based request
-            last_timestamp = message.get('last_timestamp', '1970-01-01T00:00:00Z')
-            logger.info(f"Getting changes since timestamp {last_timestamp} for {peer_ip} (legacy mode)")
+        # Get the client's logical clock value and node ID
+        last_clock = message.get('last_clock', 0)
+        peer_node_id = message.get('node_id')
+        logger.info(f"Getting changes since logical clock {last_clock} for {peer_ip}")
         
         # Get our current database version for logging
         our_version = self.change_tracker.get_db_version()
@@ -514,13 +490,8 @@ class DatabaseSynchronizer:
         except Exception as e:
             logger.error(f"Error getting change log stats: {e}")
         
-        # Get changes based on request type
-        if using_logical_clock:
-            # Use the method that filters by logical clock
-            changes = self.change_tracker.get_changes_since_clock(last_clock, peer_node_id)
-        else:
-            # Use legacy timestamp method
-            changes = self.change_tracker.get_changes_since(last_timestamp)
+        # Use the method that filters by logical clock
+        changes = self.change_tracker.get_changes_since_clock(last_clock, peer_node_id)
         
         if changes:
             logger.info(f"Found {len(changes)} changes to send to {peer_ip}")
@@ -577,12 +548,8 @@ class DatabaseSynchronizer:
                 client_socket.close()
                 return
         else:
-            if using_logical_clock:
-                logger.info(f"No changes to send to {peer_ip}")
-                logger.debug(f"Client asked for changes since logical clock {last_clock}, but no changes were found with newer clock values")
-            else:
-                logger.info(f"No changes to send to {peer_ip}")
-                logger.debug(f"Client asked for changes since timestamp {last_timestamp}, but no changes were found with newer timestamps")
+            logger.info(f"No changes to send to {peer_ip}")
+            logger.debug(f"Client asked for changes since logical clock {last_clock}, but no changes were found with newer clock values")
             
             response = self.protocol.create_sync_response(
                 self.change_tracker.get_db_version(), 
@@ -1135,10 +1102,10 @@ class DatabaseSynchronizer:
                 s.settimeout(self.socket_timeout)  # Reset to normal timeout
                 
             except Exception as e:
-                logger.warning(f"Logical clock sync attempt failed: {e}")
-                logger.info(f"Retrying with timestamp-based sync for compatibility")
-                
- 
+                logger.error(f"Sync request failed: {e}")
+                if backup_path:
+                    self._restore_database(backup_path)
+                return
             
             logger.info(f"Received sync response from {peer_ip}, has_changes: {response.get('has_changes', False)}")
             
@@ -1186,33 +1153,23 @@ class DatabaseSynchronizer:
                         # Verify versions match after sync
                         peer_version = response.get('version')
                         
-                        # Get our new version after applying changes
-                        our_new_version = self.change_tracker.get_db_version()
-                        
-                        # Get logical clock values
-                        peer_clock = peer_version.get('logical_clock', 0)
-                        our_clock = our_new_version.get('logical_clock', 0)
-                        
                         # Check if content hashes match - this is essential for verification
                         if peer_version.get('hash') != our_new_version.get('hash'):
                             logger.warning(f"Content hash mismatch after sync with {peer_ip}")
                             logger.warning(f"Peer version: {peer_version}")
                             logger.warning(f"Our version: {our_new_version}")
                             
-                            # If hashes don't match, we should not set the logical clock
-                            # Instead, we should restore from backup or try re-syncing
-                            logger.error(f"Content hash mismatch after applying changes - cannot safely set logical clock")
+                            # If hashes don't match, we should restore from backup
+                            logger.error(f"Content hash mismatch after applying changes")
                             logger.info("Restoring database from backup due to content hash mismatch")
                             if backup_path:
                                 self._restore_database(backup_path)
                         else:
                             logger.info(f"Successfully synced with {peer_ip}, content hashes match")
                             
-                            # Only set the logical clock if content hashes match (we've achieved convergence)
-                            if peer_clock > our_clock:
-                                # Use the set_logical_clock method to set the exact value
-                                self.change_tracker.set_logical_clock(peer_clock)
-                                logger.info(f"Updated our logical clock to match peer: {peer_clock}")
+                            # No need to manually set logical clock - the Lamport receive rule in apply_sync_changes
+                            # will have already updated our clock appropriately for each change:
+                            # localClock = max(localClock, changeClock) + 1
                     except Exception as e:
                         logger.error(f"Error applying changes: {e}")
                         logger.info("Restoring database from backup due to error")
