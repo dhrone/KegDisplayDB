@@ -342,7 +342,7 @@ def backup_beers():
 @app.route('/api/beers/import', methods=['POST'])
 @login_required
 def import_beers():
-    global import_status  # Move global declaration to the beginning
+    global import_status
     
     if 'file' not in request.files:
         return jsonify({"error": "No file provided"}), 400
@@ -354,346 +354,148 @@ def import_beers():
     if not file.filename.endswith('.csv'):
         return jsonify({"error": "File must be a CSV"}), 400
     
-    # Read CSV file
-    try:
-        # Create a copy of the file data since we can't pass the file object to a background thread
-        file_data = file.stream.read().decode("UTF8")
-        
-        # Update global import status
-        import_status["in_progress"] = True
-        import_status["last_import"] = {
-            "timestamp": datetime.now(UTC).isoformat(),
-            "success": None,
-            "imported_count": 0,
-            "errors": []
-        }
-        
-        # Start the import in a background thread to avoid worker timeouts
+    # Update global import status
+    import_status["in_progress"] = True
+    import_status["last_import"] = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "success": None,
+        "imported_count": 0,
+        "errors": [],
+        "status": "Downloading file..."
+    }
+    
+    # Define a temporary file path for storing the uploaded CSV
+    temp_file_path = os.path.join(DATA_DIR, f"temp_import_{uuid.uuid4()}.csv")
+    
+    def background_import():
+        global import_status
         logger = logging.getLogger("KegDisplay")
-        
-        def background_import():
-            global import_status  # Move global declaration to the beginning
+        try:
+            logger.info("Starting background beer import process")
+            
+            # Step 1: Read and save the uploaded file in chunks
             try:
-                logger.info("Starting background beer import process")
+                with open(temp_file_path, 'wb') as temp_file:
+                    chunk_size = 1024  # 1KB chunks
+                    while True:
+                        chunk = file.stream.read(chunk_size)
+                        if not chunk:
+                            break
+                        temp_file.write(chunk)
                 
-                # Process the CSV data
-                stream = io.StringIO(file_data, newline=None)
-                reader = csv.DictReader(stream)
-                
-                # Convert CSV rows to a list of dictionaries
-                beer_data_list = []
-                for row in reader:
-                    # Skip rows without a name
-                    if not row.get('Name'):
-                        continue
-                        
-                    # Convert empty strings to None for numeric fields
-                    for field in ['ABV', 'IBU', 'Color', 'OriginalGravity', 'FinalGravity']:
-                        if field in row and (not row[field] or row[field].strip() == ''):
-                            row[field] = None
-                        elif field in row:
-                            try:
-                                row[field] = float(row[field])
-                            except (ValueError, TypeError):
+                import_status["last_import"]["status"] = "Processing CSV data..."
+                logger.info(f"Uploaded file saved to temporary location: {temp_file_path}")
+            except Exception as e:
+                logger.error(f"Error saving uploaded file: {e}")
+                import_status["in_progress"] = False
+                import_status["last_import"]["success"] = False
+                import_status["last_import"]["errors"] = [f"Error saving file: {str(e)}"]
+                import_status["last_import"]["status"] = "Failed"
+                return
+            
+            # Step 2: Verify and parse the CSV file
+            try:
+                with open(temp_file_path, 'r', newline='') as csv_file:
+                    reader = csv.DictReader(csv_file)
+                    
+                    # Check if required fields are present
+                    required_field = 'Name'
+                    if required_field not in reader.fieldnames:
+                        raise ValueError(f"Required field '{required_field}' is missing from CSV")
+                    
+                    # Convert CSV rows to a list of dictionaries
+                    beer_data_list = []
+                    for row in reader:
+                        # Skip rows without a name
+                        if not row.get('Name'):
+                            continue
+                            
+                        # Convert empty strings to None for numeric fields
+                        for field in ['ABV', 'IBU', 'Color', 'OriginalGravity', 'FinalGravity']:
+                            if field in row and (not row[field] or row[field].strip() == ''):
                                 row[field] = None
+                            elif field in row:
+                                try:
+                                    row[field] = float(row[field])
+                                except (ValueError, TypeError):
+                                    row[field] = None
+                        
+                        beer_data_list.append(row)
                     
-                    beer_data_list.append(row)
-                
-                if not beer_data_list:
-                    logger.warning("No valid beer data found in the CSV")
-                    import_status["in_progress"] = False
-                    import_status["last_import"]["timestamp"] = datetime.now(UTC).isoformat()
-                    import_status["last_import"]["success"] = False
-                    import_status["last_import"]["errors"] = ["No valid beer data found in the CSV"]
-                    return
-                
-                imported_count = 0
-                errors = []
-                
-                # Configure SQLite for better concurrency
-                sqlite3.enable_callback_tracebacks(True)
-                
-                # Set maximum retry attempts
-                max_retries = 3
-                retry_delay = 1.0
-                
+                    if not beer_data_list:
+                        raise ValueError("No valid beer data found in the CSV")
+                    
+                    logger.info(f"Successfully parsed {len(beer_data_list)} beer entries from CSV")
+                    import_status["last_import"]["status"] = f"Importing {len(beer_data_list)} beers to database..."
+                    
+            except Exception as e:
+                logger.error(f"Error parsing CSV file: {e}")
+                import_status["in_progress"] = False
+                import_status["last_import"]["success"] = False
+                import_status["last_import"]["errors"] = [f"Error parsing CSV: {str(e)}"]
+                import_status["last_import"]["status"] = "Failed"
+                return
+            
+            # Step 3 & 4: Import the beer data using the helper function
+            try:
                 if synced_db:
-                    # Use the bulk import method with retries
-                    retries = 0
-                    last_error = None
+                    # Call the import function with the entire data list
+                    import_status["last_import"]["status"] = "Importing to database..."
+                    imported_count, errors = synced_db.import_beers_from_data(beer_data_list)
                     
-                    while retries < max_retries:
-                        try:
-                            # Use the bulk import method
-                            imported_count, errors = synced_db.import_beers_from_data(beer_data_list)
-                            logger.info(f"Background import completed: {imported_count} beers imported with {len(errors)} errors")
-                            break  # Success, exit the retry loop
-                        except sqlite3.OperationalError as e:
-                            if "database is locked" in str(e):
-                                retries += 1
-                                last_error = e
-                                logger.warning(f"Database locked during import (attempt {retries}/{max_retries}), retrying in {retry_delay}s")
-                                time.sleep(retry_delay)
-                                # Increase backoff time for subsequent retries
-                                retry_delay *= 1.5
-                            else:
-                                logger.error(f"SQLite error during import: {e}")
-                                errors.append(f"Database error: {str(e)}")
-                                break
-                        except Exception as e:
-                            logger.error(f"Error in bulk import: {e}")
-                            errors.append(f"Import error: {str(e)}")
-                            break
-                    
-                    # If we exhausted retries, log the error
-                    if retries == max_retries:
-                        logger.error(f"Failed to import after {max_retries} attempts: {last_error}")
-                        errors.append(f"Database locked error after {max_retries} attempts")
-                else:
-                    # Use a single connection for all operations
-                    conn = None
-                    retries = 0
-                    
-                    while retries < max_retries:
-                        try:
-                            # Close previous connection if exists
-                            if conn:
-                                try:
-                                    conn.close()
-                                except:
-                                    pass
-                            
-                            # Open fresh connection with longer timeout
-                            conn = sqlite3.connect(DB_PATH, timeout=30.0)
-                            conn.execute("PRAGMA busy_timeout = 10000")  # 10 second timeout
-                            
-                            # Process each row in the CSV
-                            imported_count = 0
-                            errors = []
-                            pending_changes = []  # Track changes to log at the end
-                            
-                            # Begin transaction
-                            conn.execute("BEGIN TRANSACTION")
-                            
-                            for idx, row in enumerate(beer_data_list):
-                                try:
-                                    # Handle existing beer with same ID
-                                    beer_id = row.get('idBeer')
-                                    existing_beer = None
-                                    
-                                    if beer_id and str(beer_id).strip() and str(beer_id) != '':
-                                        try:
-                                            beer_id = int(beer_id)
-                                            cursor = conn.cursor()
-                                            cursor.execute("SELECT * FROM beers WHERE idBeer = ?", (beer_id,))
-                                            existing_beer = cursor.fetchone()
-                                        except (ValueError, TypeError):
-                                            beer_id = None
-                                    
-                                    cursor = conn.cursor()
-                                    
-                                    # If beer exists, update it; otherwise add new beer
-                                    if existing_beer:
-                                        cursor.execute('''
-                                            UPDATE beers SET
-                                                Name = ?, ABV = ?, IBU = ?, Color = ?, OriginalGravity = ?, FinalGravity = ?,
-                                                Description = ?, Brewed = ?, Kegged = ?, Tapped = ?, Notes = ?
-                                            WHERE idBeer = ?
-                                        ''', (
-                                            row.get('Name'),
-                                            row.get('ABV'),
-                                            row.get('IBU'),
-                                            row.get('Color'),
-                                            row.get('OriginalGravity'),
-                                            row.get('FinalGravity'),
-                                            row.get('Description'),
-                                            row.get('Brewed'),
-                                            row.get('Kegged'),
-                                            row.get('Tapped'),
-                                            row.get('Notes'),
-                                            beer_id
-                                        ))
-                                        pending_changes.append(('beers', 'UPDATE', beer_id))
-                                    else:
-                                        # Add new beer
-                                        cursor.execute('''
-                                            INSERT INTO beers (
-                                                Name, ABV, IBU, Color, OriginalGravity, FinalGravity,
-                                                Description, Brewed, Kegged, Tapped, Notes
-                                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                        ''', (
-                                            row.get('Name'),
-                                            row.get('ABV'),
-                                            row.get('IBU'),
-                                            row.get('Color'),
-                                            row.get('OriginalGravity'),
-                                            row.get('FinalGravity'),
-                                            row.get('Description'),
-                                            row.get('Brewed'),
-                                            row.get('Kegged'),
-                                            row.get('Tapped'),
-                                            row.get('Notes')
-                                        ))
-                                        beer_id = cursor.lastrowid
-                                        pending_changes.append(('beers', 'INSERT', beer_id))
-                                    
-                                    imported_count += 1
-                                    
-                                except Exception as e:
-                                    errors.append(f"Error on row {idx+1}: {str(e)}")
-                            
-                            # Update the Lamport logical clock only once for the entire batch
-                            timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-                            
-                            # Check if version table has logical_clock field
-                            cursor = conn.cursor()
-                            cursor.execute("PRAGMA table_info(version)")
-                            version_columns = [col[1] for col in cursor.fetchall()]
-                            
-                            # If we have Lamport clock support, update the logical clock
-                            if 'logical_clock' in version_columns and 'node_id' in version_columns:
-                                # Get current logical clock and node ID
-                                cursor.execute("SELECT logical_clock, node_id FROM version WHERE id = 1")
-                                clock_row = cursor.fetchone()
-                                
-                                logical_clock = 0
-                                node_id = None
-                                
-                                if clock_row:
-                                    current_clock, node_id = clock_row
-                                    # Increment the logical clock
-                                    logical_clock = current_clock + 1 if current_clock is not None else 1
-                                else:
-                                    # No entry yet, start at 1 and generate a node_id
-                                    logical_clock = 1
-                                    node_id = str(uuid.uuid4())
-                                
-                                # Now log all changes with the same incremented logical clock
-                                for table_name, operation, row_id in pending_changes:
-                                    try:
-                                        # Calculate content hash for the table
-                                        cursor.execute(f"SELECT * FROM {table_name} WHERE rowid = ?", (row_id,))
-                                        row = cursor.fetchone()
-                                        if row:
-                                            content_hash = str(row)
-                                        else:
-                                            content_hash = "0"
-                                        
-                                        # Insert into change_log with logical clock
-                                        cursor.execute('''
-                                            INSERT INTO change_log 
-                                            (table_name, operation, row_id, timestamp, content_hash, logical_clock, node_id) 
-                                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                                        ''', (table_name, operation, row_id, timestamp, content_hash, logical_clock, node_id))
-                                    except Exception as e:
-                                        logger.error(f"Error logging change for {table_name}.{row_id}: {e}")
-                                
-                                # Update version table with the incremented logical clock
-                                try:
-                                    cursor.execute(
-                                        "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
-                                        (timestamp, logical_clock)
-                                    )
-                                    if cursor.rowcount == 0:
-                                        # If no rows affected, insert a new row
-                                        cursor.execute(
-                                            "INSERT OR REPLACE INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
-                                            (timestamp, "0", logical_clock, node_id)
-                                        )
-                                except Exception as e:
-                                    logger.error(f"Error updating version table: {e}")
-                            else:
-                                # Legacy method - no Lamport clock support
-                                for table_name, operation, row_id in pending_changes:
-                                    synced_db.change_tracker.log_change(table_name, operation, row_id)
-                            
-                            # Commit all changes at once
-                            conn.commit()
-                            
-                            # Break out of retry loop on success
-                            break
-                            
-                        except sqlite3.OperationalError as e:
-                            if "database is locked" in str(e):
-                                retries += 1
-                                logger.warning(f"Database locked during direct import (attempt {retries}/{max_retries}), retrying in {retry_delay}s")
-                                time.sleep(retry_delay)
-                                # Increase backoff time for subsequent retries
-                                retry_delay *= 1.5
-                                # Ensure we rollback any partial transaction
-                                try:
-                                    conn.rollback()
-                                except:
-                                    pass
-                            else:
-                                conn.rollback()
-                                logger.error(f"SQLite error in import: {e}")
-                                errors.append(f"Database error: {str(e)}")
-                                break
-                        except Exception as e:
-                            try:
-                                conn.rollback()
-                            except:
-                                pass
-                            logger.error(f"Error in direct import: {e}")
-                            errors.append(f"Import error: {str(e)}")
-                            break
-                        finally:
-                            if retries == max_retries:
-                                logger.error(f"Failed direct import after {max_retries} attempts")
-                                errors.append(f"Database locked error after {max_retries} attempts")
-                    
-                    # Send a single notification after all updates
-                    if imported_count > 0:
-                        try:
-                            if synced_db:
-                                synced_db.notify_update()
-                        except Exception as e:
-                            logger.error(f"Error sending notification: {e}")
-                    
-                    # Clean up connection
-                    if conn:
-                        try:
-                            conn.close()
-                        except:
-                            pass
+                    import_status["last_import"]["imported_count"] = imported_count
+                    import_status["last_import"]["errors"] = errors[:10]  # Limit to first 10 errors
+                    import_status["last_import"]["success"] = True
+                    import_status["last_import"]["status"] = f"Import complete: {imported_count} beers imported"
                     
                     logger.info(f"Background import completed: {imported_count} beers imported with {len(errors)} errors")
-                
-                # Update import status when complete
-                import_status["in_progress"] = False
-                import_status["last_import"]["timestamp"] = datetime.now(UTC).isoformat()
-                import_status["last_import"]["success"] = True
-                import_status["last_import"]["imported_count"] = imported_count
-                import_status["last_import"]["errors"] = errors[:10]  # Limit to first 10 errors
-                
+                else:
+                    import_status["last_import"]["success"] = False
+                    import_status["last_import"]["errors"] = ["Database synchronization service not available"]
+                    import_status["last_import"]["status"] = "Failed: Database service unavailable"
+                    logger.error("Cannot import: synced_db is not available")
             except Exception as e:
-                logger.error(f"Unexpected error in background import: {e}")
-                
-                # Update import status with error
-                import_status["in_progress"] = False
-                import_status["last_import"]["timestamp"] = datetime.now(UTC).isoformat()
+                logger.error(f"Error during database import: {e}")
                 import_status["last_import"]["success"] = False
-                import_status["last_import"]["errors"] = [f"Unexpected error: {str(e)}"]
-        
-        # Start the background thread
-        import_thread = threading.Thread(target=background_import, daemon=True)
-        import_thread.start()
-        
-        # Return success immediately
-        return jsonify({
-            "success": True,
-            "message": "Import started in the background. This may take a few minutes to complete."
-        })
-        
-    except Exception as e:
-        # Update import status with error
-        import_status["in_progress"] = False
-        import_status["last_import"]["timestamp"] = datetime.now(UTC).isoformat()
-        import_status["last_import"]["success"] = False
-        import_status["last_import"]["errors"] = [f"Error processing CSV: {str(e)}"]
-        
-        return jsonify({"error": f"Error processing CSV: {str(e)}"}), 500
+                import_status["last_import"]["errors"] = [f"Database error: {str(e)}"]
+                import_status["last_import"]["status"] = "Failed during database import"
+            
+            # Clean up the temporary file
+            try:
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
+                    logger.info(f"Removed temporary import file: {temp_file_path}")
+            except Exception as e:
+                logger.warning(f"Could not remove temporary file {temp_file_path}: {e}")
+            
+            # Mark import as complete
+            import_status["in_progress"] = False
+            import_status["last_import"]["timestamp"] = datetime.now(UTC).isoformat()
+            
+        except Exception as e:
+            logger.error(f"Unexpected error in background import: {e}")
+            import_status["in_progress"] = False
+            import_status["last_import"]["timestamp"] = datetime.now(UTC).isoformat()
+            import_status["last_import"]["success"] = False
+            import_status["last_import"]["errors"] = [f"Unexpected error: {str(e)}"]
+            import_status["last_import"]["status"] = "Failed with an unexpected error"
+            
+            # Try to clean up
+            if os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except:
+                    pass
+    
+    # Start the background import thread
+    import_thread = threading.Thread(target=background_import, daemon=True)
+    import_thread.start()
+    
+    # Return success immediately with background process info
+    return jsonify({
+        "success": True,
+        "message": "Import started in the background. Check import status for updates."
+    })
 
 @app.route('/api/beers/import-status', methods=['GET'])
 @login_required
