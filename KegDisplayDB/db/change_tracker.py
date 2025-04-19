@@ -98,51 +98,48 @@ class ChangeTracker:
             New logical clock value or None if unsuccessful
         """
         def db_manager_or_conn(conn):
-            # Set a longer timeout for this operation
-            conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
             
             # Get current logical clock value
             cursor = conn.cursor()
             cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
             row = cursor.fetchone()
             
+            # Determine the new clock value based on whether a row exists
             if row is None:
-                # Initialize with 1 if no row exists
                 current_clock = 0
                 new_clock = 1
-                
-                # Calculate content-based hash
-                content_hash = self._calculate_content_hash(conn)
-                
+            else:
+                current_clock = row[0] if row[0] is not None else 0
+                new_clock = current_clock + 1
+            
+            # Calculate shared values used in both paths
+            content_hash = self._calculate_content_hash()
+            timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            
+            # Prepare the common parameter values
+            params = (timestamp, content_hash, new_clock, self.node_id)
+            
+            # Execute the appropriate SQL operation
+            if row is None:
                 # Insert new version record
                 cursor.execute(
                     "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
-                    (
-                        datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        content_hash,
-                        new_clock,
-                        self.node_id
-                    )
+                    params
                 )
             else:
-                # Increment existing clock
-                current_clock = row[0] if row[0] is not None else 0
-                new_clock = current_clock + 1
-                
-                # Update version record
+                # Update existing version record
                 cursor.execute(
-                    "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
-                    (
-                        datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        new_clock
-                    )
+                    """
+                    UPDATE version
+                       SET timestamp     = ?,
+                           hash          = ?,
+                           logical_clock = ?,
+                           node_id       = ?
+                     WHERE id = 1
+                    """,
+                    params
                 )
             
-            # Commit the transaction
-            conn.commit()
-            
-            # Log the update
-            logger.debug(f"Incremented logical clock from {current_clock} to {new_clock}")
             return new_clock
         
         retries = 0
@@ -152,6 +149,7 @@ class ChangeTracker:
                     with self.db_manager.get_connection() as conn:
                         return db_manager_or_conn(conn)
                 else:
+                    # assume outer caller will commit
                     return db_manager_or_conn(conn)
                     
             except sqlite3.OperationalError as e:
@@ -234,40 +232,38 @@ class ChangeTracker:
             cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
             row = cursor.fetchone()
             
+            # Calculate a fresh content hash
+            content_hash = self._calculate_content_hash()
+            now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            
             if row is None:
                 # Initialize with received_clock+1 if no row exists
                 current_clock = 0
                 new_clock = received_clock + 1
                 
-                # Calculate content-based hash
-                content_hash = self._calculate_content_hash(conn)
-                
                 # Insert new version record
                 cursor.execute(
                     "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
-                    (
-                        datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        content_hash,
-                        new_clock,
-                        self.node_id
-                    )
+                    (now, content_hash, new_clock, self.node_id)
                 )
             else:
                 # Lamport clock rule: local_clock = max(local_clock, received_clock) + 1
                 current_clock = row[0] if row[0] is not None else 0
                 new_clock = max(current_clock, received_clock) + 1
                 
-                # Update version record
+                # Update version record with all fields
                 cursor.execute(
-                    "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
-                    (
-                        datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        new_clock
-                    )
+                    """
+                    UPDATE version
+                       SET timestamp     = ?,
+                           hash          = ?,
+                           logical_clock = ?,
+                           node_id       = ?
+                     WHERE id = 1
+                    """,
+                    (now, content_hash, new_clock, self.node_id)
                 )
             
-            # Commit the transaction
-            conn.commit()
             
             # Log the update
             logger.info(f"Updated logical clock from {current_clock} to {new_clock} based on received clock {received_clock}")
@@ -341,29 +337,29 @@ class ChangeTracker:
         row = cursor.fetchone()
         current_clock = row[0] if row and row[0] is not None else 0
         
+        # Calculate a fresh content hash and timestamp
+        content_hash = self._calculate_content_hash()
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        
         # Check if version row exists
         if row is None:
             # Create new version record with specified clock
-            # Calculate content-based hash
-            content_hash = self._calculate_content_hash(conn)
-            
             cursor.execute(
                 "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
-                (
-                    datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    content_hash,
-                    new_clock,
-                    self.node_id
-                )
+                (now, content_hash, new_clock, self.node_id)
             )
         else:
-            # Update existing version record
+            # Update existing version record with all fields
             cursor.execute(
-                "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
-                (
-                    datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    new_clock
-                )
+                """
+                UPDATE version
+                   SET timestamp     = ?,
+                       hash          = ?,
+                       logical_clock = ?,
+                       node_id       = ?
+                 WHERE id = 1
+                """,
+                (now, content_hash, new_clock, self.node_id)
             )
         
         # Commit the transaction only if we're using our own connection
@@ -434,19 +430,26 @@ class ChangeTracker:
                     (table_name, operation, row_id, timestamp, content, content_hash, new_clock, self.node_id)
                 )
                 
-                # Update version table with new logical clock
+                # Calculate a fresh database content hash
+                db_content_hash = self._calculate_content_hash()
+                
+                # Update version table with new logical clock and all other fields
                 cursor.execute(
-                    "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
-                    (timestamp, new_clock)
+                    """
+                    UPDATE version 
+                       SET timestamp     = ?, 
+                           hash          = ?, 
+                           logical_clock = ?, 
+                           node_id       = ? 
+                     WHERE id = 1
+                    """,
+                    (timestamp, db_content_hash, new_clock, self.node_id)
                 )
                 if cursor.rowcount == 0:
                     # If no rows were updated, insert a new row
-                    # Calculate content-based hash
-                    content_hash = self._calculate_content_hash(conn)
-                    
                     cursor.execute(
                         "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
-                        (timestamp, content_hash, new_clock, self.node_id)
+                        (timestamp, db_content_hash, new_clock, self.node_id)
                     )
             
                 conn.commit()
@@ -861,7 +864,7 @@ class ChangeTracker:
         logger.debug(f"Tie-breaking with node IDs: {node_id1} vs {node_id2}, result: {is_newer}")
         return is_newer 
 
-    def _calculate_content_hash(self, conn):
+    def _calculate_content_hash(self):
         """Calculate a hash based on database content for version tracking
         
         Args:
