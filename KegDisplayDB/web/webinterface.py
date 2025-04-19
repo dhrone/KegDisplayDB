@@ -605,7 +605,7 @@ def import_beers():
                             else:
                                 # Legacy method - no Lamport clock support
                                 for table_name, operation, row_id in pending_changes:
-                                    log_change(conn, table_name, operation, row_id, skip_notify=True)
+                                    synced_db.change_tracker.log_change(table_name, operation, row_id)
                             
                             # Commit all changes at once
                             conn.commit()
@@ -648,13 +648,6 @@ def import_beers():
                         try:
                             if synced_db:
                                 synced_db.notify_update()
-                            else:
-                                # Use a background thread for notification
-                                notify_thread = threading.Thread(
-                                    target=lambda: log_change(sqlite3.connect(DB_PATH), None, None, None, notify_only=True),
-                                    daemon=True
-                                )
-                                notify_thread.start()
                         except Exception as e:
                             logger.error(f"Error sending notification: {e}")
                     
@@ -754,7 +747,8 @@ def clear_beers():
                 
                 # Log each deletion but skip notifications
                 for beer_id in beer_ids:
-                    log_change(conn, "beers", "DELETE", beer_id, skip_notify=True)
+                    if synced_db:
+                        synced_db.change_tracker.log_change("beers", "DELETE", beer_id)
                 
                 # Commit all changes at once
                 conn.commit()
@@ -776,94 +770,6 @@ def clear_beers():
     
     except Exception as e:
         return jsonify({"error": f"Error clearing beers: {str(e)}"}), 500
-
-# This function is now used by the web interface to log changes
-# The SyncedDatabase handles the synchronization
-def log_change(conn, table_name, operation, row_id, skip_notify=False):
-    """Log a database change and trigger synchronization"""
-    cursor = conn.cursor()
-    timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    
-    # Calculate content hash for the table
-    cursor.execute(f"SELECT * FROM {table_name} WHERE rowid = ?", (row_id,))
-    row = cursor.fetchone()
-    if row:
-        content_hash = str(row)
-    else:
-        content_hash = "0"
-    
-    # First check if version table has logical_clock field and node_id
-    cursor.execute("PRAGMA table_info(version)")
-    version_columns = [col[1] for col in cursor.fetchall()]
-    
-    # If we have Lamport clock support, update the logical clock
-    logical_clock = 0
-    node_id = None
-    
-    if 'logical_clock' in version_columns and 'node_id' in version_columns:
-        # Get current logical clock
-        cursor.execute("SELECT logical_clock, node_id FROM version WHERE id = 1")
-        clock_row = cursor.fetchone()
-        if clock_row:
-            current_clock, node_id = clock_row
-            # Increment the logical clock
-            logical_clock = current_clock + 1 if current_clock is not None else 1
-        else:
-            # No entry yet, start at 1 and generate a node_id
-            logical_clock = 1
-            node_id = str(uuid.uuid4())
-            
-        # Insert with the logical clock and node_id
-        cursor.execute('''
-            INSERT INTO change_log (table_name, operation, row_id, timestamp, content_hash, logical_clock, node_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (table_name, operation, row_id, timestamp, content_hash, logical_clock, node_id))
-        
-        # Update version table with logical clock
-        cursor.execute(
-            "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
-            (timestamp, logical_clock)
-        )
-        if cursor.rowcount == 0:
-            # If no rows affected, insert a new row
-            cursor.execute(
-                "INSERT OR REPLACE INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
-                (timestamp, "0", logical_clock, node_id)
-            )
-    else:
-        # Legacy mode - no Lamport clock support
-        cursor.execute('''
-            INSERT INTO change_log (table_name, operation, row_id, timestamp, content_hash)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (table_name, operation, row_id, timestamp, content_hash))
-        
-        # Update version timestamp
-        cursor.execute(
-            "UPDATE version SET timestamp = ? WHERE id = 1",
-            (timestamp,)
-        )
-        if cursor.rowcount == 0:
-            # If no rows affected, insert a new row
-            cursor.execute(
-                "INSERT OR REPLACE INTO version (id, timestamp, hash) VALUES (1, ?, ?)",
-                (timestamp, "0")
-            )
-    
-    conn.commit()
-    
-    # Notify peers about the change if sync is enabled and notification is not skipped
-    if synced_db and not skip_notify:
-        logger = logging.getLogger("KegDisplay")
-        
-        if table_name == 'beers':
-            logger.info(f"Database change in 'beers': {operation} on row {row_id}")
-            synced_db.notify_update()
-        
-        elif table_name == 'taps':
-            logger.info(f"Database change in 'taps': {operation} on row {row_id}")
-            synced_db.notify_update()
-
-# --- API Endpoints ---
 
 @app.route('/api/taps', methods=['GET'])
 @login_required
@@ -1004,8 +910,10 @@ def api_add_tap():
                 
                 tap = dict(cursor.fetchone())
                 
-                # Notify peers of the update
-                log_change(conn, "taps", "INSERT", next_tap_id)
+                # Log the change and notify peers
+                if synced_db:
+                    synced_db.change_tracker.log_change("taps", "INSERT", next_tap_id)
+                    synced_db.notify_update()
         
         return jsonify(tap), 201
     except Exception as e:
@@ -1048,7 +956,9 @@ def api_update_tap(tap_id):
             "UPDATE taps SET idBeer = ? WHERE idTap = ?",
             (beer_id, tap_id)
         )
-        log_change(conn, "taps", "UPDATE", tap_id)
+        if synced_db:
+            synced_db.change_tracker.log_change("taps", "UPDATE", tap_id)
+            synced_db.notify_update()
         
         conn.commit()
         conn.close()
@@ -1083,8 +993,10 @@ def api_delete_tap(tap_id):
         # Delete the tap
         cursor.execute("DELETE FROM taps WHERE idTap = ?", (tap_id,))
         
-        # Log the change
-        log_change(conn, "taps", "DELETE", tap_id)
+        # Log the change and notify peers
+        if synced_db:
+            synced_db.change_tracker.log_change("taps", "DELETE", tap_id)
+            synced_db.notify_update()
         
         conn.commit()
         conn.close()
@@ -1217,8 +1129,10 @@ def api_add_beer():
         
         beer_id = cursor.lastrowid
         
-        # Log the change
-        log_change(conn, "beers", "INSERT", beer_id)
+        # Log the change and notify peers
+        if synced_db:
+            synced_db.change_tracker.log_change("beers", "INSERT", beer_id)
+            synced_db.notify_update()
         
         conn.commit()
         conn.close()
@@ -1297,8 +1211,10 @@ def api_update_beer(beer_id):
             beer_id
         ))
         
-        # Log the change
-        log_change(conn, "beers", "UPDATE", beer_id)
+        # Log the change and notify peers
+        if synced_db:
+            synced_db.change_tracker.log_change("beers", "UPDATE", beer_id)
+            synced_db.notify_update()
         
         conn.commit()
         conn.close()
@@ -1338,13 +1254,16 @@ def api_delete_beer(beer_id):
             # Update those taps to remove the beer
             for tap_id in affected_taps:
                 cursor.execute("UPDATE taps SET idBeer = NULL WHERE idTap = ?", (tap_id,))
-                log_change(conn, "taps", "UPDATE", tap_id)
+                if synced_db:
+                    synced_db.change_tracker.log_change("taps", "UPDATE", tap_id)
         
         # Delete the beer
         cursor.execute("DELETE FROM beers WHERE idBeer = ?", (beer_id,))
         
-        # Log the change
-        log_change(conn, "beers", "DELETE", beer_id)
+        # Log the change and notify peers
+        if synced_db:
+            synced_db.change_tracker.log_change("beers", "DELETE", beer_id)
+            synced_db.notify_update()
         
         conn.commit()
         conn.close()
@@ -1384,14 +1303,16 @@ def api_set_tap_count():
             # Delete taps from highest number to lowest
             for i in range(current_count, count, -1):
                 cursor.execute("DELETE FROM taps WHERE idTap = ?", (i,))
-                log_change(conn, "taps", "DELETE", i)
+                if synced_db:
+                    synced_db.change_tracker.log_change("taps", "DELETE", i)
         
         # If increasing, add new taps
         elif count > current_count:
             # Add new taps with sequential IDs
             for i in range(current_count + 1, count + 1):
                 cursor.execute("INSERT INTO taps (idTap, idBeer) VALUES (?, NULL)", (i,))
-                log_change(conn, "taps", "INSERT", i)
+                if synced_db:
+                    synced_db.change_tracker.log_change("taps", "INSERT", i)
         
         conn.commit()
         conn.close()

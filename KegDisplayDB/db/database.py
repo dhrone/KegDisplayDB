@@ -668,6 +668,20 @@ class DatabaseManager:
                 row = cursor.fetchone()
                 current_clock = row[0] if row and row[0] is not None else 0
                 
+                # Get our local node_id for sorting
+                cursor.execute("SELECT node_id FROM version WHERE id = 1")
+                row = cursor.fetchone()
+                local_node_id = row[0] if row and row[0] is not None else str(uuid.uuid4())
+                
+                # Sort the changes by logical clock and origin node
+                changes = sorted(
+                    changes,
+                    key=lambda c: (
+                        c[6] if len(c) > 6 else 0,          # logical clock
+                        c[7] if len(c) > 7 else local_node_id  # origin node
+                    )
+                )
+                
                 # Process each change in clock-ordered stream
                 for change_index, change in enumerate(changes):
                     try:
