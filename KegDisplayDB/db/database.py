@@ -648,38 +648,40 @@ class DatabaseManager:
             
             return [row[0] for row in cursor.fetchall()]
     
-    def clear_beer(self):
+    def clear_beer(self, conn):
         """Delete all records from the beers table
         
+        Args:
+            conn: Database connection to use
+            
         Returns:
             success: True if the operation was successful
         """
         try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("DELETE FROM beers")
-                conn.commit()
-                
-                logger.info(f"Cleared all records from beers table")
-                return True
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM beers")
+            
+            logger.debug(f"Cleared all records from beers table")
+            return True
         except Exception as e:
             logger.error(f"Error clearing beers table: {e}")
             return False
     
-    def clear_tap(self):
+    def clear_tap(self, conn):
         """Delete all records from the taps table
         
+        Args:
+            conn: Database connection to use
+            
         Returns:
             success: True if the operation was successful
         """
         try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("DELETE FROM taps")
-                conn.commit()
-                
-                logger.info(f"Cleared all records from taps table")
-                return True
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM taps")
+            
+            logger.debug(f"Cleared all records from taps table")
+            return True
         except Exception as e:
             logger.error(f"Error clearing taps table: {e}")
             return False

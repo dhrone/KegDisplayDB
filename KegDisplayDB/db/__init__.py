@@ -319,250 +319,108 @@ class SyncedDatabase:
         """
         logger.info(f"Importing {len(beer_data_list)} beers")
         
+        # Deduplicate and sort the beer data by ID to ensure consistent order
+        unique_beers = {}
+        for beer in beer_data_list:
+            beer_id = beer.get('idBeer')
+            if beer_id:
+                try:
+                    beer_id = int(beer_id)
+                    unique_beers[beer_id] = beer
+                except (ValueError, TypeError):
+                    # If ID can't be converted to int, use the beer name as key
+                    unique_beers[beer.get('Name', str(id(beer)))] = beer
+            else:
+                # Use the beer name as key if no ID
+                unique_beers[beer.get('Name', str(id(beer)))] = beer
+        
+        # Sort by ID (numeric keys will be sorted first)
+        sorted_beers = []
+        for key in sorted(unique_beers.keys()):
+            sorted_beers.append(unique_beers[key])
+            
+        logger.info(f"Processing {len(sorted_beers)} unique beers")
+        
         # Initialize counters and collections
         success_count = 0
         errors = []
-        changes_to_log = []
-        current_time = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         
-        # Define batch size to prevent long transactions
-        BATCH_SIZE = 50
+        # Define batch size
+        BATCH_SIZE = 100
         
-        # Process in batches
-        for batch_start in range(0, len(beer_data_list), BATCH_SIZE):
-            batch_end = min(batch_start + BATCH_SIZE, len(beer_data_list))
-            batch = beer_data_list[batch_start:batch_end]
-            
-            logger.info(f"Processing batch {batch_start//BATCH_SIZE + 1} with {len(batch)} beers")
-            
-            # Use a connection for this batch
-            with self.db_manager.get_connection() as conn:
-                try:
-                    batch_success_count = 0
-                    batch_changes = []
+        # Start a transaction for the entire import
+        with self.db_manager.get_connection() as conn:
+            try:
+                # Begin transaction
+                conn.execute('BEGIN TRANSACTION')
+                
+                # Clear all existing beers
+                cleared = self.db_manager.clear_beer(conn)
+                if not cleared:
+                    logger.error("Failed to clear beer table")
+                    conn.rollback()
+                    return (0, ["Failed to clear beer table"])
+                
+                # Process beers in batches
+                for batch_start in range(0, len(sorted_beers), BATCH_SIZE):
+                    batch_end = min(batch_start + BATCH_SIZE, len(sorted_beers))
+                    batch = sorted_beers[batch_start:batch_end]
+                    
+                    logger.info(f"Processing batch {batch_start//BATCH_SIZE + 1} with {len(batch)} beers")
                     
                     # Process each beer in the batch
+                    batch_success_count = 0
                     for idx, beer_data in enumerate(batch):
                         try:
-                            # Handle existing beer with same ID
-                            beer_id = beer_data.get('idBeer')
-                            existing_beer = None
+                            # Add beer using db_manager (all operations are inserts)
+                            beer_id = self.db_manager.add_beer(
+                                name=beer_data.get('Name'),
+                                abv=beer_data.get('ABV'),
+                                ibu=beer_data.get('IBU'),
+                                color=beer_data.get('Color'),
+                                og=beer_data.get('OriginalGravity'),
+                                fg=beer_data.get('FinalGravity'),
+                                description=beer_data.get('Description'),
+                                brewed=beer_data.get('Brewed'),
+                                kegged=beer_data.get('Kegged'),
+                                tapped=beer_data.get('Tapped'),
+                                notes=beer_data.get('Notes'),
+                                conn=conn
+                            )
                             
-                            if beer_id and str(beer_id).strip() and str(beer_id) != '':
-                                try:
-                                    beer_id = int(beer_id)
-                                    cursor = conn.cursor()
-                                    cursor.execute("SELECT * FROM beers WHERE idBeer = ?", (beer_id,))
-                                    existing_beer = cursor.fetchone()
-                                except (ValueError, TypeError):
-                                    beer_id = None
-                            
-                            # Update existing beer or add new one
-                            if existing_beer:
-                                # Update the beer using the db_manager directly with the connection
-                                success = self.db_manager.update_beer(
-                                    beer_id,
-                                    name=beer_data.get('Name'),
-                                    abv=beer_data.get('ABV'),
-                                    ibu=beer_data.get('IBU'),
-                                    color=beer_data.get('Color'),
-                                    og=beer_data.get('OriginalGravity'),
-                                    fg=beer_data.get('FinalGravity'),
-                                    description=beer_data.get('Description'),
-                                    brewed=beer_data.get('Brewed'),
-                                    kegged=beer_data.get('Kegged'),
-                                    tapped=beer_data.get('Tapped'),
-                                    notes=beer_data.get('Notes'),
-                                    conn=conn
-                                )
-                                
-                                if success:
-                                    # Get content for the row for change tracking
-                                    content = self.change_tracker._get_row_content("beers", beer_id, conn)
-                                    content_hash = hashlib.md5(content.encode()).hexdigest()
-                                    
-                                    # Store change to log later
-                                    batch_changes.append({
-                                        "table_name": "beers",
-                                        "operation": "UPDATE",
-                                        "row_id": beer_id,
-                                        "content": content,
-                                        "content_hash": content_hash
-                                    })
-                                    batch_success_count += 1
-                                    logger.info(f"Updated beer '{beer_data.get('Name')}' with ID {beer_id}")
-                            else:
-                                # Add new beer directly using db_manager
-                                beer_id = self.db_manager.add_beer(
-                                    name=beer_data.get('Name'),
-                                    abv=beer_data.get('ABV'),
-                                    ibu=beer_data.get('IBU'),
-                                    color=beer_data.get('Color'),
-                                    og=beer_data.get('OriginalGravity'),
-                                    fg=beer_data.get('FinalGravity'),
-                                    description=beer_data.get('Description'),
-                                    brewed=beer_data.get('Brewed'),
-                                    kegged=beer_data.get('Kegged'),
-                                    tapped=beer_data.get('Tapped'),
-                                    notes=beer_data.get('Notes'),
-                                    conn=conn
-                                )
-                                if beer_id:
-                                    # Get content for the row for change tracking
-                                    content = self.change_tracker._get_row_content("beers", beer_id, conn)
-                                    content_hash = hashlib.md5(content.encode()).hexdigest()
-                                    
-                                    # Store change to log later
-                                    batch_changes.append({
-                                        "table_name": "beers",
-                                        "operation": "INSERT",
-                                        "row_id": beer_id,
-                                        "content": content,
-                                        "content_hash": content_hash
-                                    })
-                                    batch_success_count += 1
-                                    logger.info(f"Added beer '{beer_data.get('Name')}' with ID {beer_id}")
+                            if beer_id:
+                                batch_success_count += 1
+                                logger.info(f"Added beer '{beer_data.get('Name')}' with ID {beer_id}")
                             
                         except Exception as e:
                             logger.error(f"Error processing beer {batch_start + idx + 1}: {str(e)}")
                             errors.append(f"Error on beer {batch_start + idx + 1}: {str(e)}")
                     
-                    # Continue only if we have successful operations in this batch
-                    if batch_success_count > 0 and batch_changes:
-                        # Now increment the Lamport clock with retry logic
-                        max_retries = 5
-                        retry_delay = 0.5
-                        retries = 0
-                        new_clock = None
-                        
-                        while retries < max_retries and new_clock is None:
-                            try:
-                                # Increment with longer timeout
-                                new_clock = self.change_tracker.increment_logical_clock(
-                                    max_retries=3,
-                                    retry_delay=1.0,
-                                    conn=conn
-                                )
-                                
-                                if new_clock is None or new_clock == 0:
-                                    # Fallback if increment failed
-                                    logger.warning("Failed to increment logical clock, attempting to force update")
-                                    cursor = conn.cursor()
-                                    cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
-                                    row = cursor.fetchone()
-                                    current_clock = row[0] if row and row[0] is not None else 0
-                                    new_clock = current_clock + 1
-                                    
-                                    # Directly update the version table
-                                    cursor.execute(
-                                        "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
-                                        (current_time, new_clock)
-                                    )
-                                    conn.commit()
-                                    logger.info(f"Force updated logical clock to {new_clock}")
-                            except sqlite3.OperationalError as e:
-                                if "database is locked" in str(e):
-                                    retries += 1
-                                    logger.warning(f"Database locked when updating logical clock in import (attempt {retries}/{max_retries}), retrying in {retry_delay}s")
-                                    time.sleep(retry_delay)
-                                else:
-                                    logger.error(f"SQLite error updating logical clock in import: {e}")
-                                    # Set a default value so we can continue
-                                    new_clock = 1
-                                    break
-                            except Exception as e:
-                                logger.error(f"Error updating logical clock in import: {e}")
-                                # Set a default value so we can continue
-                                new_clock = 1
-                                break
-                        
-                        # If all retries failed, use a default value
-                        if new_clock is None:
-                            logger.error("Failed to update logical clock after multiple retries, using default value")
-                            new_clock = 1
-                        
-                        cursor = conn.cursor()
-                        
-                        # Verify and update version table if needed
-                        try:
-                            cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
-                            row = cursor.fetchone()
-                            if row is None or row[0] != new_clock:
-                                cursor.execute(
-                                    "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
-                                    (current_time, new_clock)
-                                )
-                                if cursor.rowcount == 0:
-                                    cursor.execute(
-                                        "INSERT OR REPLACE INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
-                                        (current_time, "0", new_clock, self.change_tracker.node_id)
-                                    )
-                        except Exception as e:
-                            logger.error(f"Error verifying logical clock in version table: {e}")
-                        
-                        # Insert all change records with the same logical clock value
-                        for change in batch_changes:
-                            cursor.execute(
-                                """
-                                INSERT INTO change_log 
-                                (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                                """,
-                                (
-                                    change["table_name"],
-                                    change["operation"],
-                                    change["row_id"],
-                                    current_time,
-                                    change["content"],
-                                    change["content_hash"],
-                                    new_clock,  # Use the same clock value for all changes in the batch
-                                    self.change_tracker.node_id
-                                )
-                            )
-                    
-                    # Commit all changes in this batch
-                    conn.commit()
-                    
-                    # Update totals
+                    # Update total success count
                     success_count += batch_success_count
-                    changes_to_log.extend(batch_changes)
-                    
-                except Exception as e:
-                    conn.rollback()
-                    logger.error(f"Transaction error in batch {batch_start//BATCH_SIZE + 1}: {str(e)}")
-                    errors.append(f"Transaction error in batch {batch_start//BATCH_SIZE + 1}: {str(e)}")
-            
-            # Small delay between batches to allow other operations
-            time.sleep(0.1)
-        
-        # Send notification after all batches are processed
-        if success_count > 0:
-            try:
-                # Verify the logical clock is properly set before notification
-                with self.db_manager.get_connection() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
-                    row = cursor.fetchone()
-                    clock_value = row[0] if row else None
-                    
-                    if clock_value is None or clock_value == 0:
-                        logger.warning("Logical clock is still 0 before notify, attempting to fix")
-                        # Force increment the logical clock
-                        new_clock = 1
-                        cursor.execute(
-                            "UPDATE version SET logical_clock = ? WHERE id = 1",
-                            (new_clock,)
-                        )
-                        conn.commit()
-                    
-                    # Use the same connection for notification to avoid deadlocks
-                    self.notify_update_with_connection(conn)
                 
-                logger.info(f"Successfully imported {success_count} beers")
-            except Exception as e:
-                logger.error(f"Error notifying after import: {str(e)}")
-                errors.append(f"Error notifying after import: {str(e)}")
+                # Complete the transaction if we have successful imports
+                if success_count > 0:
+                    # Commit all changes first
+                    conn.commit()
+                    logger.info(f"Successfully imported {success_count} beers")
+                    
+                    # Log the change after committing the transaction
+                    self.change_tracker.log_change("version", "IMPORT", 1)
+                    
+                    # Notify peers about the import
+                    self.notify_update()
+                else:
+                    # No successful imports, roll back
+                    logger.warning("No beers were successfully imported, rolling back")
+                    conn.rollback()
             
+            except Exception as e:
+                # Handle any unexpected errors
+                conn.rollback()
+                logger.error(f"Error during beer import: {str(e)}")
+                errors.append(f"Transaction error: {str(e)}")
+        
         return (success_count, errors)
     
     def notify_update_with_connection(self, conn):
@@ -627,24 +485,36 @@ class SyncedDatabase:
         Returns:
             Number of beers cleared
         """
-        # Get all beers first
+        # Get all beers first to count them
         beers = self.get_all_beers()
         beer_count = len(beers)
         
-        # Clear all taps first
-        taps = self.get_all_taps()
-        for tap in taps:
-            if tap['idBeer']:
-                self.update_tap(tap['idTap'], None, notify=False)
-        
-        # Delete all beers without individual notifications
-        for beer in beers:
-            self.delete_beer(beer['idBeer'], notify=False)
-        
-        # Send a single notification for all changes
         if beer_count > 0:
-            self.notify_update()
-            
+            with self.db_manager.get_connection() as conn:
+                # Begin transaction
+                conn.execute('BEGIN TRANSACTION')
+                
+                try:
+                    # Clear all taps first to avoid foreign key issues
+                    self.db_manager.clear_tap(conn)
+                    
+                    # Then clear all beers
+                    self.db_manager.clear_beer(conn)
+                    
+                    # Commit transaction first
+                    conn.commit()
+                    
+                    # Log the change after commit
+                    self.change_tracker.log_change("version", "CLEAR", 1)
+                    
+                    # Send notification
+                    self.notify_update()
+                except Exception as e:
+                    # Rollback in case of error
+                    conn.rollback()
+                    logger.error(f"Error clearing beers: {e}")
+                    return 0
+        
         return beer_count
     
     def set_tap_count(self, count):
