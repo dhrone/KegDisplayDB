@@ -51,6 +51,10 @@ class DatabaseSynchronizer:
         self.buffer_size = buffer_size
         self.chunk_size = chunk_size
         self.max_retries = max_retries
+        
+        # Backup configuration
+        self.max_backups = 5  # Maximum number of backup files to keep
+        self.next_backup_time = None  # Will be set when start() is called
     
     def start(self):
         """Start the synchronization system"""
@@ -63,7 +67,8 @@ class DatabaseSynchronizer:
         # Start background threads
         self.threads = [
             threading.Thread(target=self._heartbeat_sender),
-            threading.Thread(target=self._cleanup_peers)
+            threading.Thread(target=self._cleanup_peers),
+            threading.Thread(target=self._daily_backup_thread)
         ]
         
         for thread in self.threads:
@@ -1072,6 +1077,31 @@ class DatabaseSynchronizer:
         """
         logger.info(f"Requesting sync with {peer_ip}:{peer_sync_port}")
         
+        # Prepare version and logical clock data before socket connection
+        try:
+            with self.db_manager.get_connection() as conn:
+                # Increment logical clock for this control message
+                logical_clock = self.change_tracker.increment_logical_clock(conn=conn)
+                if logical_clock is None:
+                    logical_clock = 0
+                
+                # Get our updated version (includes node_id)
+                version = self.change_tracker.get_db_version(conn=conn)
+                node_id = version.get('node_id')
+        except Exception as e:
+            logger.error(f"Error getting version and incrementing clock for sync request: {e}")
+            logical_clock = 0
+            node_id = self.change_tracker.node_id
+            version = self.change_tracker.get_db_version()
+        
+        # Create a backup before making any changes
+        backup_path = self._backup_database()
+        if not backup_path:
+            logger.error("Failed to create database backup, aborting sync")
+            return
+
+        # Socket handling with guaranteed cleanup
+        s = None
         try:
             # Connect to peer
             s = self.network.connect_to_peer(peer_ip, peer_sync_port)
@@ -1080,27 +1110,6 @@ class DatabaseSynchronizer:
                 return
                 
             s.settimeout(self.socket_timeout)
-            
-            # Get version and increment logical clock for this control message
-            try:
-                with self.db_manager.get_connection() as conn:
-                    # Get our current version
-                    version = self.change_tracker.get_db_version(conn=conn)
-                    node_id = version.get('node_id')
-                    
-                    # Increment logical clock for this control message
-                    # This both reads and updates the clock in one operation
-                    logical_clock = self.change_tracker.increment_logical_clock(conn=conn)
-                    if logical_clock is None:
-                        logical_clock = 0
-                    
-                    # Get our updated version
-                    version = self.change_tracker.get_db_version(conn=conn)
-            except Exception as e:
-                logger.error(f"Error getting version and incrementing clock for sync request: {e}")
-                logical_clock = 0
-                node_id = self.change_tracker.node_id
-                version = self.change_tracker.get_db_version()
             
             # Try logical clock-based sync first
             try:
@@ -1120,7 +1129,6 @@ class DatabaseSynchronizer:
                 response = self.protocol.parse_message(response_data)
                 
                 if not response or response.get('type') != 'sync_response':
-                    logger.warning(f"Peer {peer_ip} might not support logical clocks, falling back to timestamp-based sync")
                     raise Exception("Protocol incompatibility: No valid sync_response received")
                     
                 # If we got a valid response, continue with normal sync process
@@ -1130,37 +1138,7 @@ class DatabaseSynchronizer:
                 logger.warning(f"Logical clock sync attempt failed: {e}")
                 logger.info(f"Retrying with timestamp-based sync for compatibility")
                 
-                # Close the socket and reconnect
-                try:
-                    s.close()
-                except:
-                    pass
-                    
-                s = self.network.connect_to_peer(peer_ip, peer_sync_port)
-                if not s:
-                    logger.error(f"Failed to reconnect to peer {peer_ip}:{peer_sync_port}")
-                    return
-                    
-                s.settimeout(self.socket_timeout)
-                
-                # Create legacy sync request with timestamp
-                legacy_request = {
-                    'type': 'sync_request',
-                    'version': version,
-                    'last_timestamp': version.get('timestamp'),
-                    'sync_port': self.network.sync_port
-                }
-                s.send(json.dumps(legacy_request).encode())
-                
-                # Receive response
-                logger.debug(f"Waiting for sync response from {peer_ip} (timestamp-based)")
-                response_data = s.recv(self.buffer_size)
-                response = self.protocol.parse_message(response_data)
-                
-                if not response or response.get('type') != 'sync_response':
-                    logger.error(f"Invalid response from peer {peer_ip}: {response}")
-                    s.close()
-                    return
+ 
             
             logger.info(f"Received sync response from {peer_ip}, has_changes: {response.get('has_changes', False)}")
             
@@ -1178,7 +1156,6 @@ class DatabaseSynchronizer:
                     if not changes_data:
                         logger.error(f"Failed to receive changes from {peer_ip}")
                         self._restore_database(backup_path)
-                        s.close()
                         return
                     
                     changes = self.protocol.deserialize_changes(changes_data)
@@ -1245,7 +1222,8 @@ class DatabaseSynchronizer:
                                     logger.error(f"Peer clock: {peer_clock}, our clock: {our_clock}")
                                     # Rollback the changes
                                     logger.info("Restoring database from backup due to logical clock inconsistency")
-                                    self._restore_database(backup_path)
+                                    if backup_path:
+                                        self._restore_database(backup_path)
                             else:
                                 logger.info(f"Successfully synced with {peer_ip}, content hashes match")
                                 # Remove backup after successful sync
@@ -1253,27 +1231,37 @@ class DatabaseSynchronizer:
                     except Exception as e:
                         logger.error(f"Error applying changes: {e}")
                         logger.info("Restoring database from backup due to error")
-                        self._restore_database(backup_path)
+                        if backup_path:
+                            self._restore_database(backup_path)
                         
                 except socket.timeout:
                     logger.error(f"Socket timeout receiving changes from {peer_ip}")
-                    self._restore_database(backup_path)
+                    if backup_path:
+                        self._restore_database(backup_path)
                 except Exception as e:
                     logger.error(f"Error receiving changes: {e}")
-                    self._restore_database(backup_path)
+                    if backup_path:
+                        self._restore_database(backup_path)
             else:
                 logger.info(f"Peer {peer_ip} has no changes for us")
                 # Remove backup as no changes were made
                 self._remove_backup(backup_path)
             
-            s.close()
-            
         except socket.timeout:
             logger.error(f"Socket timeout during sync with {peer_ip}")
-            self._restore_database(backup_path)
+            if backup_path:
+                self._restore_database(backup_path)
         except Exception as e:
             logger.error(f"Sync request error: {e}")
-            self._restore_database(backup_path)
+            if backup_path:
+                self._restore_database(backup_path)
+        finally:
+            # Always ensure socket is closed
+            if s:
+                try:
+                    s.close()
+                except Exception as e:
+                    logger.warning(f"Error closing socket: {e}")
     
     def _request_full_database(self, peer_ip, peer_sync_port):
         """Request a full copy of the database from a peer
@@ -1440,7 +1428,29 @@ class DatabaseSynchronizer:
                 logger.info("No database to backup")
                 return None
             
-            backup_path = f"{db_path}.bak.{int(time.time())}"
+            # Get the directory and base name for the database
+            db_dir = os.path.dirname(db_path)
+            db_name = os.path.basename(db_path)
+            
+            # Find an available backup slot (1-5)
+            for i in range(1, self.max_backups + 1):
+                backup_path = os.path.join(db_dir, f"{db_name}.{i}.bak")
+                if not os.path.exists(backup_path):
+                    break
+            else:
+                # If all slots are taken, use the oldest backup (slot 5)
+                backup_files = []
+                for i in range(1, self.max_backups + 1):
+                    path = os.path.join(db_dir, f"{db_name}.{i}.bak")
+                    if os.path.exists(path):
+                        backup_files.append((path, os.path.getmtime(path)))
+                
+                # Sort by modification time (oldest first)
+                backup_files.sort(key=lambda x: x[1])
+                if backup_files:
+                    backup_path = backup_files[0][0]
+                else:
+                    backup_path = os.path.join(db_dir, f"{db_name}.1.bak")
             
             try:
                 shutil.copy2(db_path, backup_path)
@@ -1466,8 +1476,13 @@ class DatabaseSynchronizer:
         Returns:
             success: Whether the restore was successful
         """
+        # Check if backup_path is None or empty
+        if not backup_path:
+            logger.warning("Cannot restore from empty backup path")
+            return False
+            
         # Check if this is a test dummy path
-        if backup_path == "_TESTONLY_backup_path" or not backup_path:
+        if backup_path == "_TESTONLY_backup_path":
             logger.info("Test environment detected, skipping actual database restoration")
             return True
             
@@ -1550,10 +1565,10 @@ class DatabaseSynchronizer:
             
             for ip, (version, _, port) in self.peers.items():
                 # Get the peer's logical clock
-                peer_clock = version.get("logical_clock", 0)
+                peer_clock = version.get('logical_clock', 0)
                 
                 # Check if this peer's hash is different
-                content_differs = version.get("hash") != latest_version.get("hash")
+                content_differs = version.get('hash') != latest_version.get('hash')
                 
                 if content_differs:
                     logger.info(f"Peer {ip} has different hash: {version.get('hash')} vs our {latest_version.get('hash')}")
@@ -1788,4 +1803,41 @@ class DatabaseSynchronizer:
             logger.info(f"Found peer with latest version: {latest_peer}, requesting full database")
             self._request_full_database(latest_peer, latest_port)
         else:
-            logger.info("No peers with newer database version found") 
+            logger.info("No peers with newer database version found")
+    
+    def _daily_backup_thread(self):
+        """Thread to perform daily backups around 4:00 AM local time"""
+        logger.info("Starting daily backup thread")
+        
+        while self.running:
+            try:
+                # Get current time
+                now = datetime.now()
+                
+                # Calculate next backup time (4:00 AM)
+                if now.hour >= 4:
+                    # If it's already past 4 AM, schedule for tomorrow
+                    next_backup = now.replace(day=now.day+1, hour=4, minute=0, second=0, microsecond=0)
+                else:
+                    # Otherwise schedule for today at 4 AM
+                    next_backup = now.replace(hour=4, minute=0, second=0, microsecond=0)
+                
+                # Calculate seconds until next backup
+                sleep_seconds = (next_backup - now).total_seconds()
+                
+                logger.info(f"Next database backup scheduled at {next_backup.strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                # Sleep until next backup time
+                for _ in range(int(sleep_seconds / 60)):  # Check every minute if we're still running
+                    if not self.running:
+                        return
+                    time.sleep(60)
+                
+                # Perform backup if we're still running
+                if self.running:
+                    logger.info("Performing scheduled daily database backup")
+                    self._backup_database() 
+            except Exception as e:
+                logger.error(f"Error in daily backup thread: {e}")
+                # Sleep for an hour before trying again
+                time.sleep(3600) 

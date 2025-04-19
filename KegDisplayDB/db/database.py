@@ -13,6 +13,7 @@ import queue
 import hashlib
 import time
 import uuid
+import shutil
 
 logger = logging.getLogger("KegDisplay")
 
@@ -833,6 +834,14 @@ class DatabaseManager:
         logger.info(f"Importing database from {temp_db_path}")
         
         try:
+            # Create a backup before importing if the database exists
+            if os.path.exists(self.db_path):
+                backup_created = self._create_backup_before_import()
+                if backup_created:
+                    logger.info("Created backup before importing database")
+                else:
+                    logger.warning("Failed to create backup before importing database")
+            
             # Connect to both databases
             with sqlite3.connect(self.db_path) as main_conn, sqlite3.connect(temp_db_path) as temp_conn:
                 main_cursor = main_conn.cursor()
@@ -921,6 +930,53 @@ class DatabaseManager:
                 
         except Exception as e:
             logger.error(f"Error importing database: {e}")
+            return False
+    
+    def _create_backup_before_import(self):
+        """Create a backup before importing a database
+        
+        Returns:
+            success: Whether the backup was successful
+        """
+        try:
+            # Check if database exists
+            if not os.path.exists(self.db_path):
+                logger.info("No database to backup before import")
+                return True
+            
+            # Get the directory and base name for the database
+            db_dir = os.path.dirname(self.db_path)
+            db_name = os.path.basename(self.db_path)
+            
+            # Use a simple rotating backup scheme (max 5 backups)
+            max_backups = 5
+            
+            # Find an available backup slot (1-5)
+            for i in range(1, max_backups + 1):
+                backup_path = os.path.join(db_dir, f"{db_name}.{i}.bak")
+                if not os.path.exists(backup_path):
+                    break
+            else:
+                # If all slots are taken, use the oldest backup
+                backup_files = []
+                for i in range(1, max_backups + 1):
+                    path = os.path.join(db_dir, f"{db_name}.{i}.bak")
+                    if os.path.exists(path):
+                        backup_files.append((path, os.path.getmtime(path)))
+                
+                # Sort by modification time (oldest first)
+                backup_files.sort(key=lambda x: x[1])
+                if backup_files:
+                    backup_path = backup_files[0][0]
+                else:
+                    backup_path = os.path.join(db_dir, f"{db_name}.1.bak")
+            
+            # Create the backup
+            shutil.copy2(self.db_path, backup_path)
+            logger.info(f"Created pre-import backup at {backup_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to create pre-import backup: {e}")
             return False
     
     def _apply_insert_change(self, conn, table_name, row_id, content_data):
