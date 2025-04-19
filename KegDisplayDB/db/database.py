@@ -115,6 +115,25 @@ class DatabaseManager:
             ''')
             
             conn.commit()
+            
+            # Initialize version table with a valid record if it doesn't exist
+            cursor.execute("SELECT COUNT(*) FROM version WHERE id = 1")
+            if cursor.fetchone()[0] == 0:
+                # Generate a node ID for this instance
+                node_id = str(uuid.uuid4())
+                
+                # Calculate initial hash for empty tables
+                tables = ['beers', 'taps']
+                initial_hash = self._calculate_db_hash(tables, cursor)
+                
+                # Create initial version record
+                timestamp = datetime.now(UTC).isoformat()
+                cursor.execute(
+                    "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, 0, ?)",
+                    (timestamp, initial_hash, node_id)
+                )
+                conn.commit()
+            
             logger.info("Database tables initialized")
     
     def get_connection(self):
@@ -628,6 +647,42 @@ class DatabaseManager:
             )
             
             return [row[0] for row in cursor.fetchall()]
+    
+    def clear_beer(self):
+        """Delete all records from the beers table
+        
+        Returns:
+            success: True if the operation was successful
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM beers")
+                conn.commit()
+                
+                logger.info(f"Cleared all records from beers table")
+                return True
+        except Exception as e:
+            logger.error(f"Error clearing beers table: {e}")
+            return False
+    
+    def clear_tap(self):
+        """Delete all records from the taps table
+        
+        Returns:
+            success: True if the operation was successful
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM taps")
+                conn.commit()
+                
+                logger.info(f"Cleared all records from taps table")
+                return True
+        except Exception as e:
+            logger.error(f"Error clearing taps table: {e}")
+            return False
             
     def apply_sync_changes(self, changes):
         """Apply changes received during sync
@@ -664,14 +719,10 @@ class DatabaseManager:
                 
                 # Get current logical clock
                 cursor = conn.cursor()
-                cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
+                cursor.execute("SELECT logical_clock, node_id FROM version WHERE id = 1")
                 row = cursor.fetchone()
                 current_clock = row[0] if row and row[0] is not None else 0
-                
-                # Get our local node_id for sorting
-                cursor.execute("SELECT node_id FROM version WHERE id = 1")
-                row = cursor.fetchone()
-                local_node_id = row[0] if row and row[0] is not None else str(uuid.uuid4())
+                local_node_id = row[1] if row and row[1] is not None else str(uuid.uuid4())
                 
                 # Sort the changes by logical clock and origin node
                 changes = sorted(
@@ -745,7 +796,6 @@ class DatabaseManager:
                         if operation == 'INSERT' or operation == 'UPDATE':
                             try:
                                 # Parse the content as JSON and build the SQL
-                                import json
                                 row_data = json.loads(content)
                                 
                                 if operation == 'INSERT':
@@ -809,21 +859,22 @@ class DatabaseManager:
                 if highest_logical_clock > 0:
                     # Update version table with new logical clock and timestamp
                     timestamp = datetime.now(UTC).isoformat()
-                    conn.execute(
-                        "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
-                        (timestamp, highest_logical_clock)
-                    )
                     
-                    # If no row was updated, insert one
-                    if conn.total_changes == 0:
-                        # Calculate current database hash
-                        tables = ['beers', 'taps']
-                        content_hash = self._calculate_db_hash(tables, cursor)
-                        
-                        cursor.execute(
-                            "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
-                            (timestamp, content_hash, highest_logical_clock, peer_node_id)
-                        )
+                    # Calculate current database hash
+                    tables = ['beers', 'taps']
+                    new_hash = self._calculate_db_hash(tables, cursor)
+                    
+                    conn.execute(
+                        """
+                        UPDATE version 
+                        SET timestamp = ?,
+                            hash = ?,
+                            logical_clock = ?,
+                            node_id = ?
+                        WHERE id = 1
+                        """,
+                        (timestamp, new_hash, highest_logical_clock, peer_node_id)
+                    )
                     
                     logger.info(f"Updated version with logical clock {highest_logical_clock}")
                 
