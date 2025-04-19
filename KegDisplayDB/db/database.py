@@ -633,6 +633,16 @@ class DatabaseManager:
         
         Args:
             changes: List of changes to apply
+            
+        Note:
+            This implements the Lamport Clock rule for receiving sync responses:
+            For each record (op, t, origin) in clock-ordered stream:
+            1. If unseen:
+               a. localClock = max(localClock, t) + 1
+               b. version_table.clock = localClock
+               c. db.apply(op)
+               d. change_log.insert({op, t, origin})
+            2. Otherwise skip
         """
         if not changes:
             logger.info("No changes to apply")
@@ -651,7 +661,13 @@ class DatabaseManager:
                 highest_logical_clock = 0
                 peer_node_id = None
                 
-                # Process each change
+                # Get current logical clock
+                cursor = conn.cursor()
+                cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
+                row = cursor.fetchone()
+                current_clock = row[0] if row and row[0] is not None else 0
+                
+                # Process each change in clock-ordered stream
                 for change_index, change in enumerate(changes):
                     try:
                         # Ensure the change has all the required fields
@@ -679,17 +695,36 @@ class DatabaseManager:
                             if not peer_node_id:
                                 peer_node_id = node_id
                         
-                        # Track highest logical clock
-                        if logical_clock > highest_logical_clock:
-                            highest_logical_clock = logical_clock
+                        # Check if this change is already in our change_log
+                        cursor.execute(
+                            """
+                            SELECT COUNT(*) FROM change_log 
+                            WHERE table_name = ? AND operation = ? AND row_id = ? AND logical_clock = ? AND node_id = ?
+                            """,
+                            (table_name, operation, row_id, logical_clock, node_id)
+                        )
+                        count = cursor.fetchone()[0]
                         
+                        if count > 0:
+                            # Skip changes we've already processed
+                            logger.debug(f"Skipping already applied change: {operation} on {table_name}.{row_id}")
+                            continue
+                            
                         # Verify content hash (security check)
                         if hashlib.md5(content.encode()).hexdigest() != content_hash:
                             logger.warning(f"Content hash mismatch for change at index {change_index}")
                             failed_changes += 1
                             continue
                         
-                        logger.debug(f"Applying change: {operation} to {table_name}.{row_id} (logical clock: {logical_clock})")
+                        # Update our logical clock (Lamport rule: localClock = max(localClock, t) + 1)
+                        new_clock = max(current_clock, logical_clock) + 1
+                        current_clock = new_clock  # Update for next iteration
+                        
+                        # Track the highest computed clock
+                        if new_clock > highest_logical_clock:
+                            highest_logical_clock = new_clock
+                        
+                        logger.debug(f"Applying change: {operation} to {table_name}.{row_id} (logical clock: {logical_clock}, our new clock: {new_clock})")
                         
                         # Apply the change based on operation type
                         if operation == 'INSERT' or operation == 'UPDATE':
@@ -712,14 +747,14 @@ class DatabaseManager:
                                     params = list(row_data.values()) + [row_id]
                                     conn.execute(sql, params)
                                 
-                                # Log the change in our change_log table
+                                # Log the change in our change_log table with OUR new clock value
                                 conn.execute(
                                     """
                                     INSERT INTO change_log 
                                     (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                     """,
-                                    (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id)
+                                    (table_name, operation, row_id, timestamp, content, content_hash, new_clock, node_id)
                                 )
                                 applied_changes += 1
                                 
@@ -733,14 +768,14 @@ class DatabaseManager:
                                 sql = f"DELETE FROM {table_name} WHERE rowid = ?"
                                 conn.execute(sql, (row_id,))
                                 
-                                # Log the change in our change_log table
+                                # Log the change in our change_log table with OUR new clock value
                                 conn.execute(
                                     """
                                     INSERT INTO change_log 
                                     (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                     """,
-                                    (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id)
+                                    (table_name, operation, row_id, timestamp, content, content_hash, new_clock, node_id)
                                 )
                                 applied_changes += 1
                                 
@@ -755,33 +790,27 @@ class DatabaseManager:
                         logger.error(f"Error processing change at index {change_index}: {e}")
                         failed_changes += 1
                 
-                # Update the version table with the highest logical clock
+                # Update the version table with the highest computed logical clock
                 if highest_logical_clock > 0:
-                    # Get current logical clock
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
-                    row = cursor.fetchone()
-                    current_clock = row[0] if row and row[0] is not None else 0
-                    
-                    # Set logical clock to exactly the highest received value
-                    # We should not increment or calculate a max here - just use the value from the changes
-                    new_clock = highest_logical_clock
-                    
                     # Update version table with new logical clock and timestamp
                     timestamp = datetime.now(UTC).isoformat()
                     conn.execute(
                         "UPDATE version SET timestamp = ?, logical_clock = ? WHERE id = 1",
-                        (timestamp, new_clock)
+                        (timestamp, highest_logical_clock)
                     )
                     
                     # If no row was updated, insert one
                     if conn.total_changes == 0:
-                        conn.execute(
-                            "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, '0', ?, ?)",
-                            (timestamp, new_clock, peer_node_id)
+                        # Calculate current database hash
+                        tables = ['beers', 'taps']
+                        content_hash = self._calculate_db_hash(tables, cursor)
+                        
+                        cursor.execute(
+                            "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
+                            (timestamp, content_hash, highest_logical_clock, peer_node_id)
                         )
                     
-                    logger.info(f"Updated version with logical clock {new_clock}")
+                    logger.info(f"Updated version with logical clock {highest_logical_clock}")
                 
                 conn.commit()
                 logger.info(f"Successfully applied {applied_changes} changes, {failed_changes} failed")
@@ -1128,3 +1157,58 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Unexpected error applying DELETE to {table_name}.{row_id}: {e}")
             raise 
+
+    def _calculate_db_hash(self, tables, cursor):
+        """Calculate a hash based on database content for version tracking
+        
+        Args:
+            tables: List of table names to include in the hash
+            cursor: Database cursor to use
+            
+        Returns:
+            str: MD5 hash of relevant database content
+        """
+        try:
+            # Calculate content-based hash from all tracked tables
+            content_hashes = []
+            for table in tables:
+                # Get all rows from the table for hashing
+                try:
+                    cursor.execute(f"SELECT * FROM {table}")
+                    rows = cursor.fetchall()
+                    
+                    # Get column names
+                    cursor.execute(f"PRAGMA table_info({table})")
+                    column_info = cursor.fetchall()
+                    column_names = [col[1] for col in column_info]
+                    
+                    # Create normalized representation
+                    normalized_data = []
+                    for row in rows:
+                        row_dict = {}
+                        for i, col_name in enumerate(column_names):
+                            val = row[i]
+                            if val is None:
+                                val = "NULL"
+                            else:
+                                val = str(val)
+                            row_dict[col_name] = val
+                        normalized_data.append(row_dict)
+                    
+                    # Sort the normalized data
+                    normalized_data.sort(key=lambda x: [str(x.get(col, "")) for col in column_names])
+                    
+                    # Convert to JSON and calculate hash
+                    data_json = json.dumps(normalized_data, sort_keys=True)
+                    table_hash = hashlib.md5(data_json.encode()).hexdigest()
+                    content_hashes.append(table_hash)
+                except Exception as e:
+                    logger.error(f"Error calculating hash for table {table}: {e}")
+                    content_hashes.append("0")
+            
+            # Combine hashes
+            content_hash = hashlib.md5(''.join(content_hashes).encode()).hexdigest()
+            return content_hash
+        except Exception as e:
+            logger.error(f"Error calculating content hash: {e}")
+            return "0"  # Fallback hash 

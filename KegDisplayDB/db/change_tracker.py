@@ -43,8 +43,8 @@ class ChangeTracker:
                     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
                     node_id = str(uuid.uuid4())
                     cursor.execute(
-                        "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, 0, ?)",
-                        (now, "0", node_id)
+                        "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
+                        (now, "0", 0, node_id)
                     )
                 
                 conn.commit()
@@ -111,12 +111,15 @@ class ChangeTracker:
                 current_clock = 0
                 new_clock = 1
                 
+                # Calculate content-based hash
+                content_hash = self._calculate_content_hash(conn)
+                
                 # Insert new version record
                 cursor.execute(
-                    "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
+                    "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
                     (
                         datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "0",
+                        content_hash,
                         new_clock,
                         self.node_id
                     )
@@ -236,12 +239,15 @@ class ChangeTracker:
                 current_clock = 0
                 new_clock = received_clock + 1
                 
+                # Calculate content-based hash
+                content_hash = self._calculate_content_hash(conn)
+                
                 # Insert new version record
                 cursor.execute(
-                    "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
+                    "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
                     (
                         datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "0",
+                        content_hash,
                         new_clock,
                         self.node_id
                     )
@@ -338,11 +344,14 @@ class ChangeTracker:
         # Check if version row exists
         if row is None:
             # Create new version record with specified clock
+            # Calculate content-based hash
+            content_hash = self._calculate_content_hash(conn)
+            
             cursor.execute(
-                "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
+                "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
                 (
                     datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "0",
+                    content_hash,
                     new_clock,
                     self.node_id
                 )
@@ -432,9 +441,12 @@ class ChangeTracker:
                 )
                 if cursor.rowcount == 0:
                     # If no rows were updated, insert a new row
+                    # Calculate content-based hash
+                    content_hash = self._calculate_content_hash(conn)
+                    
                     cursor.execute(
-                        "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
-                        (timestamp, "0", new_clock, self.node_id)
+                        "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
+                        (timestamp, content_hash, new_clock, self.node_id)
                     )
             
                 conn.commit()
@@ -648,7 +660,7 @@ class ChangeTracker:
                     logical_clock = 0
                     node_id = self.node_id
                     cursor.execute(
-                        "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
+                        "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
                         (timestamp, content_hash, logical_clock, node_id)
                     )
                     conn.commit()
@@ -670,7 +682,7 @@ class ChangeTracker:
                         )
                     ''')
                     cursor.execute(
-                        "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (1, ?, ?, ?, ?)",
+                        "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
                         (timestamp, content_hash, logical_clock, node_id)
                     )
                     conn.commit()
@@ -847,3 +859,24 @@ class ChangeTracker:
         is_newer = node_id1 > node_id2
         logger.debug(f"Tie-breaking with node IDs: {node_id1} vs {node_id2}, result: {is_newer}")
         return is_newer 
+
+    def _calculate_content_hash(self, conn):
+        """Calculate a hash based on database content for version tracking
+        
+        Args:
+            conn: Database connection to use
+            
+        Returns:
+            str: MD5 hash of relevant database content
+        """
+        try:
+            # Calculate content-based hash from all tracked tables
+            tables = ['beers', 'taps']
+            content_hashes = []
+            for table in tables:
+                content_hashes.append(self._get_table_hash(table))
+            content_hash = hashlib.md5(''.join(content_hashes).encode()).hexdigest()
+            return content_hash
+        except Exception as e:
+            logger.error(f"Error calculating content hash: {e}")
+            return "0"  # Fallback hash 
