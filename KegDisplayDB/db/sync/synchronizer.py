@@ -1081,20 +1081,15 @@ class DatabaseSynchronizer:
                 
             s.settimeout(self.socket_timeout)
             
-            # Get last_clock for sync request
+            # Get version and increment logical clock for this control message
             try:
                 with self.db_manager.get_connection() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT MAX(logical_clock) FROM change_log")
-                    row = cursor.fetchone()
-                    logical_clock = row[0] if row and row[0] is not None else 0
-                    
                     # Get our current version
                     version = self.change_tracker.get_db_version(conn=conn)
-                    timestamp = version.get('timestamp')
                     node_id = version.get('node_id')
                     
                     # Increment logical clock for this control message
+                    # This both reads and updates the clock in one operation
                     logical_clock = self.change_tracker.increment_logical_clock(conn=conn)
                     if logical_clock is None:
                         logical_clock = 0
@@ -1102,9 +1097,8 @@ class DatabaseSynchronizer:
                     # Get our updated version
                     version = self.change_tracker.get_db_version(conn=conn)
             except Exception as e:
-                logger.error(f"Error getting last clock for sync request: {e}")
+                logger.error(f"Error getting version and incrementing clock for sync request: {e}")
                 logical_clock = 0
-                timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
                 node_id = self.change_tracker.node_id
                 version = self.change_tracker.get_db_version()
             
@@ -1153,7 +1147,7 @@ class DatabaseSynchronizer:
                 legacy_request = {
                     'type': 'sync_request',
                     'version': version,
-                    'last_timestamp': timestamp,
+                    'last_timestamp': version.get('timestamp'),
                     'sync_port': self.network.sync_port
                 }
                 s.send(json.dumps(legacy_request).encode())

@@ -142,7 +142,7 @@ class ChangeTracker:
             conn.commit()
             
             # Log the update
-            logger.info(f"Incremented logical clock from {current_clock} to {new_clock}")
+            logger.debug(f"Incremented logical clock from {current_clock} to {new_clock}")
             return new_clock
         
         retries = 0
