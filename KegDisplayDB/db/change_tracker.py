@@ -169,7 +169,7 @@ class ChangeTracker:
         logger.error(f"Failed to increment logical clock after {max_retries} attempts")
         return None
     
-    def update_logical_clock(self, received_clock, max_retries=5, retry_delay=0.5, conn=None):
+    def update_logical_clock(self, received_clock, max_retries=5, retry_delay=0.5):
         """
         Update logical clock based on received clock value (Lamport algorithm)
         
@@ -182,35 +182,31 @@ class ChangeTracker:
         Returns:
             New clock value or None if unsuccessful
         """
-        # If a connection was provided, use it directly
-        if conn:
-            return self._do_update_logical_clock(conn, received_clock)
-        else:
-            # Otherwise, use our retry logic with a new connection
-            retries = 0
-            
-            while retries < max_retries:
-                try:
-                    with self.db_manager.get_connection() as conn:
-                        # Set a longer timeout for this operation
-                        conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
+
+        retries = 0
+        
+        while retries < max_retries:
+            try:
+                with self.db_manager.get_connection() as conn:
+                    # Set a longer timeout for this operation
+                    conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
+                    
+                    # Perform the update
+                    return self._do_update_logical_clock(conn, received_clock)
                         
-                        # Perform the update
-                        return self._do_update_logical_clock(conn, received_clock)
-                            
-                except sqlite3.OperationalError as e:
-                    if "database is locked" in str(e):
-                        retries += 1
-                        logger.warning(f"Database locked when updating logical clock (attempt {retries}/{max_retries}), retrying in {retry_delay}s")
-                        time.sleep(retry_delay)
-                        # Increase backoff time for subsequent retries
-                        retry_delay *= 1.5
-                    else:
-                        logger.error(f"Error updating logical clock: {e}")
-                        return None
-                except Exception as e:
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e):
+                    retries += 1
+                    logger.warning(f"Database locked when updating logical clock (attempt {retries}/{max_retries}), retrying in {retry_delay}s")
+                    time.sleep(retry_delay)
+                    # Increase backoff time for subsequent retries
+                    retry_delay *= 1.5
+                else:
                     logger.error(f"Error updating logical clock: {e}")
                     return None
+            except Exception as e:
+                logger.error(f"Error updating logical clock: {e}")
+                return None
             
             logger.error(f"Failed to update logical clock after {max_retries} attempts")
             return None
