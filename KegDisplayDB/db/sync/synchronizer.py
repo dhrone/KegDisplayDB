@@ -92,6 +92,9 @@ class DatabaseSynchronizer:
     
     def notify_update(self):
         """Notify other instances that a change has been made"""
+        # Increment logical clock for this control message
+        self.change_tracker.increment_logical_clock()
+        
         # Get current database version
         version = self.change_tracker.get_db_version()
         
@@ -110,6 +113,9 @@ class DatabaseSynchronizer:
         Args:
             conn: The database connection to use
         """
+        # Increment logical clock for this control message using the connection
+        self.change_tracker.increment_logical_clock(conn=conn)
+        
         # Get current database version using the provided connection
         version = self.change_tracker.get_db_version(conn=conn)
         
@@ -149,14 +155,6 @@ class DatabaseSynchronizer:
         elif message_type == 'heartbeat':
             self._handle_heartbeat(message, addr)
         elif message_type == 'update':
-            # Check if the received version has logical_clock field
-            # This is for compatibility with nodes that haven't been updated yet
-            version = message.get('version', {})
-            if 'logical_clock' not in version and 'timestamp' in version:
-                # This is an old-style message, add default logical clock value
-                version['logical_clock'] = 0
-                logger.debug(f"Added default logical_clock to message from {addr[0]}")
-            
             self._handle_update(message, addr)
         else:
             logger.warning(f"Received unknown message type '{message_type}' from {addr[0]}")
@@ -261,7 +259,7 @@ class DatabaseSynchronizer:
                 content_differs = peer_version.get("hash") != our_version.get("hash")
                 
                 if content_differs:
-                    logger.info(f"Detected hash mismatch with peer {peer_ip}: {peer_version.get('hash')} vs our {our_version.get('hash')}")
+                    logger.info(f"Hash mismatch with {peer_ip}: Us/Them {our_version.get('hash')}/{peer_version.get('hash')}")
                     
                     # Determine sync need based on logical clocks only
                     if peer_clock > our_clock:
@@ -298,9 +296,13 @@ class DatabaseSynchronizer:
         
         # Extract peer information
         peer_version = message.get('version')
+        CLK = peer_version.get("logical_clock", 0)
+        TS = peer_version.get("timestamp", 0)[-10:]
+        NODE = peer_version.get("node_id", 0)[-12:]
+
         peer_sync_port = message.get('sync_port', self.network.sync_port)
         
-        logger.info(f"Received UPDATE notification from {peer_ip}:{peer_sync_port} with version {peer_version}")
+        logger.info(f"UPDATE {peer_ip}:{peer_sync_port} CLK {CLK} {TS} {NODE}")
         
         # Update peer information in our peer list (do this before any early returns)
         with self.lock:
@@ -311,7 +313,7 @@ class DatabaseSynchronizer:
         peer_clock = peer_version.get("logical_clock", 0)
         our_clock = our_version.get("logical_clock", 0)
         
-        logger.info(f"Comparing versions - Peer logical clock: {peer_clock} / Ours: {our_clock}")
+        logger.info(f"Comparing: Us/Them {our_clock}/{peer_clock}")
         
         # First check if the version hashes are identical - no need to sync in that case
         if peer_version.get('hash') == our_version.get('hash'):
@@ -365,6 +367,11 @@ class DatabaseSynchronizer:
         # Get peer's logical clock for comparison
         peer_version = message.get('version', {})
         peer_clock = peer_version.get('logical_clock', 0)
+        
+        # NOTE: Following Lamport Clock specification, we do NOT increment the logical clock 
+        # when handling sync requests (reads). The clock is only incremented for:
+        # 1. Local database updates
+        # 2. Sending control messages
         
         # Get a count of all changes in our change log
         total_changes = 0
@@ -941,42 +948,53 @@ class DatabaseSynchronizer:
             return 0
     
     def _request_sync(self, peer_ip, peer_sync_port):
-        """Request database sync from a peer
+        """Request synchronization with a peer
         
         Args:
             peer_ip: IP address of the peer
             peer_sync_port: Sync port of the peer
         """
-        logger.info(f"Requesting sync from peer {peer_ip}:{peer_sync_port}")
-        
-        # Create backup of current database state
-        backup_path = self._backup_database()
-        if not backup_path:
-            logger.error("Failed to create database backup, aborting sync")
-            return
+        logger.info(f"Requesting sync with {peer_ip}:{peer_sync_port}")
         
         try:
             # Connect to peer
-            logger.debug(f"Attempting to connect to peer at {peer_ip}:{peer_sync_port}")
             s = self.network.connect_to_peer(peer_ip, peer_sync_port)
             if not s:
                 logger.error(f"Failed to connect to peer {peer_ip}:{peer_sync_port}")
                 return
-            
-            logger.info(f"Successfully connected to peer {peer_ip}:{peer_sync_port}")
-            
-            # Set socket timeout
+                
             s.settimeout(self.socket_timeout)
             
-            # Get our version information with logical clock
-            version = self.change_tracker.get_db_version()
-            logical_clock = version.get('logical_clock', 0)
-            node_id = version.get('node_id')
-            timestamp = version.get('timestamp', '1970-01-01T00:00:00Z')
-            
-            # First try with logical clock (newer protocol)
+            # Get last_clock for sync request
             try:
-                # Send sync request with logical clock
+                with self.db_manager.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT MAX(logical_clock) FROM change_log")
+                    row = cursor.fetchone()
+                    logical_clock = row[0] if row and row[0] is not None else 0
+                    
+                    # Get our current version
+                    version = self.change_tracker.get_db_version(conn=conn)
+                    timestamp = version.get('timestamp')
+                    node_id = version.get('node_id')
+                    
+                    # Increment logical clock for this control message
+                    logical_clock = self.change_tracker.increment_logical_clock(conn=conn)
+                    if logical_clock is None:
+                        logical_clock = 0
+                    
+                    # Get our updated version
+                    version = self.change_tracker.get_db_version(conn=conn)
+            except Exception as e:
+                logger.error(f"Error getting last clock for sync request: {e}")
+                logical_clock = 0
+                timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+                node_id = self.change_tracker.node_id
+                version = self.change_tracker.get_db_version()
+            
+            # Try logical clock-based sync first
+            try:
+                # Create and send sync request with logical clock
                 request = self.protocol.create_sync_request(
                     version,
                     logical_clock,
@@ -1388,15 +1406,21 @@ class DatabaseSynchronizer:
             logger.warning(f"Failed to remove database backup {backup_path}: {e}")
     
     def _initial_peer_discovery(self):
-        """Discover peers and request a full database if needed"""
-        logger.info("Starting initial peer discovery")
+        """Send initial discovery message to find peers"""
+        # Increment logical clock for this control message
+        self.change_tracker.increment_logical_clock()
         
-        # Send discovery message
+        # Get current database version
+        version = self.change_tracker.get_db_version()
+        
+        # Create and broadcast discovery message
         discovery_message = self.protocol.create_discovery_message(
-            self.change_tracker.get_db_version(),
+            version, 
             self.network.sync_port
         )
         self.network.send_broadcast(discovery_message)
+        
+        logger.info("Sent initial peer discovery broadcast")
         
         # Wait for responses
         discovery_time = 5  # seconds
@@ -1454,26 +1478,30 @@ class DatabaseSynchronizer:
             logger.info("No peers with newer database version found")
     
     def _heartbeat_sender(self):
-        """Send periodic heartbeat messages"""
-        logger.info("Starting heartbeat sender")
+        """Background thread to send heartbeat messages"""
+        logger.info("Starting heartbeat sender thread")
         
         while self.running:
             try:
-                # Get current version
+                # Increment logical clock for this control message
+                self.change_tracker.increment_logical_clock()
+                
+                # Get current database version
                 version = self.change_tracker.get_db_version()
                 
-                # Create and send heartbeat message
+                # Create and broadcast heartbeat message
                 heartbeat_message = self.protocol.create_heartbeat_message(
-                    version,
+                    version, 
                     self.network.sync_port
                 )
                 self.network.send_broadcast(heartbeat_message)
                 
-                # Sleep for a while
-                time.sleep(10)
+                logger.debug("Sent heartbeat broadcast")
             except Exception as e:
-                if self.running:  # Only log if we're still supposed to be running
-                    logger.error(f"Heartbeat sender error: {e}")
+                logger.error(f"Error sending heartbeat: {e}")
+            
+            # Sleep until next heartbeat
+            time.sleep(60)  # Send heartbeat every minute
     
     def _cleanup_peers(self):
         """Remove peers that haven't been seen recently"""

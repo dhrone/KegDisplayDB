@@ -1,0 +1,22 @@
+Event,Instructions
+Receive broadcast; incomingClock > localClock,"1. localClock = max(localClock, incomingClock) + 1
+2. version_table.clock = localClock
+3. Initiate sync: send sync-request with lastSeen = highestAppliedClock"
+Receive broadcast; incomingClock = localClock & state-hash differs,"1. localClock += 1
+2. version_table.clock = localClock
+3. Tie-break (e.g. compare node IDs):
+   • If you lose, initiate sync
+   • If you win, ignore"
+Receive broadcast; incomingClock = localClock & state-hash equals,"1. localClock += 1
+2. version_table.clock = localClock
+3. No further action (you’re in sync)"
+Receive broadcast; incomingClock < localClock,"1. localClock += 1
+2. version_table.clock = localClock
+3. Ignore (you’re ahead)"
+Receive sync response (batch of change-log entries),"For each record (op, t, origin) in clock-ordered stream:
+1. If unseen:
+   a. localClock = max(localClock, t) + 1
+   b. version_table.clock = localClock
+   c. db.apply(op)
+   d. change_log.insert({op, t, origin})
+2. Otherwise skip"

@@ -394,6 +394,12 @@ class ChangeTracker:
             table_name: Name of the table that changed
             operation: Operation type (INSERT, UPDATE, DELETE)
             row_id: ID of the row that changed
+            
+        Note:
+            This implements the Lamport Clock protocol for local DB updates as specified:
+            1. Increment the logical clock (localClock += 1)
+            2. Log the change with the new clock value
+            3. Update the version table with the new clock value
         """
         try:
             with self.db_manager.get_connection() as conn:

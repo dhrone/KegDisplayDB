@@ -1,0 +1,19 @@
+Event,Instructions
+Local DB update (single CRUD or bulk import),"1. For each operation:
+   a. localClock += 1
+   b. db.apply(operation)
+   c. change_log.insert({operation, clock: localClock})
+   d. version_table.clock = localClock
+2. After bulk import, send one broadcast with the final localClock"
+"Send control message (heartbeat, discovery, or sync-request)","1. localClock += 1
+2. version_table.clock = localClock
+3. sendMessage(type, clock=localClock)"
+"Receive sync request (peer’s lastSeen, optional stateHash)","• Let localMax = version_table.clock
+• If lastSeen < localMax:
+   • SELECT * FROM change_log WHERE clock > :lastSeen ORDER BY clock ASC, originNodeId ASC
+   • Send each row
+• Else if lastSeen == localMax and hashes differ:
+   • Send full change_log or a DB snapshot + “reset-clock” marker
+• Else:
+   • Reply empty/204
+• No clock bump on these reads"
