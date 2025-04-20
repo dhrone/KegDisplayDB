@@ -330,7 +330,7 @@ class DatabaseManager:
         except:
             pass
     
-    def query(self, sql, params=(), fetch_all=False, row_factory=None, conn=None):
+    def query(self, sql, params=(), fetch_all=False, row_factory=None, conn=None, max_retries=5, retry_delay=0.1):
         """Execute a query and return results
         
         Args:
@@ -339,6 +339,8 @@ class DatabaseManager:
             fetch_all: Whether to fetch all results or just one
             row_factory: Optional row factory to use for result rows
             conn: Optional database connection to use (to avoid nested transactions)
+            max_retries: Maximum number of retry attempts for transient errors
+            retry_delay: Initial delay between retries in seconds (doubles on each retry)
             
         Returns:
             Result of the query execution
@@ -347,45 +349,90 @@ class DatabaseManager:
         should_commit = conn is None and not is_read_query
         conn_context = None
         
-        try:
-            # Get a connection if none was provided
-            if conn is None:
+        # Transient errors that can be retried
+        RETRYABLE_ERRORS = (
+            sqlite3.OperationalError,  # Lock timeout, database is locked, etc.
+            sqlite3.BusyError,         # Database is busy
+            sqlite3.DatabaseError      # Generic database error
+        )
+        
+        retries = 0
+        current_delay = retry_delay
+        last_error = None
+        
+        while retries <= max_retries:
+            try:
+                # Get a connection if none was provided
+                if conn is None:
+                    if is_read_query:
+                        # Use read connection for SELECT/PRAGMA
+                        conn_context = self.get_read_connection()
+                    else:
+                        # Use transaction for writes
+                        conn_context = self.transaction()
+                    
+                    conn = conn_context.__enter__()
+                    
+                if row_factory:
+                    conn.row_factory = row_factory
+                cursor = conn.cursor()
+                cursor.execute(sql, params)
+                
                 if is_read_query:
-                    # Use read connection for SELECT/PRAGMA
-                    conn_context = self.get_read_connection()
+                    if fetch_all:
+                        return cursor.fetchall()
+                    else:
+                        return cursor.fetchone()
                 else:
-                    # Use transaction for writes
-                    conn_context = self.transaction()
+                    # Only commit if we created our own connection
+                    if should_commit:
+                        conn.commit()
+                    return cursor.lastrowid if cursor.lastrowid else cursor.rowcount
+                    
+            except RETRYABLE_ERRORS as e:
+                last_error = e
+                error_message = str(e).lower()
                 
-                conn = conn_context.__enter__()
+                # Check if this is a retryable error
+                if ("database is locked" in error_message or 
+                    "busy" in error_message or 
+                    "timeout" in error_message):
+                    
+                    retries += 1
+                    if retries <= max_retries:
+                        logger.warning(f"Database error on attempt {retries}/{max_retries}, retrying in {current_delay:.2f}s: {e}")
+                        
+                        # Clean up connection if we created it
+                        if conn_context:
+                            conn_context.__exit__(type(e), e, None)
+                            conn_context = None
+                        
+                        # Wait before retrying, with exponential backoff
+                        time.sleep(current_delay)
+                        current_delay *= 2  # Exponential backoff
+                        continue
                 
-            if row_factory:
-                conn.row_factory = row_factory
-            cursor = conn.cursor()
-            cursor.execute(sql, params)
-            
-            if is_read_query:
-                if fetch_all:
-                    return cursor.fetchall()
-                else:
-                    return cursor.fetchone()
-            else:
-                # Only commit if we created our own connection
-                if should_commit:
-                    conn.commit()
-                return cursor.lastrowid if cursor.lastrowid else cursor.rowcount
+                # Not a retryable error or max retries exceeded
+                if should_commit and conn:
+                    conn.rollback()
+                logger.error(f"Error executing query (attempt {retries}/{max_retries}): {sql[:100]}..., {e}")
+                raise
                 
-        except Exception as e:
-            # Only rollback if we created our own connection
-            if should_commit and conn:
-                conn.rollback()
-            logger.error(f"Error executing query: {sql[:100]}..., {e}")
-            raise
-            
-        finally:
-            # Clean up our connection if we created it
-            if conn_context:
-                conn_context.__exit__(None, None, None)
+            except Exception as e:
+                # Only rollback if we created our own connection
+                if should_commit and conn:
+                    conn.rollback()
+                logger.error(f"Error executing query: {sql[:100]}..., {e}")
+                raise
+                
+            finally:
+                # Clean up our connection if we created it
+                if conn_context:
+                    conn_context.__exit__(None, None, None)
+                    
+        # If we get here, we've exceeded max retries
+        logger.error(f"Query failed after {max_retries} retries: {sql[:100]}...")
+        raise last_error
     
     # ---- Beer Management Methods ----
     
