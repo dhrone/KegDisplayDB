@@ -33,7 +33,10 @@ class SyncedDatabase:
             sync_port: Port for TCP sync connections
             test_mode: Whether to operate in test mode (bypassing actual network operations)
         """
-        self.db_manager = DatabaseManager(db_path)
+        # Using a minimal connection pool size of 1 to prevent SQLite database locking issues.
+        # SQLite has limitations when multiple connections try to write simultaneously,
+        # and larger connection pools can lead to "database is locked" errors.
+        self.db_manager = DatabaseManager(db_path, pool_size=1)  # Reduced pool size to minimize lock contention
         self.change_tracker = ChangeTracker(self.db_manager)
         self.test_mode = test_mode
         self.test_peers = []
