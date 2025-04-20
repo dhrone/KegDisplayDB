@@ -290,10 +290,15 @@ class DatabaseSynchronizer:
             message: Parsed message
             addr: Address the message came from
         """
+        start_time = time.time()
+        logger.info(f"ENTRY _handle_heartbeat from {addr[0]}")
+        
         peer_ip = addr[0]
         
         # Skip messages from our own IPs
         if peer_ip in self.network.local_ips:
+            elapsed = time.time() - start_time
+            logger.info(f"EXIT _handle_heartbeat (own IP, skipped) - elapsed: {elapsed:.3f}s")
             return
         
         # Extract peer information
@@ -367,9 +372,14 @@ class DatabaseSynchronizer:
             # Network operations moved outside transaction block
             if should_sync:
                 self._request_sync(peer_ip, peer_sync_port)
+            
+            elapsed = time.time() - start_time
+            logger.info(f"EXIT _handle_heartbeat from {addr[0]}, should_sync={should_sync} - elapsed: {elapsed:.3f}s")
                 
         except Exception as e:
-            logger.error(f"Error handling heartbeat message: {e}")
+            elapsed = time.time() - start_time
+            logger.error(f"Error handling heartbeat message: {e} - elapsed: {elapsed:.3f}s")
+            logger.info(f"EXIT _handle_heartbeat from {addr[0]} with error - elapsed: {elapsed:.3f}s")
     
     def _handle_update(self, message, addr):
         """Handle update notification messages
@@ -1515,6 +1525,9 @@ class DatabaseSynchronizer:
     
     def _initial_peer_discovery(self):
         """Send initial discovery message to find peers"""
+        start_time = time.time()
+        logger.info(f"ENTRY _initial_peer_discovery")
+        
         try:
             # Use a transaction for database operations
             with self.db_manager.transaction() as conn:
@@ -1585,11 +1598,20 @@ class DatabaseSynchronizer:
             
             if latest_peer:
                 logger.info(f"Found peer with latest version: {latest_peer}, requesting full database")
+                db_request_start = time.time()
                 self._request_full_database(latest_peer, latest_port)
+                db_request_elapsed = time.time() - db_request_start
+                logger.info(f"Full database request completed in {db_request_elapsed:.3f}s")
             else:
                 logger.info("No peers with newer database version found")
+                
+            elapsed = time.time() - start_time
+            logger.info(f"EXIT _initial_peer_discovery - total peers: {len(self.peers)}, found latest peer: {latest_peer is not None}, elapsed: {elapsed:.3f}s")
+                
         except Exception as e:
-            logger.error(f"Error in initial peer discovery: {e}")
+            elapsed = time.time() - start_time
+            logger.error(f"Error in initial peer discovery: {e} - elapsed: {elapsed:.3f}s")
+            logger.info(f"EXIT _initial_peer_discovery with error - elapsed: {elapsed:.3f}s")
     
     def _heartbeat_sender(self):
         """Background thread to send heartbeat messages"""
