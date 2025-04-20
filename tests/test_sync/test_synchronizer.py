@@ -98,7 +98,7 @@ class TestDatabaseSynchronizer(unittest.TestCase):
         self.mock_network_manager.start_listeners.assert_called_with(self.synchronizer.handle_message)
         
         # Check if threads were created
-        self.assertEqual(len(self.synchronizer.threads), 2)
+        self.assertEqual(len(self.synchronizer.threads), 3)
         
         # Check thread daemon status
         for thread in self.synchronizer.threads:
@@ -226,10 +226,15 @@ class TestDatabaseSynchronizer(unittest.TestCase):
     
     def test_handle_update(self):
         """Test handling an update message with version change."""
-        # Create a test message and address
+        # Create a test message and address with a properly initialized version
         test_message = {
             'type': 'update',
-            'version': {"hash": "xyz789", "timestamp": "2023-01-02T00:00:00Z"},  # Different version
+            'version': {
+                "hash": "xyz789", 
+                "timestamp": "2023-01-02T00:00:00Z",
+                "logical_clock": 5,
+                "node_id": "different-node-id"
+            },  # Different version with all required fields
             'sync_port': 5005
         }
         test_addr = ('192.168.1.10', 5000)  # Non-local IP

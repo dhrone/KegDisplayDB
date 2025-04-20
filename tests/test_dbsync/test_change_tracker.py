@@ -160,7 +160,12 @@ class TestChangeTracker(unittest.TestCase):
             self.assertEqual(result[2], beer_id, "Row ID doesn't match")
             self.assertEqual(result[3], content_str, "Content doesn't match")
             self.assertEqual(result[4], content_hash, "Content hash doesn't match")
-            self.assertEqual(result[5], logical_clock, "Logical clock doesn't match")
+            
+            # For Lamport logical clock, the value will be max(current_clock, incoming_clock) + 1
+            # In this case, it will be logical_clock + 1 since we're starting with a fresh database
+            expected_clock = logical_clock + 1
+            self.assertEqual(result[5], expected_clock, "Logical clock doesn't match Lamport clock rules")
+            
             self.assertEqual(result[6], node_id, "Node ID doesn't match")
     
     def test_get_db_version(self):

@@ -361,9 +361,7 @@ class DatabaseManager:
                 
             if row_factory:
                 conn.row_factory = row_factory
-            ro = self.is_read_only(conn)
             cursor = conn.cursor()
-            ro = self.is_read_only(conn)
             cursor.execute(sql, params)
             
             if is_read_query:
@@ -1252,7 +1250,26 @@ class DatabaseManager:
             logger.error(f"Error calculating content hash: {e}")
             return "0"  # Fallback hash 
         
-    def is_read_only(self,conn):
-        cursor = conn.execute('PRAGMA query_only;')
-        status = cursor.fetchone()[0]
-        return status == 1
+    def is_read_only(self, conn):
+        """Check if a connection is in read-only mode
+        
+        Args:
+            conn: Database connection to check
+            
+        Returns:
+            bool: True if connection is read-only, False otherwise
+        """
+        try:
+            cursor = conn.execute('PRAGMA query_only;')
+            result = cursor.fetchone()
+            
+            # Check if result is valid and has a value
+            if result and len(result) > 0:
+                return result[0] == 1
+            
+            # Default to False if no result
+            return False
+        except Exception as e:
+            # Log the error and default to False
+            logger.warning(f"Error checking read-only status: {e}")
+            return False
