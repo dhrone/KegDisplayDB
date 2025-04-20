@@ -193,45 +193,71 @@ class SyncedDatabase:
                 
         return success
     
-    def delete_beer(self, beer_id, notify=True):
+    def delete_beer(self, beer_id, notify=True, conn=None):
         """
         Delete a beer from the database
         
         Args:
             beer_id: ID of the beer to delete
             notify: Whether to notify peers about this change (default: True)
+            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             bool: Success or failure
         """
-        # First check for taps using this beer
-        taps_with_beer = self.get_tap_with_beer(beer_id)
-        
-        # Update those taps first
-        for tap_id in taps_with_beer:
-            self.update_tap(tap_id, None, notify=False)
-        
-        # Now delete the beer
-        success = self.db_manager.delete_beer(beer_id)
-        if success:
-            self.change_tracker.log_change("beers", "DELETE", beer_id)
-            
-            if notify:
-                self.notify_update()
+        try:
+            # If no connection provided, use a transaction
+            with self.db_manager.transaction() as transaction_conn:
+                conn = transaction_conn if conn is None else conn
                 
-        return success
+                # First check for taps using this beer
+                taps_with_beer = self.get_tap_with_beer(beer_id, conn=conn)
+                
+                # Update those taps first
+                for tap_id in taps_with_beer:
+                    self.update_tap(tap_id, None, notify=False, conn=conn)
+                
+                # Now delete the beer
+                success = self.db_manager.delete_beer(beer_id, conn=conn)
+                if success:
+                    self.change_tracker.log_change("beers", "DELETE", beer_id, conn=conn)
+                    
+                    if notify:
+                        self.notify_update()
+                        
+                return success
+        except Exception as e:
+            logger.error(f"Error deleting beer {beer_id}: {e}")
+            return False
     
-    def get_beer(self, beer_id):
-        """Get a beer by ID"""
-        return self.db_manager.get_beer(beer_id)
+    def get_beer(self, beer_id, conn=None):
+        """
+        Get a beer by ID
+        
+        Args:
+            beer_id: ID of the beer to retrieve
+            conn: Optional database connection to use (to avoid nested transactions)
+            
+        Returns:
+            Beer data dictionary or None if not found
+        """
+        return self.db_manager.get_beer(beer_id, conn=conn)
     
-    def get_all_beers(self):
-        """Get all beers from the database"""
-        return self.db_manager.get_all_beers()
+    def get_all_beers(self, conn=None):
+        """
+        Get all beers from the database
+        
+        Args:
+            conn: Optional database connection to use (to avoid nested transactions)
+            
+        Returns:
+            List of beer dictionaries
+        """
+        return self.db_manager.get_all_beers(conn=conn)
     
     # ---- Tap Management Methods ----
     
-    def add_tap(self, tap_id=None, beer_id=None, notify=True):
+    def add_tap(self, tap_id=None, beer_id=None, notify=True, conn=None):
         """
         Add a new tap to the database
         
@@ -239,20 +265,21 @@ class SyncedDatabase:
             tap_id: Optional tap ID (auto-assigned if not provided)
             beer_id: Optional beer ID to assign to this tap
             notify: Whether to notify peers about this change (default: True)
+            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             int: ID of the new tap
         """
-        tap_id = self.db_manager.add_tap(tap_id, beer_id)
+        tap_id = self.db_manager.add_tap(tap_id, beer_id, conn=conn)
         if tap_id:
-            self.change_tracker.log_change("taps", "INSERT", tap_id)
+            self.change_tracker.log_change("taps", "INSERT", tap_id, conn=conn)
             
             if notify:
                 self.notify_update()
                 
         return tap_id
     
-    def update_tap(self, tap_id, beer_id, notify=True):
+    def update_tap(self, tap_id, beer_id, notify=True, conn=None):
         """
         Update a tap's beer assignment
         
@@ -260,50 +287,78 @@ class SyncedDatabase:
             tap_id: ID of the tap to update
             beer_id: ID of beer to assign (or None to clear)
             notify: Whether to notify peers about this change (default: True)
+            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             bool: Success or failure
         """
-        success = self.db_manager.update_tap(tap_id, beer_id)
+        success = self.db_manager.update_tap(tap_id, beer_id, conn=conn)
         if success:
-            self.change_tracker.log_change("taps", "UPDATE", tap_id)
+            self.change_tracker.log_change("taps", "UPDATE", tap_id, conn=conn)
             
             if notify:
                 self.notify_update()
                 
         return success
     
-    def delete_tap(self, tap_id, notify=True):
+    def delete_tap(self, tap_id, notify=True, conn=None):
         """
         Delete a tap from the database
         
         Args:
             tap_id: ID of the tap to delete
             notify: Whether to notify peers about this change (default: True)
+            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             bool: Success or failure
         """
-        success = self.db_manager.delete_tap(tap_id)
+        success = self.db_manager.delete_tap(tap_id, conn=conn)
         if success:
-            self.change_tracker.log_change("taps", "DELETE", tap_id)
+            self.change_tracker.log_change("taps", "DELETE", tap_id, conn=conn)
             
             if notify:
                 self.notify_update()
                 
         return success
     
-    def get_tap(self, tap_id):
-        """Get a tap by ID"""
-        return self.db_manager.get_tap(tap_id)
+    def get_tap(self, tap_id, conn=None):
+        """
+        Get a tap by ID
+        
+        Args:
+            tap_id: ID of the tap to retrieve
+            conn: Optional database connection to use (to avoid nested transactions)
+            
+        Returns:
+            Tap data dictionary or None if not found
+        """
+        return self.db_manager.get_tap(tap_id, conn=conn)
     
-    def get_all_taps(self):
-        """Get all taps with their beer information"""
-        return self.db_manager.get_all_taps()
+    def get_all_taps(self, conn=None):
+        """
+        Get all taps with their beer information
+        
+        Args:
+            conn: Optional database connection to use (to avoid nested transactions)
+            
+        Returns:
+            List of tap dictionaries
+        """
+        return self.db_manager.get_all_taps(conn=conn)
     
-    def get_tap_with_beer(self, beer_id):
-        """Find taps that have a specific beer"""
-        return self.db_manager.get_tap_with_beer(beer_id)
+    def get_tap_with_beer(self, beer_id, conn=None):
+        """
+        Find taps that have a specific beer
+        
+        Args:
+            beer_id: ID of the beer to find in taps
+            conn: Optional database connection to use (to avoid nested transactions)
+            
+        Returns:
+            List of tap IDs that have the specified beer
+        """
+        return self.db_manager.get_tap_with_beer(beer_id, conn=conn)
     
     # ---- Bulk Operations ----
     
@@ -349,16 +404,12 @@ class SyncedDatabase:
         BATCH_SIZE = 100
         
         # Start a transaction for the entire import
-        with self.db_manager.get_connection() as conn:
-            try:
-                # Begin transaction
-                conn.execute('BEGIN TRANSACTION')
-                
+        try:
+            with self.db_manager.transaction() as conn:
                 # Clear all existing beers
-                cleared = self.db_manager.clear_beer(conn)
+                cleared = self.db_manager.clear_beer(conn=conn)
                 if not cleared:
                     logger.error("Failed to clear beer table")
-                    conn.rollback()
                     return (0, ["Failed to clear beer table"])
                 
                 # Process beers in batches
@@ -399,84 +450,23 @@ class SyncedDatabase:
                     # Update total success count
                     success_count += batch_success_count
                 
-                # Complete the transaction if we have successful imports
+                # If we have successful imports, log the change
                 if success_count > 0:
-                    # Commit all changes first
-                    conn.commit()
-                    logger.info(f"Successfully imported {success_count} beers")
-                    
-                    # Log the change after committing the transaction
-                    self.change_tracker.log_change("version", "IMPORT", 1)
+                    # Log the change
+                    self.change_tracker.log_change("version", "IMPORT", 1, conn=conn)
                     
                     # Notify peers about the import
                     self.notify_update()
-                else:
-                    # No successful imports, roll back
-                    logger.warning("No beers were successfully imported, rolling back")
-                    conn.rollback()
             
-            except Exception as e:
-                # Handle any unexpected errors
-                conn.rollback()
-                logger.error(f"Error during beer import: {str(e)}")
-                errors.append(f"Transaction error: {str(e)}")
+            logger.info(f"Successfully imported {success_count} beers")
+            
+        except Exception as e:
+            # Handle any unexpected errors
+            logger.error(f"Error during beer import: {str(e)}")
+            errors.append(f"Transaction error: {str(e)}")
         
         return (success_count, errors)
     
-    def notify_update_with_connection(self, conn):
-        """Notify other instances that a change has been made, using an existing connection
-        
-        Args:
-            conn: Database connection to use
-        """
-        try:
-            if self.test_mode:
-                # In test mode, directly sync with test peers
-                for peer in self.test_peers:
-                    try:
-                        if peer != self and hasattr(peer, 'synchronizer') and peer.synchronizer:
-                            # Only sync with peer if both have synchronizers
-                            if hasattr(self, 'synchronizer') and self.synchronizer:
-                                self.synchronizer._sync_with_peer(peer, conn)
-                    except Exception as e:
-                        logger.error(f"Error syncing with test peer: {e}")
-            else:
-                # Use synchronizer to broadcast update if available
-                if hasattr(self, 'synchronizer') and self.synchronizer:
-                    try:
-                        # Give a short timeout for network operations
-                        notify_thread = threading.Thread(
-                            target=lambda: self._notify_update_with_timeout(conn),
-                            daemon=True
-                        )
-                        notify_thread.start()
-                        notify_thread.join(timeout=2.0)  # Wait up to 2 seconds
-                        
-                        # Log success
-                        logger.info("Update notification broadcast complete or timed out")
-                    except Exception as e:
-                        logger.error(f"Error starting notification thread: {e}")
-                else:
-                    logger.warning("Notification skipped: no synchronizer available")
-        except Exception as e:
-            logger.error(f"Error in notify_update_with_connection: {e}")
-            
-    def _notify_update_with_timeout(self, conn=None):
-        """Execute the notification with timeout protection
-        
-        Args:
-            conn: Optional database connection to use
-        """
-        try:
-            # Use synchronizer to broadcast update
-            if conn is not None and hasattr(self.synchronizer, 'notify_update_with_connection'):
-                self.synchronizer.notify_update_with_connection(conn)
-            else:
-                self.synchronizer.notify_update()
-        except socket.error as e:
-            logger.error(f"Network error during notification: {e}")
-        except Exception as e:
-            logger.error(f"Error in notification thread: {e}")
     
     def clear_all_beers(self):
         """
@@ -490,30 +480,24 @@ class SyncedDatabase:
         beer_count = len(beers)
         
         if beer_count > 0:
-            with self.db_manager.get_connection() as conn:
-                # Begin transaction
-                conn.execute('BEGIN TRANSACTION')
-                
-                try:
+            try:
+                with self.db_manager.transaction() as conn:
                     # Clear all taps first to avoid foreign key issues
-                    self.db_manager.clear_tap(conn)
+                    self.db_manager.clear_tap(conn=conn)
                     
                     # Then clear all beers
-                    self.db_manager.clear_beer(conn)
+                    self.db_manager.clear_beer(conn=conn)
                     
-                    # Commit transaction first
-                    conn.commit()
-                    
-                    # Log the change after commit
-                    self.change_tracker.log_change("version", "CLEAR", 1)
-                    
-                    # Send notification
-                    self.notify_update()
-                except Exception as e:
-                    # Rollback in case of error
-                    conn.rollback()
-                    logger.error(f"Error clearing beers: {e}")
-                    return 0
+                    # Log the change
+                    self.change_tracker.log_change("version", "CLEAR", 1, conn=conn)
+                
+                # Send notification after transaction is committed
+                self.notify_update()
+                return beer_count
+                
+            except Exception as e:
+                logger.error(f"Error clearing beers: {e}")
+                return 0
         
         return beer_count
     
@@ -530,24 +514,33 @@ class SyncedDatabase:
         if not isinstance(count, int) or count < 1:
             return False
             
-        # Get current taps
-        existing_taps = self.get_all_taps()
-        current_count = len(existing_taps)
-        
-        # If decreasing, delete excess taps
-        if count < current_count:
-            # Delete taps from highest number to lowest
-            for i in range(current_count, count, -1):
-                tap_id = i
-                self.delete_tap(tap_id, notify=False)
-        
-        # If increasing, add new taps
-        elif count > current_count:
-            # Add new taps with sequential IDs
-            for i in range(current_count + 1, count + 1):
-                tap_id = i
-                self.add_tap(tap_id, None, notify=False)
-        
-        # Send a single notification after all changes
-        self.notify_update()
-        return True 
+        try:
+            with self.db_manager.transaction() as conn:
+                # Get current taps
+                existing_taps = self.get_all_taps(conn=conn)
+                current_count = len(existing_taps)
+                
+                # If decreasing, delete excess taps
+                if count < current_count:
+                    # Delete taps from highest number to lowest
+                    for i in range(current_count, count, -1):
+                        tap_id = i
+                        self.delete_tap(tap_id, notify=False, conn=conn)
+                
+                # If increasing, add new taps
+                elif count > current_count:
+                    # Add new taps with sequential IDs
+                    for i in range(current_count + 1, count + 1):
+                        tap_id = i
+                        self.add_tap(tap_id, None, notify=False, conn=conn)
+                
+                # Log the change
+                self.change_tracker.log_change("version", "TAP_COUNT", count, conn=conn)
+            
+            # Send a single notification after all changes
+            self.notify_update()
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error setting tap count: {e}")
+            return False 
