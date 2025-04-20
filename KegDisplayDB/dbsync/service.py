@@ -55,6 +55,7 @@ class DBSyncService:
         """
         self.running = False
         self.exit_requested = False
+        self.exit_event = threading.Event()
         
         # Set default database path if not provided
         if db_path is None:
@@ -71,9 +72,17 @@ class DBSyncService:
         self.broadcast_port = broadcast_port
         self.sync_port = sync_port
         
+        # Validate ports
+        if not isinstance(broadcast_port, int) or broadcast_port <= 0 or broadcast_port > 65535:
+            raise ValueError(f"Invalid broadcast port: {broadcast_port}")
+        if not isinstance(sync_port, int) or sync_port <= 0 or sync_port > 65535:
+            raise ValueError(f"Invalid sync port: {sync_port}")
+        
         # Initialize SyncedDatabase
         self.db = None
-        self.db_manager = None
+        
+        # Initialize status monitoring thread
+        self.status_thread = None
         
     def start(self):
         """Start the database sync service"""
@@ -81,12 +90,9 @@ class DBSyncService:
             logger.warning("Service is already running")
             return
             
-        logger.info("Starting database sync service in client mode")
+        logger.info("Starting database sync service")
         
         try:
-            # Initialize the database and managers
-            self.db_manager = DatabaseManager(self.db_path)
-            
             # Initialize the SyncedDatabase instance for synchronization
             self.db = SyncedDatabase(
                 db_path=self.db_path,
@@ -102,23 +108,53 @@ class DBSyncService:
             
             self.running = True
             
-            # Print some status information
+            # Print initial status information
             self._print_status()
             
+            # Start status monitoring thread
+            self.exit_event.clear()
+            self.status_thread = threading.Thread(target=self._status_monitor, daemon=True)
+            self.status_thread.start()
+            
             # Keep the service running until exit is requested
-            while not self.exit_requested:
-                time.sleep(5)  # Check for exit every 5 seconds
+            logger.info("Service started successfully")
+            while not self.exit_requested and not self.exit_event.is_set():
+                self.exit_event.wait(5)  # Wait for exit event with timeout
                 
         except Exception as e:
             logger.error(f"Error in sync service: {e}", exc_info=True)
             self.stop()
     
+    def _status_monitor(self):
+        """Periodically monitor and report service status"""
+        while self.running and not self.exit_event.is_set():
+            try:
+                self._print_status()
+            except Exception as e:
+                logger.error(f"Error in status monitoring: {e}")
+            
+            # Wait for 60 seconds or until exit is requested
+            if self.exit_event.wait(60):
+                break
+    
     def _print_status(self):
         """Print status information about the database"""
         try:
+            if not self.db:
+                logger.warning("No database connection available")
+                return
+                
             beers_count = len(self.db.get_all_beers())
             taps_count = len(self.db.get_all_taps())
+            peers = self.db.get_peers() if hasattr(self.db, 'get_peers') else []
+            
             logger.info(f"Database contains {beers_count} beers and {taps_count} taps")
+            logger.info(f"Connected peers: {len(peers)}")
+            
+            # Add more detailed status information if available
+            if hasattr(self.db, 'get_sync_status'):
+                sync_status = self.db.get_sync_status()
+                logger.info(f"Sync status: {sync_status}")
         except Exception as e:
             logger.error(f"Error getting database status: {e}")
     
@@ -126,10 +162,23 @@ class DBSyncService:
         """Stop the database sync service"""
         logger.info("Stopping database sync service")
         self.exit_requested = True
+        self.exit_event.set()
         
+        # Gracefully stop the status thread if it's running
+        if self.status_thread and self.status_thread.is_alive():
+            try:
+                self.status_thread.join(timeout=2)
+            except Exception as e:
+                logger.warning(f"Error stopping status thread: {e}")
+        
+        # Gracefully stop the database connection
         if self.db:
-            self.db.stop()
-            self.db = None
+            try:
+                self.db.stop()
+            except Exception as e:
+                logger.error(f"Error stopping SyncedDatabase: {e}")
+            finally:
+                self.db = None
             
         self.running = False
         logger.info("Database sync service stopped")
@@ -175,14 +224,18 @@ def main():
     
     # Create and start the service
     global service
-    service = DBSyncService(
-        db_path=args.db_path,
-        primary_ip=args.primary_ip,
-        broadcast_port=args.broadcast_port,
-        sync_port=args.sync_port
-    )
-    
-    service.start()
+    try:
+        service = DBSyncService(
+            db_path=args.db_path,
+            primary_ip=args.primary_ip,
+            broadcast_port=args.broadcast_port,
+            sync_port=args.sync_port
+        )
+        
+        service.start()
+    except Exception as e:
+        logger.critical(f"Failed to start service: {e}", exc_info=True)
+        sys.exit(1)
 
 if __name__ == "__main__":
     service = None
