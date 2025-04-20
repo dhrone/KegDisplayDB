@@ -192,10 +192,15 @@ class DatabaseSynchronizer:
             message: Parsed message
             addr: Address the message came from
         """
+        start_time = time.time()
+        logger.info(f"ENTRY _handle_discovery from {addr[0]}")
+        
         peer_ip = addr[0]
         
         # Skip messages from our own IPs
         if peer_ip in self.network.local_ips:
+            elapsed = time.time() - start_time
+            logger.info(f"EXIT _handle_discovery (own IP, skipped) - elapsed: {elapsed:.3f}s")
             return
         
         # Extract peer information
@@ -270,8 +275,13 @@ class DatabaseSynchronizer:
             if should_sync:
                 self._request_sync(peer_ip, peer_sync_port)
                 
+            elapsed = time.time() - start_time
+            logger.info(f"EXIT _handle_discovery from {addr[0]}, should_sync={should_sync} - elapsed: {elapsed:.3f}s")
+                
         except Exception as e:
-            logger.error(f"Error handling discovery message: {e}")
+            elapsed = time.time() - start_time
+            logger.error(f"Error handling discovery message: {e} - elapsed: {elapsed:.3f}s")
+            logger.info(f"EXIT _handle_discovery from {addr[0]} with error - elapsed: {elapsed:.3f}s")
     
     def _handle_heartbeat(self, message, addr):
         """Handle heartbeat messages
