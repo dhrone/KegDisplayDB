@@ -60,7 +60,7 @@ def _connection_logger():
     """Background thread that logs all active connections every 10 seconds"""
     while True:
         try:
-            time.sleep(10)  # Log every 10 seconds
+            time.sleep(1)  # Log every 10 seconds
             with active_connections_lock:
                 conn_count = len(active_connections)
                 if conn_count > 0:
