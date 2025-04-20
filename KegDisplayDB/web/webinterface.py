@@ -163,8 +163,8 @@ if not hasattr(sys, '_called_from_test') and 'pytest' not in sys.modules and __n
         print("or use --no-sync to disable synchronization for this instance.")
         sys.exit(1)
 
-# Initialize database manager for query operations
-db_manager = DatabaseManager(DB_PATH)
+# Remove db_manager initialization since we only use synced_db now
+# We still need to handle the case where synced_db is None in API methods
 
 app = Flask(__name__, 
            template_folder=TEMPLATE_DIR)  # Specify the template folder
@@ -205,27 +205,51 @@ def load_user(user_id):
     return User.get(user_id)
 
 def get_db_tables():
-    with db_manager.get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = cursor.fetchall()
-    return [table[0] for table in tables]
+    """Get all table names from the database"""
+    try:
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            logger.error("Database synchronization service not available")
+            return []
+            
+        with synced_db.db_manager.transaction() as conn:
+            tables = synced_db.db_manager.query("SELECT name FROM sqlite_master WHERE type='table';", conn=conn)
+        return [table[0] for table in tables]
+    except Exception as e:
+        logger.error(f"Error getting database tables: {e}")
+        return []
 
 def get_table_schema(table_name):
-    with db_manager.get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(f"PRAGMA table_info({table_name});")
-        schema = cursor.fetchall()
-    return schema
+    """Get the schema for a specific table"""
+    try:
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            logger.error("Database synchronization service not available")
+            return []
+            
+        with synced_db.db_manager.transaction() as conn:
+            schema = synced_db.db_manager.query(f"PRAGMA table_info({table_name});", conn=conn)
+        return schema
+    except Exception as e:
+        logger.error(f"Error getting schema for table {table_name}: {e}")
+        return []
 
 def get_table_data(table_name):
-    with db_manager.get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(f"SELECT * FROM {table_name};")
-        data = cursor.fetchall()
-        schema = get_table_schema(table_name)
-        columns = [col[1] for col in schema]
-    return columns, data
+    """Get all data and column names from a specific table"""
+    try:
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            logger.error("Database synchronization service not available")
+            return [], []
+            
+        with synced_db.db_manager.transaction() as conn:
+            data = synced_db.db_manager.query(f"SELECT * FROM {table_name};", conn=conn)
+            schema = get_table_schema(table_name)
+            columns = [col[1] for col in schema]
+        return columns, data
+    except Exception as e:
+        logger.error(f"Error getting data from table {table_name}: {e}")
+        return [], []
 
 @app.route('/')
 @login_required
@@ -294,50 +318,47 @@ def db_manage():
 @app.route('/api/beers/backup', methods=['GET'])
 @login_required
 def backup_beers():
-    # Get all beers from the database
-    if synced_db:
+    """Create a CSV backup of all beers from the database"""
+    try:
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            return jsonify({"error": "Database synchronization service not available"}), 503
+        
+        # Get all beers from the database
         beers = synced_db.get_all_beers()
+        
         # Get column names from the first beer or use predefined columns
         if beers:
             columns = beers[0].keys()
         else:
             columns = ['idBeer', 'Name', 'ABV', 'IBU', 'Color', 'OriginalGravity', 'FinalGravity',
-                      'Description', 'Brewed', 'Kegged', 'Tapped', 'Notes']
-    else:
-        with db_manager.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM beers")
-            beers = cursor.fetchall()
-            
-            # Get column names
-            cursor.execute("PRAGMA table_info(beers)")
-            columns = [info[1] for info in cursor.fetchall()]
-    
-    # Create a CSV string
-    output = io.StringIO()
-    writer = csv.writer(output)
-    
-    # Write header
-    writer.writerow(columns)
-    
-    # Write data
-    for beer in beers:
-        if isinstance(beer, dict):
+                    'Description', 'Brewed', 'Kegged', 'Tapped', 'Notes']
+        
+        # Create a CSV string
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write header
+        writer.writerow(columns)
+        
+        # Write data
+        for beer in beers:
             writer.writerow([beer.get(col) for col in columns])
-        else:
-            writer.writerow(beer)
-    
-    # Prepare response
-    csv_content = output.getvalue()
-    output.close()
-    
-    response = app.response_class(
-        response=csv_content,
-        mimetype='text/csv',
-        headers={'Content-Disposition': 'attachment; filename=beers_backup.csv'}
-    )
-    
-    return response
+        
+        # Prepare response
+        csv_content = output.getvalue()
+        output.close()
+        
+        response = app.response_class(
+            response=csv_content,
+            mimetype='text/csv',
+            headers={'Content-Disposition': 'attachment; filename=beers_backup.csv'}
+        )
+        
+        return response
+    except Exception as e:
+        logger.error(f"Error creating beer backup: {e}")
+        return jsonify({"error": f"Failed to create backup: {str(e)}"}), 500
 
 @app.route('/api/beers/import', methods=['POST'])
 @login_required
@@ -518,52 +539,19 @@ def get_import_status():
 @app.route('/api/beers/clear', methods=['POST'])
 @login_required
 def clear_beers():
+    """Clear all beers from the database"""
     # Check for confirmation
     confirmation = request.json.get('confirmation')
     if not confirmation or confirmation != 'CONFIRM':
         return jsonify({"error": "Confirmation required"}), 400
     
     try:
-        # Get count of beers before clearing
-        if synced_db:
-            # Use the new clear_all_beers method
-            beer_count = synced_db.clear_all_beers()
-        else:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            
-            try:
-                # Get beer count
-                cursor.execute("SELECT COUNT(*) FROM beers")
-                beer_count = cursor.fetchone()[0]
-                
-                # Clear all tap assignments first
-                cursor.execute("UPDATE taps SET idBeer = NULL")
-                
-                # Get all beer IDs for logging
-                cursor.execute("SELECT idBeer FROM beers")
-                beer_ids = [row[0] for row in cursor.fetchall()]
-                
-                # Delete all beers
-                cursor.execute("DELETE FROM beers")
-                
-                # Log each deletion but skip notifications
-                for beer_id in beer_ids:
-                    if synced_db:
-                        synced_db.change_tracker.log_change("beers", "DELETE", beer_id)
-                
-                # Commit all changes at once
-                conn.commit()
-                
-                # Send a single notification after all updates
-                if beer_count > 0 and synced_db:
-                    synced_db.notify_update()
-                    
-            except Exception as e:
-                conn.rollback()
-                raise e
-            finally:
-                conn.close()
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            return jsonify({"error": "Database synchronization service not available"}), 503
+        
+        # Use the synced_db.clear_all_beers method which handles transactions internally
+        beer_count = synced_db.clear_all_beers()
         
         return jsonify({
             "success": True,
@@ -571,6 +559,7 @@ def clear_beers():
         })
     
     except Exception as e:
+        logger.error(f"Error clearing beers: {e}")
         return jsonify({"error": f"Error clearing beers: {str(e)}"}), 500
 
 @app.route('/api/taps', methods=['GET'])
@@ -578,6 +567,10 @@ def clear_beers():
 def api_get_taps():
     """Get all taps with beer information"""
     try:
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            return jsonify({"error": "Database synchronization service not available"}), 503
+        
         # Get all taps using SyncedDatabase
         taps = synced_db.get_all_taps()
         
@@ -593,31 +586,45 @@ def api_get_taps():
                     
         return jsonify(taps)
     except Exception as e:
+        logger.error(f"Error getting taps: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/taps/<int:tap_id>', methods=['GET'])
 @login_required
 def api_get_tap(tap_id):
-    tap = synced_db.get_tap(tap_id)
-    
-    if tap and tap['idBeer']:
-        beer = synced_db.get_beer(tap['idBeer'])
-        if beer:
-            tap['BeerName'] = beer['Name']
-            tap['ABV'] = beer['ABV']
-            tap['IBU'] = beer['IBU']
-            tap['Description'] = beer['Description']
-            
-    if tap:
-        return jsonify(tap)
-    else:
-        return jsonify({"error": "Tap not found"}), 404
+    """Get a specific tap with beer information"""
+    try:
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            return jsonify({"error": "Database synchronization service not available"}), 503
+        
+        tap = synced_db.get_tap(tap_id)
+        
+        if tap and tap['idBeer']:
+            beer = synced_db.get_beer(tap['idBeer'])
+            if beer:
+                tap['BeerName'] = beer['Name']
+                tap['ABV'] = beer['ABV']
+                tap['IBU'] = beer['IBU']
+                tap['Description'] = beer['Description']
+                
+        if tap:
+            return jsonify(tap)
+        else:
+            return jsonify({"error": "Tap not found"}), 404
+    except Exception as e:
+        logger.error(f"Error getting tap {tap_id}: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/taps', methods=['POST'])
 @login_required
 def api_add_tap():
     """Add a new tap"""
     try:
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            return jsonify({"error": "Database synchronization service not available"}), 503
+        
         data = request.json
         
         # Get beer_id if provided, otherwise use NULL
@@ -628,7 +635,7 @@ def api_add_tap():
         tap_ids = [tap['idTap'] for tap in existing_taps]
         next_tap_id = 1 if not tap_ids else max(tap_ids) + 1
         
-        # Add the tap using SyncedDatabase to ensure proper sync protocols
+        # Add the tap using SyncedDatabase
         tap_id = synced_db.add_tap(next_tap_id, beer_id)
         
         # Get the new tap with beer info
@@ -645,174 +652,270 @@ def api_add_tap():
         
         return jsonify(tap), 201
     except Exception as e:
+        logger.error(f"Error adding tap: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/taps/<int:tap_id>', methods=['PUT'])
 @login_required
 def api_update_tap(tap_id):
-    data = request.json
-    
-    if not data:
-        return jsonify({"error": "No data provided"}), 400
-    
-    beer_id = data.get('beer_id')
-    
-    # Check if tap exists
-    tap = synced_db.get_tap(tap_id)
-    if not tap:
-        return jsonify({"error": f"Tap #{tap_id} not found"}), 404
+    """Update a tap's beer assignment"""
+    try:
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            return jsonify({"error": "Database synchronization service not available"}), 503
         
-    # Update the beer assignment using synced_db to ensure proper sync protocols
-    if synced_db.update_tap(tap_id, beer_id):
-        return jsonify({"success": True})
-    else:
-        return jsonify({"error": "Failed to update tap"}), 500
+        data = request.json
+        
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        beer_id = data.get('beer_id')
+        
+        # Check if tap exists
+        tap = synced_db.get_tap(tap_id)
+                
+        if not tap:
+            return jsonify({"error": f"Tap #{tap_id} not found"}), 404
+            
+        # Update the beer assignment using synced_db
+        success = synced_db.update_tap(tap_id, beer_id)
+        
+        if success:
+            return jsonify({"success": True})
+        else:
+            return jsonify({"error": "Failed to update tap"}), 500
+    except Exception as e:
+        logger.error(f"Error updating tap {tap_id}: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/taps/<int:tap_id>', methods=['DELETE'])
 @login_required
 def api_delete_tap(tap_id):
-    # Check if tap exists
-    tap = synced_db.get_tap(tap_id)
-    if not tap:
-        return jsonify({"error": f"Tap #{tap_id} not found"}), 404
+    """Delete a tap from the database"""
+    try:
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            return jsonify({"error": "Database synchronization service not available"}), 503
         
-    # Delete the tap using synced_db to ensure proper sync protocols
-    if synced_db.delete_tap(tap_id):
-        return jsonify({"success": True})
-    else:
-        return jsonify({"error": "Failed to delete tap"}), 500
+        # Check if tap exists
+        tap = synced_db.get_tap(tap_id)
+                
+        if not tap:
+            return jsonify({"error": f"Tap #{tap_id} not found"}), 404
+            
+        # Delete the tap using synced_db
+        success = synced_db.delete_tap(tap_id)
+        
+        if success:
+            return jsonify({"success": True})
+        else:
+            return jsonify({"error": "Failed to delete tap"}), 500
+    except Exception as e:
+        logger.error(f"Error deleting tap {tap_id}: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/beers', methods=['GET'])
 @login_required
 def api_get_beers():
-    beers = synced_db.get_all_beers()
-    return jsonify(beers)
+    """Get all beers from the database"""
+    try:
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            return jsonify({"error": "Database synchronization service not available"}), 503
+        
+        beers = synced_db.get_all_beers()
+        return jsonify(beers)
+    except Exception as e:
+        logger.error(f"Error getting beers: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/beers/<int:beer_id>', methods=['GET'])
 @login_required
 def api_get_beer(beer_id):
-    beer = synced_db.get_beer(beer_id)
-    
-    if beer:
-        return jsonify(beer)
-    else:
-        return jsonify({"error": "Beer not found"}), 404
-
-@app.route('/api/beers/<int:beer_id>/taps', methods=['GET'])
-@login_required
-def api_get_beer_taps(beer_id):
-    taps = synced_db.get_tap_with_beer(beer_id)
-    return jsonify(taps)
-
-@app.route('/api/beers', methods=['POST'])
-@login_required
-def api_add_beer():
-    data = request.json
-    
-    if not data:
-        return jsonify({"error": "No data provided"}), 400
-    
-    name = data.get('Name')
-    
-    # Validate data
-    if not name:
-        return jsonify({"error": "Beer name is required"}), 400
-    
-    # Add the beer using synced_db to ensure proper sync protocols
-    beer_data = {
-        'name': name,
-        'abv': data.get('ABV'),
-        'ibu': data.get('IBU'),
-        'color': data.get('Color'),
-        'og': data.get('OriginalGravity'),  # Use the correct field from frontend
-        'fg': data.get('FinalGravity'),     # Use the correct field from frontend
-        'description': data.get('Description'),
-        'brewed': data.get('Brewed'),
-        'kegged': data.get('Kegged'),
-        'tapped': data.get('Tapped'),
-        'notes': data.get('Notes')
-    }
-    
-    beer_id = synced_db.add_beer(**beer_data)
-    
-    if beer_id:
-        return jsonify({"success": True, "beer_id": beer_id}), 201
-    else:
-        return jsonify({"error": "Failed to create beer"}), 500
-
-@app.route('/api/beers/<int:beer_id>', methods=['PUT'])
-@login_required
-def api_update_beer(beer_id):
-    data = request.json
-    
-    if not data:
-        return jsonify({"error": "No data provided"}), 400
-    
-    name = data.get('Name')
-    
-    # Validate data
-    if not name:
-        return jsonify({"error": "Beer name is required"}), 400
-    
-    # Check if beer exists
-    beer = synced_db.get_beer(beer_id)
-    if not beer:
-        return jsonify({"error": "Beer not found"}), 404
+    """Get a specific beer by ID"""
+    try:
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            return jsonify({"error": "Database synchronization service not available"}), 503
         
-    # Update the beer using synced_db to ensure proper sync protocols
-    beer_data = {
-        'beer_id': beer_id,
-        'name': name,
-        'abv': data.get('ABV'),
-        'ibu': data.get('IBU'),
-        'color': data.get('Color'),
-        'og': data.get('OriginalGravity'),  # Use the correct field from frontend
-        'fg': data.get('FinalGravity'),     # Use the correct field from frontend
-        'description': data.get('Description'),
-        'brewed': data.get('Brewed'),
-        'kegged': data.get('Kegged'),
-        'tapped': data.get('Tapped'),
-        'notes': data.get('Notes')
-    }
-    
-    if synced_db.update_beer(**beer_data):
-        return jsonify({"success": True})
-    else:
-        return jsonify({"error": "Failed to update beer"}), 500
+        beer = synced_db.get_beer(beer_id)
+        
+        if beer:
+            return jsonify(beer)
+        else:
+            return jsonify({"error": "Beer not found"}), 404
+    except Exception as e:
+        logger.error(f"Error getting beer {beer_id}: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/beers/<int:beer_id>', methods=['DELETE'])
 @login_required
 def api_delete_beer(beer_id):
-    # Check if beer exists
-    beer = synced_db.get_beer(beer_id)
-    if not beer:
-        return jsonify({"error": "Beer not found"}), 404
+    """Delete a beer from the database"""
+    try:
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            return jsonify({"error": "Database synchronization service not available"}), 503
         
-    # Delete the beer using synced_db to ensure proper sync protocols
-    # Note: synced_db.delete_beer will automatically handle updating any taps using this beer
-    if synced_db.delete_beer(beer_id):
-        return jsonify({"success": True})
-    else:
-        return jsonify({"error": "Failed to delete beer"}), 500
+        # Check if beer exists
+        beer = synced_db.get_beer(beer_id)
+                
+        if not beer:
+            return jsonify({"error": "Beer not found"}), 404
+            
+        # Delete the beer using synced_db
+        # Note: synced_db.delete_beer will automatically handle updating any taps using this beer
+        success = synced_db.delete_beer(beer_id)
+        
+        if success:
+            return jsonify({"success": True})
+        else:
+            return jsonify({"error": "Failed to delete beer"}), 500
+    except Exception as e:
+        logger.error(f"Error deleting beer {beer_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/beers/<int:beer_id>/taps', methods=['GET'])
+@login_required
+def api_get_beer_taps(beer_id):
+    """Get all taps that have a specific beer assigned"""
+    try:
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            return jsonify({"error": "Database synchronization service not available"}), 503
+        
+        taps = synced_db.get_tap_with_beer(beer_id)
+        return jsonify(taps)
+    except Exception as e:
+        logger.error(f"Error getting taps for beer {beer_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/beers', methods=['POST'])
+@login_required
+def api_add_beer():
+    """Add a new beer to the database"""
+    try:
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            return jsonify({"error": "Database synchronization service not available"}), 503
+        
+        data = request.json
+        
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        name = data.get('Name')
+        
+        # Validate data
+        if not name:
+            return jsonify({"error": "Beer name is required"}), 400
+        
+        # Add the beer using synced_db
+        beer_data = {
+            'name': name,
+            'abv': data.get('ABV'),
+            'ibu': data.get('IBU'),
+            'color': data.get('Color'),
+            'og': data.get('OriginalGravity'),
+            'fg': data.get('FinalGravity'),
+            'description': data.get('Description'),
+            'brewed': data.get('Brewed'),
+            'kegged': data.get('Kegged'),
+            'tapped': data.get('Tapped'),
+            'notes': data.get('Notes')
+        }
+        
+        beer_id = synced_db.add_beer(**beer_data)
+        
+        if beer_id:
+            return jsonify({"success": True, "beer_id": beer_id}), 201
+        else:
+            return jsonify({"error": "Failed to create beer"}), 500
+    except Exception as e:
+        logger.error(f"Error adding beer: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/beers/<int:beer_id>', methods=['PUT'])
+@login_required
+def api_update_beer(beer_id):
+    """Update an existing beer"""
+    try:
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            return jsonify({"error": "Database synchronization service not available"}), 503
+        
+        data = request.json
+        
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        name = data.get('Name')
+        
+        # Validate data
+        if not name:
+            return jsonify({"error": "Beer name is required"}), 400
+        
+        # Check if beer exists
+        beer = synced_db.get_beer(beer_id)
+        
+        if not beer:
+            return jsonify({"error": "Beer not found"}), 404
+        
+        # Update the beer using synced_db
+        beer_data = {
+            'beer_id': beer_id,
+            'name': name,
+            'abv': data.get('ABV'),
+            'ibu': data.get('IBU'),
+            'color': data.get('Color'),
+            'og': data.get('OriginalGravity'),
+            'fg': data.get('FinalGravity'),
+            'description': data.get('Description'),
+            'brewed': data.get('Brewed'),
+            'kegged': data.get('Kegged'),
+            'tapped': data.get('Tapped'),
+            'notes': data.get('Notes')
+        }
+        
+        success = synced_db.update_beer(**beer_data)
+        
+        if success:
+            return jsonify({"success": True})
+        else:
+            return jsonify({"error": "Failed to update beer"}), 500
+    except Exception as e:
+        logger.error(f"Error updating beer {beer_id}: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/taps/count', methods=['POST'])
 @login_required
 def api_set_tap_count():
-    data = request.json
-    
-    if not data:
-        return jsonify({"error": "No data provided"}), 400
-    
-    count = data.get('count')
-    
-    if count is None or not isinstance(count, int) or count < 1:
-        return jsonify({"error": "Valid tap count is required (must be positive integer)"}), 400
-    
-    # Use the set_tap_count method from synced_db to ensure proper sync protocols
-    if synced_db.set_tap_count(count):
-        return jsonify({"success": True, "tap_count": count})
-    else:
-        return jsonify({"error": "Failed to set tap count"}), 500
+    """Set the number of taps in the system"""
+    try:
+        # Ensure synced_db is initialized
+        if synced_db is None:
+            return jsonify({"error": "Database synchronization service not available"}), 503
+        
+        data = request.json
+        
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        count = data.get('count')
+        
+        if count is None or not isinstance(count, int) or count < 1:
+            return jsonify({"error": "Valid tap count is required (must be positive integer)"}), 400
+        
+        # Use the set_tap_count method from synced_db
+        success = synced_db.set_tap_count(count)
+        
+        if success:
+            return jsonify({"success": True, "tap_count": count})
+        else:
+            return jsonify({"error": "Failed to set tap count"}), 500
+    except Exception as e:
+        logger.error(f"Error setting tap count: {e}")
+        return jsonify({"error": str(e)}), 500
 
 def generate_self_signed_certificate(cert_path, key_path):
     """
@@ -875,6 +978,7 @@ def start(passed_args=None):
         passed_args: Arguments passed from another module. If None, use command line arguments.
     """
     global args
+    global synced_db
     
     # Parse arguments if they weren't passed
     if passed_args is None:
@@ -891,7 +995,6 @@ def start(passed_args=None):
     logger.setLevel(getattr(logging, args.log_level))
     
     # Initialize SyncedDatabase if not disabled
-    global synced_db
     if not args.no_sync and synced_db is None:
         try:
             logger.info(f"Initializing SyncedDatabase with broadcast_port={args.broadcast_port}, sync_port={args.sync_port}")
@@ -902,13 +1005,15 @@ def start(passed_args=None):
                 test_mode=False
             )
             logger.info("Initialized SyncedDatabase for web interface")
+            logger.info(f"Database synchronization active on ports {args.broadcast_port} (UDP) and {args.sync_port} (TCP)")
         except OSError as e:
             logger.error(f"Error initializing SyncedDatabase: {e}")
-            logger.info("If another instance is already running, use --broadcast-port and --sync-port to set different ports")
-            logger.info("or use --no-sync to disable synchronization for this instance.")
+            logger.error("If another instance is already running, use --broadcast-port and --sync-port to set different ports")
+            logger.error("or use --no-sync to disable synchronization for this instance.")
             sys.exit(1)
-        
-        logger.info(f"Database synchronization active on ports {args.broadcast_port} (UDP) and {args.sync_port} (TCP)")
+    elif args.no_sync:
+        logger.warning("Database synchronization disabled (--no-sync flag)")
+        logger.warning("The application will not be able to sync with other instances")
     
     # Check if Gunicorn is available
     if BaseApplication is None:
