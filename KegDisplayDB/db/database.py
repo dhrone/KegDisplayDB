@@ -73,7 +73,9 @@ def _connection_logger():
                         logger.info(f"  Opened at: {info['time_opened']}")
                         # Show the full stack trace
                         stack_full = info['stack'].strip()
-                        logger.info(f"  Stack: \n    {stack_full.replace('\n', '\n    ')}")
+                        # Fix the backslash issue by using separate string concatenation
+                        indented_stack = stack_full.replace('\n', '\n    ')
+                        logger.info(f"  Stack: \n    {indented_stack}")
                         logger.info("  " + "-" * 40)
                 else:
                     logger.info("No active database connections")
