@@ -86,7 +86,7 @@ class ChangeTracker:
             logger.warning(f"Using temporary node ID: {temp_id}")
             return temp_id
     
-    def increment_logical_clock(self, max_retries=5, retry_delay=0.5, conn=None):
+    def increment_logical_clock(self, max_retries=5, retry_delay=0.5):
         """
         Increment the logical clock in the version table
         
@@ -145,11 +145,7 @@ class ChangeTracker:
         retries = 0
         while retries < max_retries:
             try:
-                if conn is None:    
-                    with self.db_manager.get_connection() as conn:
-                        return db_manager_or_conn(conn)
-                else:
-                    # assume outer caller will commit
+                with self.db_manager.get_connection() as conn:
                     return db_manager_or_conn(conn)
                     
             except sqlite3.OperationalError as e:
@@ -262,7 +258,7 @@ class ChangeTracker:
             
             
             # Log the update
-            logger.info(f"Updated logical clock from {current_clock} to {new_clock} based on received clock {received_clock}")
+            logger.debug(f"Updated logical clock from {current_clock} to {new_clock} based on received clock {received_clock}")
             return new_clock
                 
         except sqlite3.Error as e:
@@ -363,7 +359,7 @@ class ChangeTracker:
             conn.commit()
         
         # Log the update
-        logger.info(f"Set logical clock from {current_clock} to exact value: {new_clock}")
+        logger.debug(f"Set logical clock from {current_clock} to exact value: {new_clock}")
         return new_clock
     
     def ensure_valid_session(self):
