@@ -493,7 +493,7 @@ class DatabaseSynchronizer:
                 # Get total changes count
                 total_changes = self.db_manager.query(
                     "SELECT COUNT(*) FROM change_log",
-                    fetch_one=True,
+                    fetch_all=False,
                     conn=conn
                 )[0]
                 logger.debug(f"Total changes in change_log: {total_changes}")
@@ -501,7 +501,7 @@ class DatabaseSynchronizer:
                 # Get the highest logical clock for comparison
                 highest_clock = self.db_manager.query(
                     "SELECT MAX(logical_clock) FROM change_log",
-                    fetch_one=True,
+                    fetch_all=False,
                     conn=conn
                 )[0]
                 if highest_clock:
