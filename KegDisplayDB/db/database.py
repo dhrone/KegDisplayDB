@@ -71,12 +71,9 @@ def _connection_logger():
                         logger.info(f"  Origin: {info['origin']}")
                         logger.info(f"  Thread: {info['thread']}")
                         logger.info(f"  Opened at: {info['time_opened']}")
-                        # Only show the first few lines of the stack to keep logs readable
-                        stack_lines = info['stack'].strip().split('\n')
-                        stack_preview = '\n    '.join(stack_lines[:3])
-                        if len(stack_lines) > 3:
-                            stack_preview += f"\n    ... ({len(stack_lines)-3} more frames)"
-                        logger.info(f"  Stack: \n    {stack_preview}")
+                        # Show the full stack trace
+                        stack_full = info['stack'].strip()
+                        logger.info(f"  Stack: \n    {stack_full.replace('\n', '\n    ')}")
                         logger.info("  " + "-" * 40)
                 else:
                     logger.info("No active database connections")
