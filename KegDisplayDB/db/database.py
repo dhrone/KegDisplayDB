@@ -241,10 +241,11 @@ class DatabaseManager:
         """
         # Use a context manager to ensure connections are returned to the pool
         class ConnectionContext:
-            def __init__(self, db_manager, conn):
+            def __init__(self, db_manager, conn, acquired_lock=False):
                 self.db_manager = db_manager
                 self.conn = conn
                 self.origin = f"RW Connection from {traceback.extract_stack()[-3].name}"
+                self.acquired_lock = acquired_lock
             
             def __enter__(self):
                 # Register the connection in the global tracker
@@ -261,14 +262,60 @@ class DatabaseManager:
                         # Unregister from global tracker before returning to pool
                         unregister_connection(self.conn)
                         self.db_manager._rw_connection_pools[self.db_manager.db_path].put(self.conn)
+                        
+                        # Release the semaphore if we acquired it
+                        if self.acquired_lock:
+                            with db_write_semaphore_lock:
+                                if self.db_manager.db_path in db_write_semaphore:
+                                    db_write_semaphore[self.db_manager.db_path].release()
+                                    logger.debug(f"Released database lock in connection exit")
                 except Exception as e:
                     logger.error(f"Error returning connection to pool: {e}")
                     # If there's an error returning to the pool, close it
                     if self.conn:
                         unregister_connection(self.conn)
                         self.conn.close()
+                        
+                        # Release the semaphore if we acquired it
+                        if self.acquired_lock:
+                            with db_write_semaphore_lock:
+                                if self.db_manager.db_path in db_write_semaphore:
+                                    db_write_semaphore[self.db_manager.db_path].release()
+                                    logger.debug(f"Released database lock in connection exception handler")
 
         try:
+            # Acquire the database semaphore
+            acquired_lock = False
+            
+            # Get the semaphore for this database path
+            with db_write_semaphore_lock:
+                if self.db_path not in db_write_semaphore:
+                    db_write_semaphore[self.db_path] = threading.Semaphore(1)
+                db_semaphore = db_write_semaphore[self.db_path]
+            
+            # First try to acquire with a short timeout
+            initial_timeout = 0.5
+            start_time = time.time()
+            acquired_lock = db_semaphore.acquire(timeout=initial_timeout)
+            
+            # If we didn't get the lock within the initial timeout, log and try again with the remaining timeout
+            if not acquired_lock:
+                elapsed = time.time() - start_time
+                logger.info(f"Waiting for database lock ({elapsed:.2f}s) in get_connection")
+                
+                # Try again with the remaining timeout (10 seconds total max wait)
+                remaining_timeout = 10.0 - elapsed
+                if remaining_timeout > 0:
+                    acquired_lock = db_semaphore.acquire(timeout=remaining_timeout)
+                    
+                    total_wait = time.time() - start_time
+                    if acquired_lock:
+                        logger.info(f"Acquired database lock after {total_wait:.2f}s in get_connection")
+                    else:
+                        logger.warning(f"Failed to acquire database lock after {total_wait:.2f}s in get_connection")
+            else:
+                logger.debug(f"Acquired database lock immediately in get_connection")
+            
             if self.db_path in self._rw_connection_pools:
                 with self._pool_locks[self.db_path]:
                     try:
@@ -277,10 +324,26 @@ class DatabaseManager:
                         # If pool is empty, create a new connection
                         conn = sqlite3.connect(self.db_path, check_same_thread=False)
                 
-                return ConnectionContext(self, conn)
+                return ConnectionContext(self, conn, acquired_lock)
+            
+            # If we failed to get a connection but acquired a lock, release it
+            if acquired_lock:
+                with db_write_semaphore_lock:
+                    if self.db_path in db_write_semaphore:
+                        db_write_semaphore[self.db_path].release()
+                        logger.debug(f"Released database lock due to connection failure")
+                
         except Exception as e:
             logger.error(f"Error getting connection from pool: {e}")
-
+            
+            # Make sure to release the lock if we acquired it but hit an exception
+            if acquired_lock:
+                with db_write_semaphore_lock:
+                    if self.db_path in db_write_semaphore:
+                        db_write_semaphore[self.db_path].release()
+                        logger.debug(f"Released database lock due to exception in get_connection")
+                        
+            raise
             
     def transaction(self):
         """Create a transaction context for atomic write operations
@@ -293,13 +356,59 @@ class DatabaseManager:
                 self.db_manager = db_manager
                 self.conn = None
                 self.origin = f"Transaction from {traceback.extract_stack()[-3].name}"
+                self.acquired_lock = False
                 
             def __enter__(self):
-                self.conn = self.db_manager.get_connection().__enter__()
-                self.conn.execute('BEGIN TRANSACTION')
-                # Register the transaction in the global tracker
-                register_connection(self.conn, self.origin)
-                return self.conn
+                # Acquire the database semaphore
+                with db_write_semaphore_lock:
+                    if self.db_manager.db_path not in db_write_semaphore:
+                        db_write_semaphore[self.db_manager.db_path] = threading.Semaphore(1)
+                    db_semaphore = db_write_semaphore[self.db_manager.db_path]
+                
+                # First try to acquire with a short timeout
+                initial_timeout = 0.5
+                start_time = time.time()
+                self.acquired_lock = db_semaphore.acquire(timeout=initial_timeout)
+                
+                # If we didn't get the lock within the initial timeout, log and try again
+                if not self.acquired_lock:
+                    elapsed = time.time() - start_time
+                    logger.info(f"Waiting for database lock ({elapsed:.2f}s) in transaction from {self.origin}")
+                    
+                    # Try again with the remaining timeout (10 seconds total max wait)
+                    remaining_timeout = 10.0 - elapsed
+                    if remaining_timeout > 0:
+                        self.acquired_lock = db_semaphore.acquire(timeout=remaining_timeout)
+                        
+                        total_wait = time.time() - start_time
+                        if self.acquired_lock:
+                            logger.info(f"Acquired database lock after {total_wait:.2f}s in transaction")
+                        else:
+                            logger.warning(f"Failed to acquire database lock after {total_wait:.2f}s in transaction")
+                else:
+                    logger.debug(f"Acquired database lock immediately in transaction")
+                
+                # Get a connection from the pool
+                try:
+                    with self.db_manager._pool_locks[self.db_manager.db_path]:
+                        try:
+                            self.conn = self.db_manager._rw_connection_pools[self.db_manager.db_path].get(block=False)
+                        except queue.Empty:
+                            # If pool is empty, create a new connection
+                            self.conn = sqlite3.connect(self.db_manager.db_path, check_same_thread=False)
+                    
+                    self.conn.execute('BEGIN TRANSACTION')
+                    # Register the transaction in the global tracker
+                    register_connection(self.conn, self.origin)
+                    return self.conn
+                except Exception as e:
+                    # If we fail to get a connection, release the lock if we acquired it
+                    if self.acquired_lock:
+                        with db_write_semaphore_lock:
+                            if self.db_manager.db_path in db_write_semaphore:
+                                db_write_semaphore[self.db_manager.db_path].release()
+                                logger.debug(f"Released database lock due to exception in transaction")
+                    raise
                 
             def __exit__(self, exc_type, exc_val, exc_tb):
                 try:
@@ -315,6 +424,13 @@ class DatabaseManager:
                         # Return connection to pool
                         self.db_manager._rw_connection_pools[self.db_manager.db_path].put(self.conn)
                         self.conn = None
+                    
+                    # Release the lock if we acquired it
+                    if self.acquired_lock:
+                        with db_write_semaphore_lock:
+                            if self.db_manager.db_path in db_write_semaphore:
+                                db_write_semaphore[self.db_manager.db_path].release()
+                                logger.debug(f"Released database lock in transaction exit")
                         
         return TransactionContext(self)
 
@@ -329,8 +445,38 @@ class DatabaseManager:
                 self.db_manager = db_manager
                 self.conn = None
                 self.origin = f"RO Connection from {traceback.extract_stack()[-3].name}"
+                self.acquired_lock = False
                 
             def __enter__(self):
+                # Acquire the database semaphore
+                with db_write_semaphore_lock:
+                    if self.db_manager.db_path not in db_write_semaphore:
+                        db_write_semaphore[self.db_manager.db_path] = threading.Semaphore(1)
+                    db_semaphore = db_write_semaphore[self.db_manager.db_path]
+                
+                # First try to acquire with a short timeout
+                initial_timeout = 0.5
+                start_time = time.time()
+                self.acquired_lock = db_semaphore.acquire(timeout=initial_timeout)
+                
+                # If we didn't get the lock within the initial timeout, log and try again
+                if not self.acquired_lock:
+                    elapsed = time.time() - start_time
+                    logger.info(f"Waiting for database lock ({elapsed:.2f}s) in read connection")
+                    
+                    # Try again with the remaining timeout (10 seconds total max wait)
+                    remaining_timeout = 10.0 - elapsed
+                    if remaining_timeout > 0:
+                        self.acquired_lock = db_semaphore.acquire(timeout=remaining_timeout)
+                        
+                        total_wait = time.time() - start_time
+                        if self.acquired_lock:
+                            logger.info(f"Acquired database lock after {total_wait:.2f}s in read connection")
+                        else:
+                            logger.warning(f"Failed to acquire database lock after {total_wait:.2f}s in read connection")
+                else:
+                    logger.debug(f"Acquired database lock immediately in read connection")
+                
                 # Get connection from read-only pool
                 try:
                     if self.db_manager.db_path in self.db_manager._ro_connection_pools:
@@ -370,64 +516,16 @@ class DatabaseManager:
                             unregister_connection(self.conn)
                             self.conn.close()
                             self.conn = None
+                
+                # Release the lock if we acquired it
+                if self.acquired_lock:
+                    with db_write_semaphore_lock:
+                        if self.db_manager.db_path in db_write_semaphore:
+                            db_write_semaphore[self.db_manager.db_path].release()
+                            logger.debug(f"Released database lock in read connection exit")
                     
         return ReadConnectionContext(self)
         
-    def read_query(self, sql, params=(), fetch_all=False, row_factory=None):
-        """Execute a read-only query
-        
-        Args:
-            sql: SQL query string
-            params: Parameters for the query
-            fetch_all: Whether to fetch all results or just one
-            row_factory: Optional row factory for result rows
-            
-        Returns:
-            Result of the query execution
-        """
-        with self.get_read_connection() as conn:
-            if row_factory:
-                conn.row_factory = row_factory
-            cursor = conn.cursor()
-            cursor.execute(sql, params)
-            
-            if fetch_all:
-                return cursor.fetchall()
-            else:
-                return cursor.fetchone()
-    
-    def close_all_connections(self):
-        """Close all connections in both pools for this database path"""
-        try:
-            if self.db_path in self._rw_connection_pools:
-                with self._pool_locks[self.db_path]:
-                    # Empty the read-write queue and close all connections
-                    while not self._rw_connection_pools[self.db_path].empty():
-                        try:
-                            conn = self._rw_connection_pools[self.db_path].get(block=False)
-                            conn.close()
-                        except Exception as e:
-                            logger.error(f"Error closing read-write connection: {e}")
-            
-            if self.db_path in self._ro_connection_pools:
-                with self._pool_locks[self.db_path]:
-                    # Empty the read-only queue and close all connections
-                    while not self._ro_connection_pools[self.db_path].empty():
-                        try:
-                            conn = self._ro_connection_pools[self.db_path].get(block=False)
-                            conn.close()
-                        except Exception as e:
-                            logger.error(f"Error closing read-only connection: {e}")
-        except Exception as e:
-            logger.error(f"Error in close_all_connections: {e}")
-    
-    def __del__(self):
-        """Clean up resources when the instance is destroyed"""
-        try:
-            self.close_all_connections()
-        except:
-            pass
-    
     def query(self, sql, params=(), fetch_all=False, row_factory=None, conn=None, max_retries=5, retry_delay=0.1):
         """Execute a query and return results
         
@@ -457,38 +555,9 @@ class DatabaseManager:
         current_delay = retry_delay
         last_error = None
         
-        # Acquire database semaphore for all operations if we're starting a new connection
-        # Only skip if a connection was passed in (already part of a transaction)
+        # We don't need to acquire semaphore here anymore since transaction/get_connection will handle it
+        # Just make sure we don't release it in finally if we didn't acquire it here
         db_lock_acquired = False
-        if conn is None:
-            # Get the semaphore for this database path
-            with db_write_semaphore_lock:
-                if self.db_path not in db_write_semaphore:
-                    db_write_semaphore[self.db_path] = threading.Semaphore(1)
-                db_semaphore = db_write_semaphore[self.db_path]
-            
-            # First try to acquire with a short timeout
-            initial_timeout = 0.5
-            start_time = time.time()
-            db_lock_acquired = db_semaphore.acquire(timeout=initial_timeout)
-            
-            # If we didn't get the lock within the initial timeout, log and try again with the remaining timeout
-            if not db_lock_acquired:
-                elapsed = time.time() - start_time
-                logger.info(f"Waiting for database lock ({elapsed:.2f}s) for query: {sql[:100]}...")
-                
-                # Try again with the remaining timeout (10 seconds total max wait)
-                remaining_timeout = 10.0 - elapsed
-                if remaining_timeout > 0:
-                    db_lock_acquired = db_semaphore.acquire(timeout=remaining_timeout)
-                    
-                    total_wait = time.time() - start_time
-                    if db_lock_acquired:
-                        logger.info(f"Acquired database lock after {total_wait:.2f}s for query: {sql[:100]}...")
-                    else:
-                        logger.warning(f"Failed to acquire database lock after {total_wait:.2f}s for query: {sql[:100]}...")
-            else:
-                logger.debug(f"Acquired database lock immediately for query: {sql[:60]}...")
         
         try:
             while retries <= max_retries:
@@ -565,12 +634,8 @@ class DatabaseManager:
             logger.error(f"Query failed after {max_retries} retries: {sql[:100]}...")
             raise last_error
         finally:
-            # Release the database semaphore if we acquired it
-            if db_lock_acquired:
-                with db_write_semaphore_lock:
-                    if self.db_path in db_write_semaphore:
-                        db_write_semaphore[self.db_path].release()
-                        logger.debug(f"Released database lock after query: {sql[:60]}...")
+            # We don't need to release semaphore here anymore - transaction/connection contexts will handle it
+            pass
     
     # ---- Beer Management Methods ----
     
