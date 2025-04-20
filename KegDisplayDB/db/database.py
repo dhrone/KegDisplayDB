@@ -57,13 +57,15 @@ class DatabaseManager:
                     conn = sqlite3.connect(self.db_path, check_same_thread=False)
                     self._connection_pools[self.db_path].put(conn)
     
-    def initialize_tables(self):
-        """Initialize database tables if they don't exist"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
+    def initialize_tables(self, conn=None):
+        """Initialize database tables if they don't exist
+        
+        Args:
+            conn: Optional database connection to use (to avoid nested transactions)
+        """
+        try:
             # Create beers table if it doesn't exist
-            cursor.execute('''
+            self.query('''
                 CREATE TABLE IF NOT EXISTS beers (
                     idBeer INTEGER PRIMARY KEY,
                     Name tinytext NOT NULL,
@@ -78,18 +80,18 @@ class DatabaseManager:
                     Tapped datetime,
                     Notes TEXT
                 )
-            ''')
+            ''', conn=conn)
             
             # Create taps table if it doesn't exist
-            cursor.execute('''
+            self.query('''
                 CREATE TABLE IF NOT EXISTS taps (
                     idTap INTEGER PRIMARY KEY,
                     idBeer INTEGER
                 )
-            ''')
+            ''', conn=conn)
             
             # Create change_log table if it doesn't exist
-            cursor.execute('''
+            self.query('''
                 CREATE TABLE IF NOT EXISTS change_log (
                     id INTEGER PRIMARY KEY,
                     table_name TEXT NOT NULL,
@@ -101,10 +103,10 @@ class DatabaseManager:
                     logical_clock INTEGER DEFAULT 0,
                     node_id TEXT
                 )
-            ''')
+            ''', conn=conn)
             
             # Create version table if it doesn't exist
-            cursor.execute('''
+            self.query('''
                 CREATE TABLE IF NOT EXISTS version (
                     id INTEGER PRIMARY KEY,
                     timestamp TEXT NOT NULL,
@@ -112,29 +114,30 @@ class DatabaseManager:
                     logical_clock INTEGER DEFAULT 0,
                     node_id TEXT
                 )
-            ''')
-            
-            conn.commit()
+            ''', conn=conn)
             
             # Initialize version table with a valid record if it doesn't exist
-            cursor.execute("SELECT COUNT(*) FROM version WHERE id = 1")
-            if cursor.fetchone()[0] == 0:
+            count = self.query("SELECT COUNT(*) FROM version WHERE id = 1", conn=conn)
+            if count and count[0] == 0:
                 # Generate a node ID for this instance
                 node_id = str(uuid.uuid4())
                 
                 # Calculate initial hash for empty tables
                 tables = ['beers', 'taps']
-                initial_hash = self._calculate_db_hash(tables, cursor)
+                initial_hash = self._calculate_db_hash(tables, conn)
                 
                 # Create initial version record
                 timestamp = datetime.now(UTC).isoformat()
-                cursor.execute(
+                self.query(
                     "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, 0, ?)",
-                    (timestamp, initial_hash, node_id)
+                    (timestamp, initial_hash, node_id),
+                    conn=conn
                 )
-                conn.commit()
             
             logger.info("Database tables initialized")
+        except Exception as e:
+            logger.error(f"Error initializing database tables: {e}")
+            raise
     
     def get_connection(self):
         """Get a database connection from the pool or create a new one
@@ -750,7 +753,7 @@ class DatabaseManager:
             logger.error(f"Error retrieving taps with beer {beer_id}: {e}")
             return []
     
-    def clear_beer(self, conn):
+    def clear_beer(self, conn=None):
         """Delete all records from the beers table
         
         Args:
@@ -760,16 +763,14 @@ class DatabaseManager:
             success: True if the operation was successful
         """
         try:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM beers")
-            
+            self.query("DELETE FROM beers", conn=conn)
             logger.debug(f"Cleared all records from beers table")
             return True
         except Exception as e:
             logger.error(f"Error clearing beers table: {e}")
             return False
     
-    def clear_tap(self, conn):
+    def clear_tap(self, conn=None):
         """Delete all records from the taps table
         
         Args:
@@ -779,9 +780,7 @@ class DatabaseManager:
             success: True if the operation was successful
         """
         try:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM taps")
-            
+            self.query("DELETE FROM taps", conn=conn)
             logger.debug(f"Cleared all records from taps table")
             return True
         except Exception as e:
@@ -814,19 +813,18 @@ class DatabaseManager:
             
         try:
             # Start transaction
-            with self.get_connection() as conn:
-                conn.execute('BEGIN TRANSACTION')
-               
+            with self.transaction() as conn:
                 # Track the highest logical clock from applied changes
                 highest_logical_clock = 0
                 peer_node_id = None
                 
                 # Get current logical clock
-                cursor = conn.cursor()
-                cursor.execute("SELECT logical_clock, node_id FROM version WHERE id = 1")
-                row = cursor.fetchone()
-                current_clock = row[0] if row and row[0] is not None else 0
-                local_node_id = row[1] if row and row[1] is not None else str(uuid.uuid4())
+                current_clock_row = self.query(
+                    "SELECT logical_clock, node_id FROM version WHERE id = 1", 
+                    conn=conn
+                )
+                current_clock = current_clock_row[0] if current_clock_row and current_clock_row[0] is not None else 0
+                local_node_id = current_clock_row[1] if current_clock_row and current_clock_row[1] is not None else str(uuid.uuid4())
                 
                 # Sort the changes by logical clock and origin node
                 changes = sorted(
@@ -866,16 +864,16 @@ class DatabaseManager:
                                 peer_node_id = node_id
                         
                         # Check if this change is already in our change_log
-                        cursor.execute(
+                        existing_change = self.query(
                             """
                             SELECT COUNT(*) FROM change_log 
                             WHERE table_name = ? AND operation = ? AND row_id = ? AND logical_clock = ? AND node_id = ?
                             """,
-                            (table_name, operation, row_id, logical_clock, node_id)
+                            (table_name, operation, row_id, logical_clock, node_id),
+                            conn=conn
                         )
-                        count = cursor.fetchone()[0]
                         
-                        if count > 0:
+                        if existing_change and existing_change[0] > 0:
                             # Skip changes we've already processed
                             logger.debug(f"Skipping already applied change: {operation} on {table_name}.{row_id}")
                             continue
@@ -907,23 +905,24 @@ class DatabaseManager:
                                     columns = ', '.join(row_data.keys())
                                     placeholders = ', '.join(['?'] * len(row_data))
                                     sql = f"INSERT OR REPLACE INTO {table_name} ({columns}) VALUES ({placeholders})"
-                                    conn.execute(sql, list(row_data.values()))
+                                    self.query(sql, list(row_data.values()), conn=conn)
                                     
                                 elif operation == 'UPDATE':
                                     # Build UPDATE statement
                                     set_clause = ', '.join([f"{col} = ?" for col in row_data.keys()])
                                     sql = f"UPDATE {table_name} SET {set_clause} WHERE rowid = ?"
                                     params = list(row_data.values()) + [row_id]
-                                    conn.execute(sql, params)
+                                    self.query(sql, params, conn=conn)
                                 
                                 # Log the change in our change_log table with OUR new clock value
-                                conn.execute(
+                                self.query(
                                     """
                                     INSERT INTO change_log 
                                     (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                     """,
-                                    (table_name, operation, row_id, timestamp, content, content_hash, new_clock, node_id)
+                                    (table_name, operation, row_id, timestamp, content, content_hash, new_clock, node_id),
+                                    conn=conn
                                 )
                                 applied_changes += 1
                                 
@@ -935,16 +934,17 @@ class DatabaseManager:
                             try:
                                 # Execute DELETE statement
                                 sql = f"DELETE FROM {table_name} WHERE rowid = ?"
-                                conn.execute(sql, (row_id,))
+                                self.query(sql, (row_id,), conn=conn)
                                 
                                 # Log the change in our change_log table with OUR new clock value
-                                conn.execute(
+                                self.query(
                                     """
                                     INSERT INTO change_log 
                                     (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                     """,
-                                    (table_name, operation, row_id, timestamp, content, content_hash, new_clock, node_id)
+                                    (table_name, operation, row_id, timestamp, content, content_hash, new_clock, node_id),
+                                    conn=conn
                                 )
                                 applied_changes += 1
                                 
@@ -966,9 +966,9 @@ class DatabaseManager:
                     
                     # Calculate current database hash
                     tables = ['beers', 'taps']
-                    new_hash = self._calculate_db_hash(tables, cursor)
+                    new_hash = self._calculate_db_hash(tables, conn)
                     
-                    conn.execute(
+                    self.query(
                         """
                         UPDATE version 
                         SET timestamp = ?,
@@ -977,13 +977,13 @@ class DatabaseManager:
                             node_id = ?
                         WHERE id = 1
                         """,
-                        (timestamp, new_hash, highest_logical_clock, peer_node_id)
+                        (timestamp, new_hash, highest_logical_clock, peer_node_id),
+                        conn=conn
                     )
                     
                     logger.info(f"Updated version with logical clock {highest_logical_clock}")
                 
-                conn.commit()
-                logger.info(f"Successfully applied {applied_changes} changes, {failed_changes} failed")
+            logger.info(f"Successfully applied {applied_changes} changes, {failed_changes} failed")
                 
         except Exception as e:
             logger.error(f"Error applying sync changes: {e}")
@@ -1011,23 +1011,22 @@ class DatabaseManager:
                 else:
                     logger.warning("Failed to create backup before importing database")
             
-            # Connect to both databases
+            # This operation uses direct connections since we need to connect to
+            # two different database files simultaneously
             with sqlite3.connect(self.db_path) as main_conn, sqlite3.connect(temp_db_path) as temp_conn:
-                main_cursor = main_conn.cursor()
-                temp_cursor = temp_conn.cursor()
-                
-                # Begin transaction
                 main_conn.execute("BEGIN TRANSACTION")
                 
                 # Clear existing tables
-                main_cursor.execute("DELETE FROM beers")
-                main_cursor.execute("DELETE FROM taps")
+                self.clear_beer(main_conn)
+                self.clear_tap(main_conn)
                 
                 # Get all beers from temp db
+                temp_cursor = temp_conn.cursor()
                 temp_cursor.execute("SELECT * FROM beers")
                 beers = temp_cursor.fetchall()
                 
                 # Insert beers into main db
+                main_cursor = main_conn.cursor()
                 if beers:
                     beer_columns = [d[0] for d in temp_cursor.description]
                     beer_placeholders = ", ".join(["?"] * len(beer_columns))
@@ -1148,247 +1147,14 @@ class DatabaseManager:
             logger.error(f"Failed to create pre-import backup: {e}")
             return False
     
-    def _apply_insert_change(self, conn, table_name, row_id, content_data):
-        """Apply an INSERT change to the database
-        
-        Args:
-            conn: Database connection
-            table_name: Name of the table
-            row_id: ID of the row
-            content_data: Content data (list or dict)
-        """
-        try:
-            logger.debug(f"Applying INSERT to {table_name}.{row_id}")
-            logger.debug(f"Content data type: {type(content_data)}")
-            
-            if table_name == 'beers':
-                if isinstance(content_data, list):
-                    # Map values from list to appropriate column positions
-                    # Assuming format is [idBeer, Name, ABV, IBU, Color, OriginalGravity, FinalGravity, Description, etc.]
-                    logger.debug(f"INSERT beer with list data: {content_data}")
-                    conn.execute('''
-                        INSERT OR REPLACE INTO beers (idBeer, Name, ABV, IBU, Color, OriginalGravity, 
-                        FinalGravity, Description, Brewed, Kegged, Tapped, Notes)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (row_id, content_data[1] if len(content_data) > 1 else None, 
-                        content_data[2] if len(content_data) > 2 else None,
-                        content_data[3] if len(content_data) > 3 else None, 
-                        content_data[4] if len(content_data) > 4 else None,
-                        content_data[5] if len(content_data) > 5 else None,
-                        content_data[6] if len(content_data) > 6 else None,
-                        content_data[7] if len(content_data) > 7 else None,
-                        content_data[8] if len(content_data) > 8 else None,
-                        content_data[9] if len(content_data) > 9 else None,
-                        content_data[10] if len(content_data) > 10 else None,
-                        content_data[11] if len(content_data) > 11 else None))
-                else:
-                    # It's a dictionary, use .get()
-                    # Log the dictionary keys to help with debugging
-                    logger.debug(f"INSERT beer with dict data. Keys: {list(content_data.keys())}")
-                    
-                    # Check for different possible name conventions in the dictionary
-                    name = None
-                    if 'name' in content_data:
-                        name = content_data.get('name')
-                    elif 'Name' in content_data:
-                        name = content_data.get('Name')
-                        
-                    # Same for other fields
-                    abv = content_data.get('abv') or content_data.get('ABV')
-                    ibu = content_data.get('ibu') or content_data.get('IBU')
-                    color = content_data.get('color') or content_data.get('Color')
-                    og = content_data.get('og') or content_data.get('OriginalGravity')
-                    fg = content_data.get('fg') or content_data.get('FinalGravity')
-                    description = content_data.get('description') or content_data.get('Description')
-                    brewed = content_data.get('brewed') or content_data.get('Brewed')
-                    kegged = content_data.get('kegged') or content_data.get('Kegged')
-                    tapped = content_data.get('tapped') or content_data.get('Tapped')
-                    notes = content_data.get('notes') or content_data.get('Notes')
-                    
-                    logger.debug(f"Inserting beer: id={row_id}, name={name}, abv={abv}")
-                    
-                    conn.execute('''
-                        INSERT OR REPLACE INTO beers (idBeer, Name, ABV, IBU, Color, OriginalGravity, 
-                        FinalGravity, Description, Brewed, Kegged, Tapped, Notes)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (row_id, name, abv, ibu, color, og, fg, description, brewed, kegged, tapped, notes))
-            elif table_name == 'taps':
-                if isinstance(content_data, list):
-                    logger.debug(f"INSERT tap with list data: {content_data}")
-                    conn.execute('''
-                        INSERT OR REPLACE INTO taps (idTap, idBeer)
-                        VALUES (?, ?)
-                    ''', (row_id, content_data[1] if len(content_data) > 1 else None))
-                else:
-                    # It's a dictionary, use .get()
-                    logger.debug(f"INSERT tap with dict data. Keys: {list(content_data.keys())}")
-                    
-                    # Check for different possible beer_id naming conventions
-                    beer_id = None
-                    if 'beer_id' in content_data:
-                        beer_id = content_data.get('beer_id')
-                    elif 'idBeer' in content_data:
-                        beer_id = content_data.get('idBeer')
-                    
-                    logger.debug(f"Inserting tap: idTap={row_id}, idBeer={beer_id}")
-                    
-                    conn.execute('''
-                        INSERT OR REPLACE INTO taps (idTap, idBeer)
-                        VALUES (?, ?)
-                    ''', (row_id, beer_id))
-            else:
-                logger.warning(f"Unknown table for INSERT: {table_name}")
-                
-        except sqlite3.Error as e:
-            logger.error(f"SQLite error applying INSERT to {table_name}.{row_id}: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error applying INSERT to {table_name}.{row_id}: {e}")
-            raise
-                
-    def _apply_update_change(self, conn, table_name, row_id, content_data):
-        """Apply an UPDATE change to the database
-        
-        Args:
-            conn: Database connection
-            table_name: Name of the table
-            row_id: ID of the row
-            content_data: Content data (list or dict)
-        """
-        try:
-            logger.debug(f"Applying UPDATE to {table_name}.{row_id}")
-            logger.debug(f"Content data type: {type(content_data)}")
-            
-            if table_name == 'beers':
-                if isinstance(content_data, list):
-                    # Map values from list to appropriate column positions
-                    logger.debug(f"UPDATE beer with list data: {content_data}")
-                    conn.execute('''
-                        UPDATE beers SET Name=?, ABV=?, IBU=?, Color=?, OriginalGravity=?, 
-                        FinalGravity=?, Description=?, Brewed=?, Kegged=?, Tapped=?, Notes=?
-                        WHERE idBeer=?
-                    ''', (content_data[1] if len(content_data) > 1 else None, 
-                        content_data[2] if len(content_data) > 2 else None,
-                        content_data[3] if len(content_data) > 3 else None, 
-                        content_data[4] if len(content_data) > 4 else None,
-                        content_data[5] if len(content_data) > 5 else None,
-                        content_data[6] if len(content_data) > 6 else None,
-                        content_data[7] if len(content_data) > 7 else None,
-                        content_data[8] if len(content_data) > 8 else None,
-                        content_data[9] if len(content_data) > 9 else None,
-                        content_data[10] if len(content_data) > 10 else None,
-                        content_data[11] if len(content_data) > 11 else None,
-                        row_id))
-                else:
-                    # It's a dictionary, use .get()
-                    # Log the dictionary keys to help with debugging
-                    logger.debug(f"UPDATE beer with dict data. Keys: {list(content_data.keys())}")
-                    
-                    # Check for different possible name conventions in the dictionary
-                    name = None
-                    if 'name' in content_data:
-                        name = content_data.get('name')
-                    elif 'Name' in content_data:
-                        name = content_data.get('Name')
-                        
-                    # Same for other fields
-                    abv = content_data.get('abv') or content_data.get('ABV')
-                    ibu = content_data.get('ibu') or content_data.get('IBU')
-                    color = content_data.get('color') or content_data.get('Color')
-                    og = content_data.get('og') or content_data.get('OriginalGravity')
-                    fg = content_data.get('fg') or content_data.get('FinalGravity')
-                    description = content_data.get('description') or content_data.get('Description')
-                    brewed = content_data.get('brewed') or content_data.get('Brewed')
-                    kegged = content_data.get('kegged') or content_data.get('Kegged')
-                    tapped = content_data.get('tapped') or content_data.get('Tapped')
-                    notes = content_data.get('notes') or content_data.get('Notes')
-                    
-                    logger.debug(f"Updating beer: id={row_id}, name={name}, abv={abv}")
-                    
-                    conn.execute('''
-                        UPDATE beers SET Name=?, ABV=?, IBU=?, Color=?, OriginalGravity=?, 
-                        FinalGravity=?, Description=?, Brewed=?, Kegged=?, Tapped=?, Notes=?
-                        WHERE idBeer=?
-                    ''', (name, abv, ibu, color, og, fg, description, brewed, kegged, tapped, notes, row_id))
-            elif table_name == 'taps':
-                if isinstance(content_data, list):
-                    logger.debug(f"UPDATE tap with list data: {content_data}")
-                    conn.execute('''
-                        UPDATE taps SET idBeer=?
-                        WHERE idTap=?
-                    ''', (content_data[1] if len(content_data) > 1 else None, row_id))
-                else:
-                    # It's a dictionary, use .get()
-                    logger.debug(f"UPDATE tap with dict data. Keys: {list(content_data.keys())}")
-                    
-                    # Check for different possible beer_id naming conventions
-                    beer_id = None
-                    if 'beer_id' in content_data:
-                        beer_id = content_data.get('beer_id')
-                    elif 'idBeer' in content_data:
-                        beer_id = content_data.get('idBeer')
-                    
-                    logger.debug(f"Updating tap: idTap={row_id}, idBeer={beer_id}")
-                    
-                    conn.execute('''
-                        UPDATE taps SET idBeer=?
-                        WHERE idTap=?
-                    ''', (beer_id, row_id))
-            else:
-                logger.warning(f"Unknown table for UPDATE: {table_name}")
-                
-        except sqlite3.Error as e:
-            logger.error(f"SQLite error applying UPDATE to {table_name}.{row_id}: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error applying UPDATE to {table_name}.{row_id}: {e}")
-            raise
-    
-    def _apply_delete_change(self, conn, table_name, row_id):
-        """Apply a DELETE change to the database
-        
-        Args:
-            conn: Database connection
-            table_name: Name of the table
-            row_id: ID of the row
-        """
-        try:
-            logger.debug(f"Applying DELETE to {table_name}.{row_id}")
-            
-            if table_name == 'beers':
-                # Check if the row actually exists
-                cursor = conn.cursor()
-                cursor.execute('SELECT 1 FROM beers WHERE idBeer=?', (row_id,))
-                if cursor.fetchone():
-                    conn.execute('DELETE FROM beers WHERE idBeer=?', (row_id,))
-                    logger.info(f"Deleted beer with idBeer={row_id}")
-                else:
-                    logger.warning(f"Beer with idBeer={row_id} not found for deletion")
-            elif table_name == 'taps':
-                # Check if the row actually exists
-                cursor = conn.cursor()
-                cursor.execute('SELECT 1 FROM taps WHERE idTap=?', (row_id,))
-                if cursor.fetchone():
-                    conn.execute('DELETE FROM taps WHERE idTap=?', (row_id,))
-                    logger.info(f"Deleted tap with idTap={row_id}")
-                else:
-                    logger.warning(f"Tap with idTap={row_id} not found for deletion")
-            else:
-                logger.warning(f"Unknown table for DELETE: {table_name}")
-                
-        except sqlite3.Error as e:
-            logger.error(f"SQLite error applying DELETE to {table_name}.{row_id}: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error applying DELETE to {table_name}.{row_id}: {e}")
-            raise 
 
-    def _calculate_db_hash(self, tables, cursor):
+
+    def _calculate_db_hash(self, tables, conn=None):
         """Calculate a hash based on database content for version tracking
         
         Args:
             tables: List of table names to include in the hash
-            cursor: Database cursor to use
+            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             str: MD5 hash of relevant database content
@@ -1399,12 +1165,10 @@ class DatabaseManager:
             for table in tables:
                 # Get all rows from the table for hashing
                 try:
-                    cursor.execute(f"SELECT * FROM {table}")
-                    rows = cursor.fetchall()
+                    rows = self.query(f"SELECT * FROM {table}", fetch_all=True, conn=conn)
                     
                     # Get column names
-                    cursor.execute(f"PRAGMA table_info({table})")
-                    column_info = cursor.fetchall()
+                    column_info = self.query(f"PRAGMA table_info({table})", fetch_all=True, conn=conn)
                     column_names = [col[1] for col in column_info]
                     
                     # Create normalized representation

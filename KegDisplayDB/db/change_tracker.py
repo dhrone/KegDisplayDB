@@ -86,49 +86,45 @@ class ChangeTracker:
             logger.warning(f"Using temporary node ID: {temp_id}")
             return temp_id
     
-    def increment_logical_clock(self, max_retries=5, retry_delay=0.5):
+    def increment_logical_clock(self, conn=None):
         """
         Increment the logical clock in the version table
         
         Args:
-            max_retries: Number of times to retry if database is locked
-            retry_delay: Time to wait between retries in seconds
+            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             New logical clock value or None if unsuccessful
         """
-        def db_manager_or_conn(conn):
-            
+        try:
             # Get current logical clock value
-            cursor = conn.cursor()
-            cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
-            row = cursor.fetchone()
+            current_clock_row = self.db_manager.query(
+                "SELECT logical_clock FROM version WHERE id = 1",
+                conn=conn
+            )
             
             # Determine the new clock value based on whether a row exists
-            if row is None:
+            if current_clock_row is None:
                 current_clock = 0
                 new_clock = 1
             else:
-                current_clock = row[0] if row[0] is not None else 0
+                current_clock = current_clock_row[0] if current_clock_row[0] is not None else 0
                 new_clock = current_clock + 1
             
-            # Calculate shared values used in both paths
-            content_hash = self._calculate_content_hash()
+            # Calculate a fresh content hash
+            content_hash = self._calculate_content_hash(conn=conn)
             timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             
-            # Prepare the common parameter values
-            params = (timestamp, content_hash, new_clock, self.node_id)
-            
-            # Execute the appropriate SQL operation
-            if row is None:
-                # Insert new version record
-                cursor.execute(
+            if current_clock_row is None:
+                # Insert new version record if none exists
+                self.db_manager.query(
                     "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
-                    params
+                    (timestamp, content_hash, new_clock, self.node_id),
+                    conn=conn
                 )
             else:
                 # Update existing version record
-                cursor.execute(
+                self.db_manager.query(
                     """
                     UPDATE version
                        SET timestamp     = ?,
@@ -137,114 +133,58 @@ class ChangeTracker:
                            node_id       = ?
                      WHERE id = 1
                     """,
-                    params
+                    (timestamp, content_hash, new_clock, self.node_id),
+                    conn=conn
                 )
             
+            logger.debug(f"Incremented logical clock from {current_clock} to {new_clock}")
             return new_clock
-        
-        retries = 0
-        while retries < max_retries:
-            try:
-                with self.db_manager.get_connection() as conn:
-                    return db_manager_or_conn(conn)
-                    
-            except sqlite3.OperationalError as e:
-                if "database is locked" in str(e):
-                    retries += 1
-                    logger.warning(f"Database locked when incrementing logical clock (attempt {retries}/{max_retries}), retrying in {retry_delay}s")
-                    time.sleep(retry_delay)
-                    # Increase backoff time for subsequent retries
-                    retry_delay *= 1.5
-                else:
-                    logger.error(f"Error incrementing logical clock: {e}")
-                    return None
-            except Exception as e:
-                logger.error(f"Error incrementing logical clock: {e}")
-                return None
-        
-        logger.error(f"Failed to increment logical clock after {max_retries} attempts")
-        return None
+            
+        except Exception as e:
+            logger.error(f"Error incrementing logical clock: {e}")
+            return None
     
-    def update_logical_clock(self, received_clock, max_retries=5, retry_delay=0.5):
+    def update_logical_clock(self, received_clock, conn=None):
         """
         Update logical clock based on received clock value (Lamport algorithm)
         
         Args:
             received_clock: Clock value received from another node
-            max_retries: Number of times to retry if database is locked
-            retry_delay: Time to wait between retries in seconds
-            conn: Optional database connection to use
+            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             New clock value or None if unsuccessful
         """
-
-        retries = 0
-        
-        while retries < max_retries:
-            try:
-                with self.db_manager.get_connection() as conn:
-                    # Set a longer timeout for this operation
-                    conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
-                    
-                    # Perform the update
-                    return self._do_update_logical_clock(conn, received_clock)
-                        
-            except sqlite3.OperationalError as e:
-                if "database is locked" in str(e):
-                    retries += 1
-                    logger.warning(f"Database locked when updating logical clock (attempt {retries}/{max_retries}), retrying in {retry_delay}s")
-                    time.sleep(retry_delay)
-                    # Increase backoff time for subsequent retries
-                    retry_delay *= 1.5
-                else:
-                    logger.error(f"Error updating logical clock: {e}")
-                    return None
-            except Exception as e:
-                logger.error(f"Error updating logical clock: {e}")
-                return None
-            
-            logger.error(f"Failed to update logical clock after {max_retries} attempts")
-            return None
-            
-    def _do_update_logical_clock(self, conn, received_clock):
-        """
-        Perform the actual logical clock update using a provided connection
-        
-        Args:
-            conn: Database connection to use
-            received_clock: Clock value received from another node
-            
-        Returns:
-            The new clock value
-        """
         try:
             # Get current logical clock value
-            cursor = conn.cursor()
-            cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
-            row = cursor.fetchone()
+            current_clock_row = self.db_manager.query(
+                "SELECT logical_clock FROM version WHERE id = 1",
+                conn=conn
+            )
+            
+            # Determine the new clock value based on whether a row exists
+            if current_clock_row is None:
+                current_clock = 0
+                new_clock = received_clock + 1
+            else:
+                current_clock = current_clock_row[0] if current_clock_row[0] is not None else 0
+                # Lamport clock rule: local_clock = max(local_clock, received_clock) + 1
+                new_clock = max(current_clock, received_clock) + 1
             
             # Calculate a fresh content hash
             content_hash = self._calculate_content_hash()
-            now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             
-            if row is None:
-                # Initialize with received_clock+1 if no row exists
-                current_clock = 0
-                new_clock = received_clock + 1
-                
-                # Insert new version record
-                cursor.execute(
+            if current_clock_row is None:
+                # Insert new version record if none exists
+                self.db_manager.query(
                     "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
-                    (now, content_hash, new_clock, self.node_id)
+                    (timestamp, content_hash, new_clock, self.node_id),
+                    conn=conn
                 )
             else:
-                # Lamport clock rule: local_clock = max(local_clock, received_clock) + 1
-                current_clock = row[0] if row[0] is not None else 0
-                new_clock = max(current_clock, received_clock) + 1
-                
-                # Update version record with all fields
-                cursor.execute(
+                # Update existing version record
+                self.db_manager.query(
                     """
                     UPDATE version
                        SET timestamp     = ?,
@@ -253,114 +193,71 @@ class ChangeTracker:
                            node_id       = ?
                      WHERE id = 1
                     """,
-                    (now, content_hash, new_clock, self.node_id)
+                    (timestamp, content_hash, new_clock, self.node_id),
+                    conn=conn
                 )
-            
             
             # Log the update
             logger.debug(f"Updated logical clock from {current_clock} to {new_clock} based on received clock {received_clock}")
             return new_clock
-                
-        except sqlite3.Error as e:
-            logger.error(f"SQLite error in _do_update_logical_clock: {e}")
-            raise
+            
         except Exception as e:
-            logger.error(f"Error in _do_update_logical_clock: {e}")
-            raise
+            logger.error(f"Error updating logical clock: {e}")
+            return None
     
-    def set_logical_clock(self, new_clock, max_retries=5, retry_delay=0.5, conn=None):
+    def set_logical_clock(self, new_clock, conn=None):
         """
         Set the logical clock to a specific value
         
         Args:
             new_clock: The clock value to set
-            max_retries: Number of times to retry if database is locked
-            retry_delay: Time to wait between retries in seconds
-            conn: Optional database connection to use
+            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             The set clock value or None if unsuccessful
         """
-        # If a connection is provided, use it directly
-        if conn is not None:
-            return self._do_set_logical_clock(conn, new_clock)
-            
-        # Otherwise use retry logic with a new connection
-        retries = 0
-        
-        while retries < max_retries:
-            try:
-                with self.db_manager.get_connection() as conn:
-                    # Set a longer timeout for this operation
-                    conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
-                    return self._do_set_logical_clock(conn, new_clock)
-                    
-            except sqlite3.OperationalError as e:
-                if "database is locked" in str(e):
-                    retries += 1
-                    logger.warning(f"Database locked when setting logical clock (attempt {retries}/{max_retries}), retrying in {retry_delay}s")
-                    time.sleep(retry_delay)
-                    # Increase backoff time for subsequent retries
-                    retry_delay *= 1.5
-                else:
-                    logger.error(f"Error setting logical clock: {e}")
-                    return None
-            except Exception as e:
-                logger.error(f"Error setting logical clock: {e}")
-                return None
-        
-        logger.error(f"Failed to set logical clock after {max_retries} attempts")
-        return None
-        
-    def _do_set_logical_clock(self, conn, new_clock):
-        """
-        Do the actual work of setting the logical clock
-        
-        Args:
-            conn: Database connection to use
-            new_clock: The clock value to set
-            
-        Returns:
-            The set clock value
-        """
-        # Get current logical clock value for logging
-        cursor = conn.cursor()
-        cursor.execute("SELECT logical_clock FROM version WHERE id = 1")
-        row = cursor.fetchone()
-        current_clock = row[0] if row and row[0] is not None else 0
-        
-        # Calculate a fresh content hash and timestamp
-        content_hash = self._calculate_content_hash()
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        
-        # Check if version row exists
-        if row is None:
-            # Create new version record with specified clock
-            cursor.execute(
-                "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
-                (now, content_hash, new_clock, self.node_id)
+        try:
+            # Get current logical clock value for logging
+            current_clock_row = self.db_manager.query(
+                "SELECT logical_clock FROM version WHERE id = 1",
+                conn=conn
             )
-        else:
-            # Update existing version record with all fields
-            cursor.execute(
-                """
-                UPDATE version
-                   SET timestamp     = ?,
-                       hash          = ?,
-                       logical_clock = ?,
-                       node_id       = ?
-                 WHERE id = 1
-                """,
-                (now, content_hash, new_clock, self.node_id)
-            )
-        
-        # Commit the transaction only if we're using our own connection
-        if not conn.in_transaction:
-            conn.commit()
-        
-        # Log the update
-        logger.debug(f"Set logical clock from {current_clock} to exact value: {new_clock}")
-        return new_clock
+            current_clock = current_clock_row[0] if current_clock_row and current_clock_row[0] is not None else 0
+            
+            # Calculate a fresh content hash and timestamp
+            content_hash = self._calculate_content_hash(conn=conn)
+            timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            
+            # Check if version row exists
+            if not current_clock_row:
+                # Create new version record with specified clock
+                self.db_manager.query(
+                    "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
+                    (timestamp, content_hash, new_clock, self.node_id),
+                    conn=conn
+                )
+            else:
+                # Update existing version record with all fields
+                self.db_manager.query(
+                    """
+                    UPDATE version
+                       SET timestamp     = ?,
+                           hash          = ?,
+                           logical_clock = ?,
+                           node_id       = ?
+                     WHERE id = 1
+                    """,
+                    (timestamp, content_hash, new_clock, self.node_id),
+                    conn=conn
+                )
+            
+            # Log the update
+            logger.debug(f"Set logical clock from {current_clock} to exact value: {new_clock}")
+            return new_clock
+            
+        except Exception as e:
+            logger.error(f"Error setting logical clock: {e}")
+            return None
     
     def ensure_valid_session(self):
         """Ensure we have a valid tracking session"""
@@ -384,13 +281,14 @@ class ChangeTracker:
             self.initialize_tracking()
             self.node_id = self.initialize_node_id()
     
-    def log_change(self, table_name, operation, row_id):
+    def log_change(self, table_name, operation, row_id, conn=None):
         """Log a database change with Lamport logical clock
         
         Args:
             table_name: Name of the table that changed
             operation: Operation type (INSERT, UPDATE, DELETE)
             row_id: ID of the row that changed
+            conn: Optional database connection to use (to avoid nested transactions)
             
         Note:
             This implements the Lamport Clock protocol for local DB updates as specified:
@@ -399,34 +297,36 @@ class ChangeTracker:
             3. Update the version table with the new clock value
         """
         try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
+            # Use transaction to ensure atomicity of the entire operation
+            with self.db_manager.transaction() as transaction_conn:
+                conn = transaction_conn if conn is None else conn
                 
                 # Increment logical clock for this operation
-                new_clock = self.increment_logical_clock()
+                new_clock = self.increment_logical_clock(conn=conn)
                 
                 # Get content for the row
-                content = self._get_row_content(table_name, row_id, conn)
+                content = self._get_row_content(table_name, row_id, conn=conn)
                 content_hash = hashlib.md5(content.encode()).hexdigest()
                 
                 # Set current timestamp (still kept for reference)
                 timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
                 
                 # Log the change with logical clock and node ID
-                cursor.execute(
+                self.db_manager.query(
                     """
                     INSERT INTO change_log 
                     (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (table_name, operation, row_id, timestamp, content, content_hash, new_clock, self.node_id)
+                    (table_name, operation, row_id, timestamp, content, content_hash, new_clock, self.node_id),
+                    conn=conn
                 )
                 
                 # Calculate a fresh database content hash
-                db_content_hash = self._calculate_content_hash()
+                db_content_hash = self._calculate_content_hash(conn=conn)
                 
                 # Update version table with new logical clock and all other fields
-                cursor.execute(
+                version_update_result = self.db_manager.query(
                     """
                     UPDATE version 
                        SET timestamp     = ?, 
@@ -435,21 +335,23 @@ class ChangeTracker:
                            node_id       = ? 
                      WHERE id = 1
                     """,
-                    (timestamp, db_content_hash, new_clock, self.node_id)
+                    (timestamp, db_content_hash, new_clock, self.node_id),
+                    conn=conn
                 )
-                if cursor.rowcount == 0:
-                    # If no rows were updated, insert a new row
-                    cursor.execute(
+                
+                # If no rows were updated, insert a new row
+                if version_update_result == 0:
+                    self.db_manager.query(
                         "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
-                        (timestamp, db_content_hash, new_clock, self.node_id)
+                        (timestamp, db_content_hash, new_clock, self.node_id),
+                        conn=conn
                     )
             
-                conn.commit()
-                logger.debug(f"Logged {operation} operation on {table_name} for row {row_id} with logical clock {new_clock}")
-        except sqlite3.Error as e:
-            logger.error(f"Error logging change: {e}")
+            logger.debug(f"Logged {operation} operation on {table_name} for row {row_id} with logical clock {new_clock}")
+            
         except Exception as e:
-            logger.error(f"Unexpected error logging change: {e}")
+            logger.error(f"Error logging change: {e}")
+            raise
     
     def get_changes_since(self, last_timestamp, batch_size=1000):
         """Get all changes since a given timestamp
@@ -537,13 +439,14 @@ class ChangeTracker:
             logger.info(f"Found {len(filtered_changes)} changes since {normalized_timestamp}")
             return filtered_changes
 
-    def get_changes_since_clock(self, last_clock, node_id=None, batch_size=1000):
+    def get_changes_since_clock(self, last_clock, node_id=None, batch_size=1000, conn=None):
         """Get all changes since a given logical clock value
         
         Args:
             last_clock: Logical clock value to get changes since
             node_id: Node ID for tie-breaking (optional)
             batch_size: Maximum number of changes to return
+            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             changes: List of changes
@@ -551,36 +454,40 @@ class ChangeTracker:
         # Make sure we have a valid session
         self.ensure_valid_session()
         
-        with self.db_manager.get_connection() as conn:
-            cursor = conn.cursor()
-            
+        try:
             # Get all changes with higher logical clock
-            cursor.execute('''
+            higher_clock_changes = self.db_manager.query(
+                '''
                 SELECT table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id
                 FROM change_log
                 WHERE logical_clock > ?
                 ORDER BY logical_clock
-            ''', (last_clock,))
-            
-            higher_clock_changes = cursor.fetchall()
+                ''',
+                (last_clock,),
+                fetch_all=True,
+                conn=conn
+            )
             
             # Get changes with equal clock but from different nodes
             # (only if node_id is provided)
             if node_id:
-                cursor.execute('''
+                equal_clock_changes = self.db_manager.query(
+                    '''
                     SELECT table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id
                     FROM change_log
                     WHERE logical_clock = ? AND node_id != ?
                     ORDER BY node_id
-                ''', (last_clock, node_id))
-                
-                equal_clock_changes = cursor.fetchall()
+                    ''',
+                    (last_clock, node_id),
+                    fetch_all=True,
+                    conn=conn
+                )
                 
                 # Combine and sort the changes
                 all_changes = higher_clock_changes + equal_clock_changes
                 all_changes.sort(key=lambda x: (x[6], x[7]))  # Sort by logical_clock, then node_id
             else:
-                all_changes = higher_clock_changes
+                all_changes = higher_clock_changes or []
             
             # Limit to batch_size
             if len(all_changes) > batch_size:
@@ -589,6 +496,10 @@ class ChangeTracker:
             
             logger.info(f"Found {len(all_changes)} changes since logical clock {last_clock}")
             return all_changes
+            
+        except Exception as e:
+            logger.error(f"Error getting changes since clock {last_clock}: {e}")
+            return []
     
     def get_db_version(self, conn=None):
         """Calculate database version based on content and Lamport clock
@@ -602,64 +513,42 @@ class ChangeTracker:
         if not os.path.exists(self.db_manager.db_path):
             return {"hash": "0", "logical_clock": 0, "node_id": self.node_id}
         
-        # Use the provided connection or create a new one as needed
-        if conn:
-            # Use the provided connection directly
-            return self._calculate_db_version(conn)
-        else:
-            # Create our own connection if none was provided
-            try:
-                with self.db_manager.get_connection() as conn:
-                    return self._calculate_db_version(conn)
-            except Exception as e:
-                logger.error(f"Error getting database version: {e}")
-                return {"hash": "0", "logical_clock": 0, "node_id": self.node_id}
-    
-    def _calculate_db_version(self, conn):
-        """Calculate database version using provided connection
-        
-        Args:
-            conn: Database connection to use
-            
-        Returns:
-            version: Dictionary with hash, logical_clock, and node_id
-        """
         try:
-            cursor = conn.cursor()
-            
             # Calculate content-based hash from all tracked tables
             tables = ['beers', 'taps']
             content_hashes = []
             for table in tables:
-                content_hashes.append(self._get_table_hash(table))
+                content_hashes.append(self._get_table_hash(table, conn=conn))
             content_hash = hashlib.md5(''.join(content_hashes).encode()).hexdigest()
             
             # Get version information from version table
             try:
                 # Get timestamp, hash, logical_clock, and node_id from version table
-                cursor.execute("SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1 LIMIT 1")
-                row = cursor.fetchone()
+                version_row = self.db_manager.query(
+                    "SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1 LIMIT 1",
+                    conn=conn
+                )
                 
-                if row:
-                    timestamp, stored_hash, logical_clock, node_id = row
+                if version_row:
+                    timestamp, stored_hash, logical_clock, node_id = version_row
                     logical_clock = logical_clock if logical_clock is not None else 0
                     node_id = node_id if node_id else self.node_id
                     
                     # Always update the hash to ensure it's correct
-                    cursor.execute(
+                    self.db_manager.query(
                         "UPDATE version SET hash = ?, node_id = ? WHERE id = 1", 
-                        (content_hash, self.node_id)
+                        (content_hash, self.node_id),
+                        conn=conn
                     )
-                    conn.commit()
                 else:
                     timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
                     logical_clock = 0
                     node_id = self.node_id
-                    cursor.execute(
+                    self.db_manager.query(
                         "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
-                        (timestamp, content_hash, logical_clock, node_id)
+                        (timestamp, content_hash, logical_clock, node_id),
+                        conn=conn
                     )
-                    conn.commit()
             except sqlite3.Error as e:
                 logger.error(f"Error accessing version table: {e}")
                 timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -668,7 +557,8 @@ class ChangeTracker:
                 
                 # Try to create the version table with proper schema
                 try:
-                    cursor.execute('''
+                    self.db_manager.query(
+                        '''
                         CREATE TABLE IF NOT EXISTS version (
                             id INTEGER PRIMARY KEY,
                             timestamp TEXT NOT NULL,
@@ -676,26 +566,28 @@ class ChangeTracker:
                             logical_clock INTEGER DEFAULT 0,
                             node_id TEXT
                         )
-                    ''')
-                    cursor.execute(
-                        "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
-                        (timestamp, content_hash, logical_clock, node_id)
+                        ''',
+                        conn=conn
                     )
-                    conn.commit()
+                    self.db_manager.query(
+                        "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
+                        (timestamp, content_hash, logical_clock, node_id),
+                        conn=conn
+                    )
                 except sqlite3.Error as e2:
                     logger.error(f"Error creating version table: {e2}")
+                
+            # Building the version object with logical clock and node_id
+            # We keep timestamp for backward compatibility
+            return {
+                "hash": content_hash, 
+                "timestamp": timestamp, 
+                "logical_clock": logical_clock,
+                "node_id": node_id
+            }
         except Exception as e:
             logger.error(f"Error calculating database version: {e}")
             return {"hash": "0", "logical_clock": 0, "node_id": self.node_id}
-            
-        # Building the version object with logical clock and node_id
-        # We keep timestamp for backward compatibility
-        return {
-            "hash": content_hash, 
-            "timestamp": timestamp, 
-            "logical_clock": logical_clock,
-            "node_id": node_id
-        }
     
     def _get_row_content(self, table_name, row_id, conn=None):
         """Get the content of a row as a JSON string for change tracking
@@ -703,28 +595,31 @@ class ChangeTracker:
         Args:
             table_name: Table name
             row_id: Row ID
-            conn: Database connection (optional)
+            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             content: JSON string representation of the row
         """
-        # Get or create a database connection
-        close_conn = False
-        if conn is None:
-            conn = self.db_manager.get_connection()
-            close_conn = True
-        
         try:
-            cursor = conn.cursor()
-            cursor.execute(f"SELECT * FROM {table_name} WHERE rowid = ?", (row_id,))
-            row = cursor.fetchone()
+            # Get row data
+            row = self.db_manager.query(
+                f"SELECT * FROM {table_name} WHERE rowid = ?", 
+                (row_id,),
+                conn=conn
+            )
             
             if row:
+                # Get column names
+                columns = self.db_manager.query(
+                    f"PRAGMA table_info({table_name})",
+                    fetch_all=True,
+                    conn=conn
+                )
+                column_names = [info[1] for info in columns]
+                
                 # Convert row to dict for JSON serialization
-                cursor.execute(f"PRAGMA table_info({table_name})")
-                columns = [info[1] for info in cursor.fetchall()]
                 row_dict = {}
-                for i, col in enumerate(columns):
+                for i, col in enumerate(column_names):
                     row_dict[col] = row[i]
                 
                 return json.dumps(row_dict)
@@ -733,87 +628,92 @@ class ChangeTracker:
         except Exception as e:
             logger.error(f"Error getting row content for {table_name}.{row_id}: {e}")
             return "{}"
-        finally:
-            if close_conn:
-                conn.close()
     
-    def _get_table_hash(self, table_name):
+    def _get_table_hash(self, table_name, conn=None):
         """Calculate a hash of the table's contents
         
         Args:
             table_name: Name of the table to hash
+            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             hash: MD5 hash of the table's contents
         """
         try:
             # Check if a non-empty table exists
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                try:
-                    cursor.execute(f"SELECT count(*) FROM {table_name}")
-                    count = cursor.fetchone()[0]
-                    if count == 0:
-                        return "0"
-                    
-                    # Get column names for sorting and consistent data representation
-                    cursor.execute(f"PRAGMA table_info({table_name})")
-                    column_info = cursor.fetchall()
-                    column_names = [col[1] for col in column_info]  # col[1] is the column name in PRAGMA result
-                    
-                    # Query all rows from the table
-                    cursor.execute(f"SELECT * FROM {table_name}")
-                    rows = cursor.fetchall()
-                    
-                    # Create a sorted, normalized representation for hashing
-                    normalized_data = []
-                    for row in rows:
-                        # Sort the values by column name to ensure consistent ordering
-                        row_dict = {}
-                        for i, col_name in enumerate(column_names):
-                            # Convert value to string, handle None values
-                            val = row[i]
-                            if val is None:
-                                val = "NULL"
-                            else:
-                                val = str(val)
-                            row_dict[col_name] = val
-                        normalized_data.append(row_dict)
-                    
-                    # Sort the normalized data to ensure consistent ordering
-                    normalized_data.sort(key=lambda x: [str(x.get(col, "")) for col in column_names])
-                    
-                    # Convert to JSON and calculate hash
-                    data_json = json.dumps(normalized_data, sort_keys=True)
-                    table_hash = hashlib.md5(data_json.encode()).hexdigest()
-                    
-                    return table_hash
-                except Exception as e:
-                    logger.error(f"Error calculating hash for table {table_name}: {e}")
-                    return "0"
+            count = self.db_manager.query(
+                f"SELECT count(*) FROM {table_name}",
+                conn=conn
+            )
+            
+            if count and count[0] == 0:
+                return "0"
+            
+            # Get column names for sorting and consistent data representation
+            column_info = self.db_manager.query(
+                f"PRAGMA table_info({table_name})",
+                fetch_all=True,
+                conn=conn
+            )
+            column_names = [col[1] for col in column_info]  # col[1] is the column name in PRAGMA result
+            
+            # Query all rows from the table
+            rows = self.db_manager.query(
+                f"SELECT * FROM {table_name}",
+                fetch_all=True,
+                conn=conn
+            )
+            
+            # Create a sorted, normalized representation for hashing
+            normalized_data = []
+            for row in rows:
+                # Sort the values by column name to ensure consistent ordering
+                row_dict = {}
+                for i, col_name in enumerate(column_names):
+                    # Convert value to string, handle None values
+                    val = row[i]
+                    if val is None:
+                        val = "NULL"
+                    else:
+                        val = str(val)
+                    row_dict[col_name] = val
+                normalized_data.append(row_dict)
+            
+            # Sort the normalized data to ensure consistent ordering
+            normalized_data.sort(key=lambda x: [str(x.get(col, "")) for col in column_names])
+            
+            # Convert to JSON and calculate hash
+            data_json = json.dumps(normalized_data, sort_keys=True)
+            table_hash = hashlib.md5(data_json.encode()).hexdigest()
+            
+            return table_hash
         except Exception as e:
-            logger.error(f"Error accessing table {table_name}: {e}")
+            logger.error(f"Error calculating hash for table {table_name}: {e}")
             return "0"
     
-    def is_database_empty(self):
+    def is_database_empty(self, conn=None):
         """Check if the database is empty (no beers or taps)
+        
+        Args:
+            conn: Optional database connection to use (to avoid nested transactions)
         
         Returns:
             bool: True if database has no content, False otherwise
         """
         try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # Check beers table
-                cursor.execute("SELECT COUNT(*) FROM beers")
-                beer_count = cursor.fetchone()[0]
-                
-                # Check taps table
-                cursor.execute("SELECT COUNT(*) FROM taps")
-                tap_count = cursor.fetchone()[0]
-                
-                return beer_count == 0 and tap_count == 0
+            # Check beers table
+            beer_count = self.db_manager.query(
+                "SELECT COUNT(*) FROM beers",
+                conn=conn
+            )
+            
+            # Check taps table
+            tap_count = self.db_manager.query(
+                "SELECT COUNT(*) FROM taps",
+                conn=conn
+            )
+            
+            return beer_count[0] == 0 and tap_count[0] == 0
         except Exception as e:
             logger.error(f"Error checking if database is empty: {e}")
             return True  # Assume empty if we can't check
@@ -856,11 +756,11 @@ class ChangeTracker:
         logger.debug(f"Tie-breaking with node IDs: {node_id1} vs {node_id2}, result: {is_newer}")
         return is_newer 
 
-    def _calculate_content_hash(self):
+    def _calculate_content_hash(self, conn=None):
         """Calculate a hash based on database content for version tracking
         
         Args:
-            conn: Database connection to use
+            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             str: MD5 hash of relevant database content
@@ -870,7 +770,7 @@ class ChangeTracker:
             tables = ['beers', 'taps']
             content_hashes = []
             for table in tables:
-                content_hashes.append(self._get_table_hash(table))
+                content_hashes.append(self._get_table_hash(table, conn=conn))
             content_hash = hashlib.md5(''.join(content_hashes).encode()).hexdigest()
             return content_hash
         except Exception as e:
