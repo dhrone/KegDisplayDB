@@ -113,8 +113,8 @@ class DBSyncService:
             
             # Start status monitoring thread
             self.exit_event.clear()
-            self.status_thread = threading.Thread(target=self._status_monitor, daemon=True)
-            self.status_thread.start()
+            #self.status_thread = threading.Thread(target=self._status_monitor, daemon=True)
+            #self.status_thread.start()
             
             # Keep the service running until exit is requested
             logger.info("Service started successfully")

@@ -140,20 +140,21 @@ class TestSyncScenarios(unittest.TestCase):
         with sqlite3.connect(self.db1_path) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT table_name, operation, row_id, timestamp, content, content_hash 
+                SELECT table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id
                 FROM change_log
             """)
             changes = cursor.fetchall()
             print(f"Found {len(changes)} changes in db1 change_log")
             for c in changes:
-                print(f"Change: {c[0]} {c[1]} {c[2]} at {c[3]}")
+                print(f"Change: {c[0]} {c[1]} {c[2]} at {c[3]}, logical_clock: {c[6]}")
                 print(f"Content: {c[4]}")
         
         # Get the changes without using a mock to avoid recursion
-        changes = self.db1_tracker.get_changes_since("1970-01-01T00:00:00Z")
-        print(f"\nDEBUG: Real get_changes_since returned {len(changes)} changes")
+        # Use get_changes_since_clock with clock value 0 to get all changes from the beginning
+        changes = self.db1_tracker.get_changes_since_clock(0)
+        print(f"\nDEBUG: Real get_changes_since_clock returned {len(changes)} changes")
         for c in changes:
-            print(f"Change: {c[0]} {c[1]} {c[2]} at {c[3]}")
+            print(f"Change: {c[0]} {c[1]} {c[2]}, logical_clock: {c[6]}")
         
         # Apply the changes directly to db2
         print("\nDEBUG: Directly applying changes to db2")
@@ -191,7 +192,8 @@ class TestSyncScenarios(unittest.TestCase):
         
         # Get the changes directly instead of using the synchronizer
         print("\nDEBUG: Getting changes from db2")
-        changes = self.db2_tracker.get_changes_since("1970-01-01T00:00:00Z")
+        # Use get_changes_since_clock with clock value 0 to get all changes from the beginning
+        changes = self.db2_tracker.get_changes_since_clock(0)
         print(f"DEBUG: Got {len(changes)} changes from db2")
         
         # Apply changes directly to db1

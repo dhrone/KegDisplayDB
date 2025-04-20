@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, UTC
 import shutil
 import json
 import hashlib
+import uuid
 
 from KegDisplayDB.db.database import DatabaseManager
 from KegDisplayDB.db.change_tracker import ChangeTracker
@@ -86,39 +87,73 @@ class TestChangeTracker(unittest.TestCase):
             self.assertIsNotNone(result[3], "Content should not be None")
             self.assertIsNotNone(result[4], "Content hash should not be None")
     
-    def test_get_changes_since(self):
-        """Test retrieving changes since a given timestamp."""
-        # Create a timestamp in the past
-        past_timestamp = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_get_changes_since_clock(self):
+        """Test retrieving changes since a given logical clock value."""
+        # Get the initial clock value
+        initial_version = self.change_tracker.get_db_version()
+        initial_clock = initial_version.get('logical_clock', 0)
         
-        # Add some beers and log changes
-        beer_id1 = self.db_manager.add_beer("Change Time Test 1")
+        # Add some beers and log changes - this will increment logical clock for each change
+        beer_id1 = self.db_manager.add_beer("Clock Test Beer 1")
         self.change_tracker.log_change("beers", "INSERT", beer_id1)
         
-        beer_id2 = self.db_manager.add_beer("Change Time Test 2")
+        beer_id2 = self.db_manager.add_beer("Clock Test Beer 2")
         self.change_tracker.log_change("beers", "INSERT", beer_id2)
         
         # Update a beer
         self.db_manager.update_beer(beer_id1, abv=5.0)
         self.change_tracker.log_change("beers", "UPDATE", beer_id1)
         
-        # Get changes since the past timestamp
-        changes = self.change_tracker.get_changes_since(past_timestamp)
+        # Get the current version to check the clock value after our changes
+        current_version = self.change_tracker.get_db_version()
+        current_clock = current_version.get('logical_clock', 0)
+        
+        # We should have incremented the clock at least 3 times
+        self.assertGreater(current_clock, initial_clock, "Logical clock should have increased")
+        
+        # Test 1: Get all changes since initial clock
+        changes = self.change_tracker.get_changes_since_clock(initial_clock)
         
         # Should have 3 changes: 2 inserts and 1 update
-        self.assertEqual(len(changes), 3, "Wrong number of changes returned")
+        self.assertEqual(len(changes), 3, "Wrong number of changes returned since initial clock")
         
-        # First two should be inserts
-        self.assertEqual(changes[0][1], "INSERT", "First change should be INSERT")
-        self.assertEqual(changes[1][1], "INSERT", "Second change should be INSERT")
+        # Verify the operations in the changes
+        operations = [change[1] for change in changes]
+        self.assertEqual(operations.count("INSERT"), 2, "Should have 2 INSERT operations")
+        self.assertEqual(operations.count("UPDATE"), 1, "Should have 1 UPDATE operation")
         
-        # Last one should be an update
-        self.assertEqual(changes[2][1], "UPDATE", "Third change should be UPDATE")
+        # Check that the changes are returned in clock order
+        for i in range(1, len(changes)):
+            self.assertGreaterEqual(changes[i][6], changes[i-1][6], "Changes should be ordered by logical clock")
         
-        # Get changes since now (should be empty)
-        current_timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        changes = self.change_tracker.get_changes_since(current_timestamp)
-        self.assertEqual(len(changes), 0, "Should return no changes since current timestamp")
+        # Test 2: Get changes since a middle clock value
+        if len(changes) >= 2:
+            middle_clock = changes[1][6]  # Get the clock from the second change
+            filtered_changes = self.change_tracker.get_changes_since_clock(middle_clock)
+            
+            # Should only get changes after the middle clock
+            expected_remaining = len(changes) - 2  # -1 for starting after middle, -1 because middle is inclusive
+            self.assertEqual(len(filtered_changes), expected_remaining, 
+                            f"Wrong number of changes since clock {middle_clock}")
+            
+            # First change should have higher clock than middle_clock
+            if filtered_changes:
+                self.assertGreater(filtered_changes[0][6], middle_clock, 
+                                "First filtered change should have higher clock than filter value")
+        
+        # Test 3: Get changes with node ID filter
+        # Create a different node ID
+        test_node_id = "test-node-" + str(uuid.uuid4())
+        node_filtered_changes = self.change_tracker.get_changes_since_clock(initial_clock, test_node_id)
+        
+        # Should get same number of changes as without node filter (since all changes are from our node)
+        self.assertEqual(len(node_filtered_changes), len(changes), 
+                        "Node ID filtering should not change result count for foreign node ID")
+        
+        # Test 4: Get changes since current clock (should be empty)
+        latest_changes = self.change_tracker.get_changes_since_clock(current_clock)
+        self.assertEqual(len(latest_changes), 0, "Should return no changes since current clock")
     
     def test_apply_changes(self):
         """Test applying changes from a changeset."""

@@ -34,21 +34,20 @@ class ChangeTracker:
     
     def initialize_tracking(self):
         try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # Initialize version table if empty
-                cursor.execute("SELECT COUNT(*) FROM version")
-                if cursor.fetchone()[0] == 0:
-                    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-                    node_id = str(uuid.uuid4())
-                    cursor.execute(
-                        "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
-                        (now, "0", 0, node_id)
-                    )
-                
-                conn.commit()
-                logger.info("Change tracking tables initialized with Lamport clock support")
+            # Check if version table is empty
+            version_count = self.db_manager.query(
+                "SELECT COUNT(*) FROM version"
+            )
+            
+            if version_count and version_count[0] == 0:
+                now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+                node_id = str(uuid.uuid4())
+                self.db_manager.query(
+                    "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
+                    (now, "0", 0, node_id)
+                )
+            
+            logger.info("Change tracking tables initialized with Lamport clock support")
         except Exception as e:
             logger.error(f"Error initializing change tracking: {e}")
     
@@ -59,26 +58,26 @@ class ChangeTracker:
             str: The node ID
         """
         try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # Check if node_id exists in version table
-                cursor.execute("SELECT node_id FROM version WHERE id = 1")
-                row = cursor.fetchone()
-                
-                if row and row[0]:
-                    logger.info(f"Using existing node ID: {row[0]}")
-                    return row[0]
-                
-                # Generate a new node ID if none exists
-                node_id = str(uuid.uuid4())
-                
-                # Store it permanently
-                cursor.execute("UPDATE version SET node_id = ? WHERE id = 1", (node_id,))
-                conn.commit()
-                
-                logger.info(f"Initialized new node ID: {node_id}")
-                return node_id
+            # Check if node_id exists in version table
+            row = self.db_manager.query(
+                "SELECT node_id FROM version WHERE id = 1"
+            )
+            
+            if row and row[0]:
+                logger.info(f"Using existing node ID: {row[0]}")
+                return row[0]
+            
+            # Generate a new node ID if none exists
+            node_id = str(uuid.uuid4())
+            
+            # Store it permanently
+            self.db_manager.query(
+                "UPDATE version SET node_id = ? WHERE id = 1",
+                (node_id,)
+            )
+            
+            logger.info(f"Initialized new node ID: {node_id}")
+            return node_id
         except Exception as e:
             logger.error(f"Error initializing node ID: {e}")
             # Fallback to a temporary ID
@@ -186,12 +185,7 @@ class ChangeTracker:
                 # Update existing version record
                 self.db_manager.query(
                     """
-                    UPDATE version
-                       SET timestamp     = ?,
-                           hash          = ?,
-                           logical_clock = ?,
-                           node_id       = ?
-                     WHERE id = 1
+                    UPDATE version SET timestamp = ?, hash = ?, logical_clock = ?, node_id = ? WHERE id = 1
                     """,
                     (timestamp, content_hash, new_clock, self.node_id),
                     conn=conn
@@ -262,19 +256,26 @@ class ChangeTracker:
     def ensure_valid_session(self):
         """Ensure we have a valid tracking session"""
         try:
-            with self.db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                # Directly check if the change_log table exists
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='change_log'")
-                if cursor.fetchone() is None:
-                    # Table doesn't exist, needs initialization
-                    raise sqlite3.Error("change_log table missing") 
-
-                # Check for the version table too
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='version'")
-                if cursor.fetchone() is None:
-                    raise sqlite3.Error("version table missing")
-
+            # Check if the change_log table exists
+            change_log_exists = self.db_manager.query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='change_log'",
+                fetch_all=True
+            )
+            
+            if not change_log_exists:
+                # Table doesn't exist, needs initialization
+                raise sqlite3.Error("change_log table missing")
+                
+            # Check if the version table exists
+            version_exists = self.db_manager.query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='version'",
+                fetch_all=True
+            )
+            
+            if not version_exists:
+                # Table doesn't exist, needs initialization
+                raise sqlite3.Error("version table missing")
+                
         except sqlite3.Error as e:
             # If session is invalid (tables missing or other DB error during check)
             logger.warning(f"Session invalid ({e}), attempting reinitialization")
@@ -328,12 +329,7 @@ class ChangeTracker:
                 # Update version table with new logical clock and all other fields
                 version_update_result = self.db_manager.query(
                     """
-                    UPDATE version 
-                       SET timestamp     = ?, 
-                           hash          = ?, 
-                           logical_clock = ?, 
-                           node_id       = ? 
-                     WHERE id = 1
+                    UPDATE version SET timestamp = ?, hash = ?, logical_clock = ?, node_id = ? WHERE id = 1
                     """,
                     (timestamp, db_content_hash, new_clock, self.node_id),
                     conn=conn
@@ -353,91 +349,6 @@ class ChangeTracker:
             logger.error(f"Error logging change: {e}")
             raise
     
-    def get_changes_since(self, last_timestamp, batch_size=1000):
-        """Get all changes since a given timestamp
-        
-        Args:
-            last_timestamp: Timestamp to get changes since
-            batch_size: Maximum number of changes to return
-            
-        Returns:
-            changes: List of changes
-        """
-        # Legacy function, maintained for backward compatibility
-        # DEPRECATED: This method will be removed in future versions. Use get_changes_since_clock instead.
-        logger.warning("DEPRECATED: get_changes_since() is deprecated and will be removed in a future version. Use get_changes_since_clock() instead.")
-        
-        # Make sure we have a valid session
-        self.ensure_valid_session()
-        
-        # Try to normalize the timestamp format for consistent comparison
-        try:
-            # Determine the timestamp format and parse accordingly
-            if '.' in last_timestamp:
-                # If it has milliseconds
-                dt = datetime.strptime(last_timestamp, "%Y-%m-%dT%H:%M:%S.%f")
-                dt = dt.replace(tzinfo=UTC)
-            elif 'Z' in last_timestamp:
-                # If it has Z timezone indicator
-                dt = datetime.strptime(last_timestamp.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
-                dt = dt.replace(tzinfo=UTC)
-            else:
-                # Basic ISO format without timezone
-                dt = datetime.strptime(last_timestamp, "%Y-%m-%dT%H:%M:%S")
-                dt = dt.replace(tzinfo=UTC)
-        except ValueError as e:
-            logger.warning(f"Error parsing timestamp '{last_timestamp}': {e}")
-            dt = datetime(1970, 1, 1, 0, 0, 0, tzinfo=UTC)  # Use epoch start if parsing fails
-            
-        # Convert back to a standard ISO format without timezone for consistent comparison
-        normalized_timestamp = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        
-        logger.debug(f"Normalized timestamp from '{last_timestamp}' to '{normalized_timestamp}'")
-        
-        with self.db_manager.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # First, get all changes from the change_log table
-            cursor.execute('''
-                SELECT table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id
-                FROM change_log
-                ORDER BY logical_clock
-            ''')
-            
-            all_changes = cursor.fetchall()
-            
-            # Filter changes that have a timestamp after our normalized_timestamp
-            # by using timestamp comparison on parsed datetime objects
-            filtered_changes = []
-            for change in all_changes:
-                change_timestamp = change[3]  # timestamp is at index 3
-                
-                try:
-                    # Parse the change timestamp
-                    if '.' in change_timestamp:
-                        change_dt = datetime.strptime(change_timestamp, "%Y-%m-%dT%H:%M:%S.%f")
-                    elif 'Z' in change_timestamp:
-                        change_dt = datetime.strptime(change_timestamp.replace('Z', ''), "%Y-%m-%dT%H:%M:%S")
-                    else:
-                        change_dt = datetime.strptime(change_timestamp, "%Y-%m-%dT%H:%M:%S")
-                    
-                    # Convert to UTC for consistent comparison
-                    change_dt = change_dt.replace(tzinfo=UTC)
-                    
-                    # Compare with our normalized timestamp
-                    if change_dt > dt:
-                        filtered_changes.append(change)
-                except ValueError as e:
-                    logger.warning(f"Error parsing change timestamp '{change_timestamp}': {e}")
-                    # Skip this change if we can't parse its timestamp
-            
-            # Limit to batch_size
-            if len(filtered_changes) > batch_size:
-                logger.warning(f"Limiting changes from {len(filtered_changes)} to {batch_size}")
-                filtered_changes = filtered_changes[:batch_size]
-            
-            logger.info(f"Found {len(filtered_changes)} changes since {normalized_timestamp}")
-            return filtered_changes
 
     def get_changes_since_clock(self, last_clock, node_id=None, batch_size=1000, conn=None):
         """Get all changes since a given logical clock value
@@ -476,7 +387,7 @@ class ChangeTracker:
                     SELECT table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id
                     FROM change_log
                     WHERE logical_clock = ? AND node_id != ?
-                    ORDER BY node_id
+                    ORDER BY  node_id
                     ''',
                     (last_clock, node_id),
                     fetch_all=True,

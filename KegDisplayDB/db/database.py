@@ -14,8 +14,82 @@ import hashlib
 import time
 import uuid
 import shutil
+import traceback
+import socket
+
+# Global transaction tracker dictionary to monitor all active database connections
+active_connections = {}
+active_connections_lock = threading.RLock()
 
 logger = logging.getLogger("KegDisplay")
+
+def register_connection(conn, origin):
+    """Register a connection in the global active_connections dictionary
+    
+    Args:
+        conn: The database connection
+        origin: String description or stack trace of where the connection was opened
+    """
+    with active_connections_lock:
+        # Use connection object's ID as a unique identifier
+        conn_id = id(conn)
+        stack = traceback.extract_stack()
+        # Remove the last two frames which are this function and its caller
+        stack = stack[:-2]
+        active_connections[conn_id] = {
+            'connection': conn,
+            'origin': origin,
+            'stack': ''.join(traceback.format_list(stack)),
+            'thread': threading.current_thread().name,
+            'time_opened': datetime.now().isoformat()
+        }
+        
+def unregister_connection(conn):
+    """Remove a connection from the global active_connections dictionary
+    
+    Args:
+        conn: The database connection to unregister
+    """
+    with active_connections_lock:
+        conn_id = id(conn)
+        if conn_id in active_connections:
+            del active_connections[conn_id]
+
+# Thread function to periodically log active connections
+def _connection_logger():
+    """Background thread that logs all active connections every 10 seconds"""
+    while True:
+        try:
+            time.sleep(10)  # Log every 10 seconds
+            with active_connections_lock:
+                conn_count = len(active_connections)
+                if conn_count > 0:
+                    logger.info(f"==== ACTIVE DATABASE CONNECTIONS: {conn_count} ====")
+                    for conn_id, info in active_connections.items():
+                        # Format a readable log entry for each connection
+                        logger.info(f"Connection {conn_id}:")
+                        logger.info(f"  Origin: {info['origin']}")
+                        logger.info(f"  Thread: {info['thread']}")
+                        logger.info(f"  Opened at: {info['time_opened']}")
+                        # Only show the first few lines of the stack to keep logs readable
+                        stack_lines = info['stack'].strip().split('\n')
+                        stack_preview = '\n    '.join(stack_lines[:3])
+                        if len(stack_lines) > 3:
+                            stack_preview += f"\n    ... ({len(stack_lines)-3} more frames)"
+                        logger.info(f"  Stack: \n    {stack_preview}")
+                        logger.info("  " + "-" * 40)
+                else:
+                    logger.info("No active database connections")
+        except Exception as e:
+            logger.error(f"Error in connection logger thread: {e}")
+
+# Start the connection logger thread
+connection_logger_thread = threading.Thread(
+    target=_connection_logger,
+    name="ConnectionLogger",
+    daemon=True  # Make thread exit when main program exits
+)
+connection_logger_thread.start()
 
 class DatabaseManager:
     """
@@ -162,8 +236,11 @@ class DatabaseManager:
             def __init__(self, db_manager, conn):
                 self.db_manager = db_manager
                 self.conn = conn
+                self.origin = f"RW Connection from {traceback.extract_stack()[-3].name}"
             
             def __enter__(self):
+                # Register the connection in the global tracker
+                register_connection(self.conn, self.origin)
                 return self.conn
             
             def __exit__(self, exc_type, exc_val, exc_tb):
@@ -173,11 +250,14 @@ class DatabaseManager:
                         # Rollback any uncommitted changes if there was an exception
                         if exc_type:
                             self.conn.rollback()
+                        # Unregister from global tracker before returning to pool
+                        unregister_connection(self.conn)
                         self.db_manager._rw_connection_pools[self.db_manager.db_path].put(self.conn)
                 except Exception as e:
                     logger.error(f"Error returning connection to pool: {e}")
                     # If there's an error returning to the pool, close it
                     if self.conn:
+                        unregister_connection(self.conn)
                         self.conn.close()
 
         try:
@@ -192,8 +272,7 @@ class DatabaseManager:
                 return ConnectionContext(self, conn)
         except Exception as e:
             logger.error(f"Error getting connection from pool: {e}")
-            # If there's an error with the pool, fall back to a direct connection
-            return sqlite3.connect(self.db_path, check_same_thread=False)
+
             
     def transaction(self):
         """Create a transaction context for atomic write operations
@@ -205,10 +284,13 @@ class DatabaseManager:
             def __init__(self, db_manager):
                 self.db_manager = db_manager
                 self.conn = None
+                self.origin = f"Transaction from {traceback.extract_stack()[-3].name}"
                 
             def __enter__(self):
                 self.conn = self.db_manager.get_connection().__enter__()
                 self.conn.execute('BEGIN TRANSACTION')
+                # Register the transaction in the global tracker
+                register_connection(self.conn, self.origin)
                 return self.conn
                 
             def __exit__(self, exc_type, exc_val, exc_tb):
@@ -220,6 +302,8 @@ class DatabaseManager:
                             self.conn.rollback()
                 finally:
                     if self.conn:
+                        # Unregister from global tracker
+                        unregister_connection(self.conn)
                         # Return connection to pool
                         self.db_manager._rw_connection_pools[self.db_manager.db_path].put(self.conn)
                         self.conn = None
@@ -236,6 +320,7 @@ class DatabaseManager:
             def __init__(self, db_manager):
                 self.db_manager = db_manager
                 self.conn = None
+                self.origin = f"RO Connection from {traceback.extract_stack()[-3].name}"
                 
             def __enter__(self):
                 # Get connection from read-only pool
@@ -258,11 +343,15 @@ class DatabaseManager:
                     self.conn = sqlite3.connect(self.db_manager.db_path, check_same_thread=False)
                     self.conn.execute("PRAGMA query_only = ON;")
                 
+                # Register the connection in the global tracker
+                register_connection(self.conn, self.origin)
                 return self.conn
                 
             def __exit__(self, exc_type, exc_val, exc_tb):
                 if self.conn:
                     try:
+                        # Unregister from global tracker
+                        unregister_connection(self.conn)
                         # Return connection to read-only pool
                         self.db_manager._ro_connection_pools[self.db_manager.db_path].put(self.conn)
                         self.conn = None
@@ -270,6 +359,7 @@ class DatabaseManager:
                         logger.error(f"Error returning read-only connection to pool: {e}")
                         # If there's an error returning to the pool, close it
                         if self.conn:
+                            unregister_connection(self.conn)
                             self.conn.close()
                             self.conn = None
                     
@@ -352,7 +442,6 @@ class DatabaseManager:
         # Transient errors that can be retried
         RETRYABLE_ERRORS = (
             sqlite3.OperationalError,  # Lock timeout, database is locked, etc.
-            sqlite3.BusyError,         # Database is busy
             sqlite3.DatabaseError      # Generic database error
         )
         
@@ -400,7 +489,7 @@ class DatabaseManager:
                     
                     retries += 1
                     if retries <= max_retries:
-                        logger.warning(f"Database error on attempt {retries}/{max_retries}, retrying in {current_delay:.2f}s: {e}")
+                        logger.warning(f"Database error attempting {sql[:60]}..., {retries}/{max_retries}, retrying in {current_delay:.2f}s: {e}")
                         
                         # Clean up connection if we created it
                         if conn_context:
@@ -415,7 +504,7 @@ class DatabaseManager:
                 # Not a retryable error or max retries exceeded
                 if should_commit and conn:
                     conn.rollback()
-                logger.error(f"Error executing query (attempt {retries}/{max_retries}): {sql[:100]}..., {e}")
+                logger.error(f"Error executing query (attempt {retries-1}/{max_retries}): {sql[:60]}..., {e}")
                 raise
                 
             except Exception as e:

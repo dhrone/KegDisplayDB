@@ -201,6 +201,7 @@ class DatabaseSynchronizer:
         # Extract peer information
         peer_version = message.get('version')
         peer_sync_port = message.get('sync_port', self.network.sync_port)
+        should_sync = False
         
         try:
             # Get our current database version for comparison
@@ -233,7 +234,7 @@ class DatabaseSynchronizer:
                     # 3. Initiate sync
                     logger.debug(f"Peer has higher logical clock ({peer_clock} > {our_clock}), updating our clock and initiating sync")
                     self.change_tracker.update_logical_clock(peer_clock, conn=conn)
-                    self._request_sync(peer_ip, peer_sync_port)
+                    should_sync = True
                     
                 elif peer_clock == our_clock and content_differs:
                     # Receive broadcast; incomingClock = localClock & state-hash differs
@@ -248,7 +249,7 @@ class DatabaseSynchronizer:
                     # Tie-breaking using node IDs
                     if self.change_tracker.is_newer_version(peer_version, our_version):
                         logger.info(f"Peer wins tie-breaking, initiating sync")
-                        self._request_sync(peer_ip, peer_sync_port)
+                        should_sync = True
                     else:
                         logger.debug(f"We win tie-breaking, not syncing")
                     
@@ -263,7 +264,12 @@ class DatabaseSynchronizer:
                 # Special case: if our database is empty but peer has data, sync regardless of clocks
                 elif self.change_tracker.is_database_empty(conn=conn) and not peer_version.get("hash") == "0":
                     logger.debug(f"We have empty database but peer has data, initiating sync")
-                    self._request_sync(peer_ip, peer_sync_port)
+                    should_sync = True
+            
+            # Network operations moved outside transaction block
+            if should_sync:
+                self._request_sync(peer_ip, peer_sync_port)
+                
         except Exception as e:
             logger.error(f"Error handling discovery message: {e}")
     
@@ -283,6 +289,7 @@ class DatabaseSynchronizer:
         # Extract peer information
         peer_version = message.get('version')
         peer_sync_port = message.get('sync_port', self.network.sync_port)
+        should_sync = False
         
         try:
             # Get our current database version for comparison
@@ -315,7 +322,7 @@ class DatabaseSynchronizer:
                     # 3. Initiate sync
                     logger.info(f"Peer has higher logical clock ({peer_clock} > {our_clock}), updating our clock and initiating sync")
                     self.change_tracker.update_logical_clock(peer_clock, conn=conn)
-                    self._request_sync(peer_ip, peer_sync_port)
+                    should_sync = True
                     
                 elif peer_clock == our_clock and content_differs:
                     # Receive broadcast; incomingClock = localClock & state-hash differs
@@ -330,7 +337,7 @@ class DatabaseSynchronizer:
                     # Tie-breaking using node IDs
                     if self.change_tracker.is_newer_version(peer_version, our_version):
                         logger.info(f"Peer wins tie-breaking, initiating sync")
-                        self._request_sync(peer_ip, peer_sync_port)
+                        should_sync = True
                     else:
                         logger.info(f"We win tie-breaking, not syncing")
                     
@@ -345,7 +352,12 @@ class DatabaseSynchronizer:
                 # Special case: if our database is empty but peer has data, sync regardless of clocks
                 elif self.change_tracker.is_database_empty(conn=conn) and not peer_version.get("hash") == "0":
                     logger.info(f"We have empty database but peer has data, initiating sync")
-                    self._request_sync(peer_ip, peer_sync_port)
+                    should_sync = True
+            
+            # Network operations moved outside transaction block
+            if should_sync:
+                self._request_sync(peer_ip, peer_sync_port)
+                
         except Exception as e:
             logger.error(f"Error handling heartbeat message: {e}")
     
@@ -365,6 +377,7 @@ class DatabaseSynchronizer:
         # Extract peer information
         peer_version = message.get('version')
         peer_sync_port = message.get('sync_port', self.network.sync_port)
+        should_sync = False
         
         # Log message details for debugging
         CLK = peer_version.get("logical_clock", 0)
@@ -398,7 +411,7 @@ class DatabaseSynchronizer:
                     # 3. Initiate sync
                     logger.info(f"Peer has higher logical clock ({peer_clock} > {our_clock}), updating our clock and initiating sync")
                     self.change_tracker.update_logical_clock(peer_clock, conn=conn)
-                    self._request_sync(peer_ip, peer_sync_port)
+                    should_sync = True
                     
                 elif peer_clock == our_clock and content_differs:
                     # Receive broadcast; incomingClock = localClock & state-hash differs
@@ -413,7 +426,7 @@ class DatabaseSynchronizer:
                     # Tie-breaking using node IDs
                     if self.change_tracker.is_newer_version(peer_version, our_version):
                         logger.info(f"Peer wins tie-breaking, initiating sync")
-                        self._request_sync(peer_ip, peer_sync_port)
+                        should_sync = True
                     else:
                         logger.info(f"We win tie-breaking, not syncing")
                     
@@ -436,7 +449,12 @@ class DatabaseSynchronizer:
                 # Special case: if our database is empty but peer has data, sync regardless of clocks
                 elif self.change_tracker.is_database_empty(conn=conn) and not peer_version.get("hash") == "0":
                     logger.info(f"We have empty database but peer has data, initiating sync")
-                    self._request_sync(peer_ip, peer_sync_port)
+                    should_sync = True
+            
+            # Network operations moved outside transaction block
+            if should_sync:
+                self._request_sync(peer_ip, peer_sync_port)
+                
         except Exception as e:
             logger.error(f"Error handling update message: {e}")
     
