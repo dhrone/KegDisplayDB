@@ -180,6 +180,86 @@ class DatabaseManager:
             # If there's an error with the pool, fall back to a direct connection
             return sqlite3.connect(self.db_path, check_same_thread=False)
             
+    def transaction(self):
+        """Create a transaction context for atomic write operations
+        
+        Returns:
+            TransactionContext: A context manager for transaction handling
+        """
+        class TransactionContext:
+            def __init__(self, db_manager):
+                self.db_manager = db_manager
+                self.conn = None
+                
+            def __enter__(self):
+                self.conn = self.db_manager.get_connection().__enter__()
+                self.conn.execute('BEGIN TRANSACTION')
+                return self.conn
+                
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                try:
+                    if self.conn:
+                        if exc_type is None:
+                            self.conn.commit()
+                        else:
+                            self.conn.rollback()
+                finally:
+                    if self.conn:
+                        # Return connection to pool
+                        self.db_manager._connection_pools[self.db_manager.db_path].put(self.conn)
+                        self.conn = None
+                        
+        return TransactionContext(self)
+
+    def get_read_connection(self):
+        """Get a read-only database connection
+        
+        Returns:
+            ReadConnectionContext: Context manager for read-only connections
+        """
+        class ReadConnectionContext:
+            def __init__(self, db_manager):
+                self.db_manager = db_manager
+                self.conn = None
+                
+            def __enter__(self):
+                # Get connection from pool
+                self.conn = self.db_manager.get_connection().__enter__()
+                # Set read-only mode
+                self.conn.execute("PRAGMA query_only = ON;")
+                return self.conn
+                
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                if self.conn:
+                    # Return connection to pool
+                    self.db_manager._connection_pools[self.db_manager.db_path].put(self.conn)
+                    self.conn = None
+                    
+        return ReadConnectionContext(self)
+        
+    def read_query(self, sql, params=(), fetch_all=False, row_factory=None):
+        """Execute a read-only query
+        
+        Args:
+            sql: SQL query string
+            params: Parameters for the query
+            fetch_all: Whether to fetch all results or just one
+            row_factory: Optional row factory for result rows
+            
+        Returns:
+            Result of the query execution
+        """
+        with self.get_read_connection() as conn:
+            if row_factory:
+                conn.row_factory = row_factory
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            
+            if fetch_all:
+                return cursor.fetchall()
+            else:
+                return cursor.fetchone()
+    
     def close_all_connections(self):
         """Close all connections in the pool for this database path"""
         if self.db_path in self._connection_pools:
@@ -199,7 +279,7 @@ class DatabaseManager:
         except:
             pass
     
-    def query(self, sql, params=(), fetch_all=False, row_factory=None):
+    def query(self, sql, params=(), fetch_all=False, row_factory=None, conn=None):
         """Execute a query and return results
         
         Args:
@@ -207,24 +287,54 @@ class DatabaseManager:
             params: Parameters for the query
             fetch_all: Whether to fetch all results or just one
             row_factory: Optional row factory to use for result rows
+            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             Result of the query execution
         """
-        with self.get_connection() as conn:
+        is_read_query = sql.strip().upper().startswith(("SELECT", "PRAGMA"))
+        should_commit = conn is None and not is_read_query
+        conn_context = None
+        
+        try:
+            # Get a connection if none was provided
+            if conn is None:
+                if is_read_query:
+                    # Use read connection for SELECT/PRAGMA
+                    conn_context = self.get_read_connection()
+                else:
+                    # Use transaction for writes
+                    conn_context = self.transaction()
+                
+                conn = conn_context.__enter__()
+                
             if row_factory:
                 conn.row_factory = row_factory
             cursor = conn.cursor()
             cursor.execute(sql, params)
             
-            if sql.strip().upper().startswith(("SELECT", "PRAGMA")):
+            if is_read_query:
                 if fetch_all:
                     return cursor.fetchall()
                 else:
                     return cursor.fetchone()
             else:
-                conn.commit()
+                # Only commit if we created our own connection
+                if should_commit:
+                    conn.commit()
                 return cursor.lastrowid if cursor.lastrowid else cursor.rowcount
+                
+        except Exception as e:
+            # Only rollback if we created our own connection
+            if should_commit and conn:
+                conn.rollback()
+            logger.error(f"Error executing query: {sql[:100]}..., {e}")
+            raise
+            
+        finally:
+            # Clean up our connection if we created it
+            if conn_context:
+                conn_context.__exit__(None, None, None)
     
     # ---- Beer Management Methods ----
     
@@ -266,37 +376,22 @@ class DatabaseManager:
                 tapped = tapped.replace(tzinfo=UTC)
             tapped = tapped.strftime("%Y-%m-%d %H:%M:%S")
         
-        # If a connection was provided, use it directly
-        if conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO beers (
-                    Name, ABV, IBU, Color, OriginalGravity, FinalGravity,
-                    Description, Brewed, Kegged, Tapped, Notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (name, abv, ibu, color, og, fg, description, brewed, kegged, tapped, notes))
-            
-            beer_id = cursor.lastrowid
-            # Do not commit - caller will handle this
-            
+        # Use the query method which now handles transactions
+        sql = '''
+            INSERT INTO beers (
+                Name, ABV, IBU, Color, OriginalGravity, FinalGravity,
+                Description, Brewed, Kegged, Tapped, Notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        '''
+        params = (name, abv, ibu, color, og, fg, description, brewed, kegged, tapped, notes)
+        
+        try:
+            beer_id = self.query(sql, params, conn=conn)
             logger.info(f"Added beer '{name}' with ID {beer_id}")
             return beer_id
-        else:
-            # Use our own connection if none was provided
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO beers (
-                        Name, ABV, IBU, Color, OriginalGravity, FinalGravity,
-                        Description, Brewed, Kegged, Tapped, Notes
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (name, abv, ibu, color, og, fg, description, brewed, kegged, tapped, notes))
-                
-                beer_id = cursor.lastrowid
-                conn.commit()
-                
-                logger.info(f"Added beer '{name}' with ID {beer_id}")
-                return beer_id
+        except Exception as e:
+            logger.error(f"Error adding beer '{name}': {e}")
+            raise
     
     def update_beer(self, beer_id, name=None, abv=None, ibu=None, color=None, og=None, fg=None,
                    description=None, brewed=None, kegged=None, tapped=None, notes=None, conn=None):
@@ -321,7 +416,7 @@ class DatabaseManager:
             success: Whether the update was successful
         """
         # First check if the beer exists
-        if not self.get_beer(beer_id):
+        if not self.get_beer(beer_id, conn=conn):
             logger.error(f"Cannot update beer with ID {beer_id}: Beer not found")
             return False
         
@@ -341,101 +436,70 @@ class DatabaseManager:
             if getattr(tapped, 'tzinfo', None) is None:
                 tapped = tapped.replace(tzinfo=UTC)
             tapped = tapped.strftime("%Y-%m-%d %H:%M:%S")
-            
-        # If a connection was provided, use it directly
-        if conn:
+        
+        try:
             # Get existing data for any fields not specified
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM beers WHERE idBeer = ?", (beer_id,))
-            existing_beer = cursor.fetchone()
+            existing_beer = self.query(
+                "SELECT * FROM beers WHERE idBeer = ?",
+                (beer_id,),
+                row_factory=sqlite3.Row,
+                conn=conn
+            )
             
             if not existing_beer:
                 logger.error(f"Cannot update beer with ID {beer_id}: Beer not found")
                 return False
                 
             # Update only the fields that were specified
-            update_name = name if name is not None else existing_beer[1]
-            update_abv = abv if abv is not None else existing_beer[2]
-            update_ibu = ibu if ibu is not None else existing_beer[3]
-            update_color = color if color is not None else existing_beer[4]
-            update_og = og if og is not None else existing_beer[5]
-            update_fg = fg if fg is not None else existing_beer[6]
-            update_description = description if description is not None else existing_beer[7]
-            update_brewed = brewed if brewed is not None else existing_beer[8]
-            update_kegged = kegged if kegged is not None else existing_beer[9]
-            update_tapped = tapped if tapped is not None else existing_beer[10]
-            update_notes = notes if notes is not None else existing_beer[11]
+            update_name = name if name is not None else existing_beer['Name']
+            update_abv = abv if abv is not None else existing_beer['ABV']
+            update_ibu = ibu if ibu is not None else existing_beer['IBU']
+            update_color = color if color is not None else existing_beer['Color']
+            update_og = og if og is not None else existing_beer['OriginalGravity']
+            update_fg = fg if fg is not None else existing_beer['FinalGravity']
+            update_description = description if description is not None else existing_beer['Description']
+            update_brewed = brewed if brewed is not None else existing_beer['Brewed']
+            update_kegged = kegged if kegged is not None else existing_beer['Kegged']
+            update_tapped = tapped if tapped is not None else existing_beer['Tapped']
+            update_notes = notes if notes is not None else existing_beer['Notes']
             
-            # Update the database
-            cursor.execute('''
+            # Update the database using query
+            sql = '''
                 UPDATE beers SET
                     Name = ?, ABV = ?, IBU = ?, Color = ?, OriginalGravity = ?, FinalGravity = ?,
                     Description = ?, Brewed = ?, Kegged = ?, Tapped = ?, Notes = ?
                 WHERE idBeer = ?
-            ''', (
+            '''
+            params = (
                 update_name, update_abv, update_ibu, update_color, update_og, update_fg,
                 update_description, update_brewed, update_kegged, update_tapped, update_notes,
                 beer_id
-            ))
+            )
             
-            # Do not commit - caller will handle this
+            self.query(sql, params, conn=conn)
             logger.info(f"Updated beer {beer_id} with name '{update_name}'")
             return True
-        else:
-            # Use our own connection if none was provided
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT * FROM beers WHERE idBeer = ?", (beer_id,))
-                existing_beer = cursor.fetchone()
-                
-                if not existing_beer:
-                    logger.error(f"Cannot update beer with ID {beer_id}: Beer not found")
-                    return False
-                    
-                # Update only the fields that were specified
-                update_name = name if name is not None else existing_beer[1]
-                update_abv = abv if abv is not None else existing_beer[2]
-                update_ibu = ibu if ibu is not None else existing_beer[3]
-                update_color = color if color is not None else existing_beer[4]
-                update_og = og if og is not None else existing_beer[5]
-                update_fg = fg if fg is not None else existing_beer[6]
-                update_description = description if description is not None else existing_beer[7]
-                update_brewed = brewed if brewed is not None else existing_beer[8]
-                update_kegged = kegged if kegged is not None else existing_beer[9]
-                update_tapped = tapped if tapped is not None else existing_beer[10]
-                update_notes = notes if notes is not None else existing_beer[11]
-                
-                # Update the database
-                cursor.execute('''
-                    UPDATE beers SET
-                        Name = ?, ABV = ?, IBU = ?, Color = ?, OriginalGravity = ?, FinalGravity = ?,
-                        Description = ?, Brewed = ?, Kegged = ?, Tapped = ?, Notes = ?
-                    WHERE idBeer = ?
-                ''', (
-                    update_name, update_abv, update_ibu, update_color, update_og, update_fg,
-                    update_description, update_brewed, update_kegged, update_tapped, update_notes,
-                    beer_id
-                ))
-                
-                conn.commit()
-                logger.info(f"Updated beer {beer_id} with name '{update_name}'")
-                return True
+        except Exception as e:
+            logger.error(f"Error updating beer with ID {beer_id}: {e}")
+            raise
     
-    def delete_beer(self, beer_id):
+    def delete_beer(self, beer_id, conn=None):
         """Delete a beer from the database
         
         Args:
             beer_id: ID of the beer to delete
+            conn: Optional database connection to use
             
         Returns:
             success: True if the beer was deleted, False if not found
         """
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
+        try:
             # First check if beer exists
-            cursor.execute("SELECT Name FROM beers WHERE idBeer = ?", (beer_id,))
-            beer = cursor.fetchone()
+            beer = self.query(
+                "SELECT Name FROM beers WHERE idBeer = ?",
+                (beer_id,),
+                conn=conn
+            )
             
             if not beer:
                 logger.warning(f"Beer with ID {beer_id} not found for deletion")
@@ -444,209 +508,247 @@ class DatabaseManager:
             beer_name = beer[0]
             
             # Delete the beer
-            cursor.execute("DELETE FROM beers WHERE idBeer = ?", (beer_id,))
-            conn.commit()
+            result = self.query(
+                "DELETE FROM beers WHERE idBeer = ?",
+                (beer_id,),
+                conn=conn
+            )
             
-            if cursor.rowcount > 0:
+            if result > 0:
                 logger.info(f"Deleted beer '{beer_name}' with ID {beer_id}")
                 return True
             else:
                 logger.warning(f"Failed to delete beer with ID {beer_id}")
                 return False
+        except Exception as e:
+            logger.error(f"Error deleting beer with ID {beer_id}: {e}")
+            raise
     
-    def get_beer(self, beer_id):
+    def get_beer(self, beer_id, conn=None):
         """Get a beer by ID
         
         Args:
             beer_id: ID of the beer to retrieve
+            conn: Optional database connection to use
             
         Returns:
             beer: Dictionary with beer information or None if not found
         """
-        with self.get_connection() as conn:
-            conn.row_factory = sqlite3.Row  # Return rows as dictionaries
-            cursor = conn.cursor()
-            
-            cursor.execute(
+        try:
+            return self.query(
                 "SELECT * FROM beers WHERE idBeer = ?", 
-                (beer_id,)
+                (beer_id,),
+                row_factory=sqlite3.Row,
+                conn=conn
             )
-            
-            row = cursor.fetchone()
-            
-            if row:
-                return dict(row)
-            else:
-                return None
+        except Exception as e:
+            logger.error(f"Error retrieving beer with ID {beer_id}: {e}")
+            return None
     
-    def get_all_beers(self):
+    def get_all_beers(self, conn=None):
         """Get all beers from the database
         
+        Args:
+            conn: Optional database connection to use
+            
         Returns:
             beers: List of dictionaries with beer information
         """
-        with self.get_connection() as conn:
-            conn.row_factory = sqlite3.Row  # Return rows as dictionaries
-            cursor = conn.cursor()
-            
-            cursor.execute("SELECT * FROM beers ORDER BY Name")
-            
-            return [dict(row) for row in cursor.fetchall()]
+        try:
+            return self.query(
+                "SELECT * FROM beers ORDER BY Name",
+                fetch_all=True,
+                row_factory=sqlite3.Row,
+                conn=conn
+            )
+        except Exception as e:
+            logger.error(f"Error retrieving all beers: {e}")
+            return []
     
     # ---- Tap Management Methods ----
     
-    def add_tap(self, tap_id=None, beer_id=None):
+    def add_tap(self, tap_id=None, beer_id=None, conn=None):
         """Add a new tap to the database
         
         Args:
             tap_id: ID for the tap (optional, auto-generated if not provided)
             beer_id: ID of the beer to assign (optional)
+            conn: Optional database connection to use
             
         Returns:
             id: ID of the newly added tap
         """
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
+        try:
             if tap_id:
                 # Check if tap with this ID already exists
-                cursor.execute("SELECT COUNT(*) FROM taps WHERE idTap = ?", (tap_id,))
-                if cursor.fetchone()[0] > 0:
+                existing_tap = self.query(
+                    "SELECT COUNT(*) FROM taps WHERE idTap = ?", 
+                    (tap_id,),
+                    conn=conn
+                )
+                
+                if existing_tap and existing_tap[0] > 0:
                     logger.warning(f"Tap with ID {tap_id} already exists")
                     return None
                 
                 # Insert with specified ID
-                cursor.execute(
+                tap_id = self.query(
                     "INSERT INTO taps (idTap, idBeer) VALUES (?, ?)",
-                    (tap_id, beer_id)
+                    (tap_id, beer_id),
+                    conn=conn
                 )
             else:
                 # Auto-generate ID
-                cursor.execute(
+                tap_id = self.query(
                     "INSERT INTO taps (idBeer) VALUES (?)",
-                    (beer_id,)
+                    (beer_id,),
+                    conn=conn
                 )
-            
-            tap_id = cursor.lastrowid
-            conn.commit()
             
             logger.info(f"Added tap {tap_id} with beer ID {beer_id}")
             return tap_id
+        except Exception as e:
+            logger.error(f"Error adding tap: {e}")
+            raise
     
-    def update_tap(self, tap_id, beer_id):
+    def update_tap(self, tap_id, beer_id, conn=None):
         """Update a tap's beer assignment
         
         Args:
             tap_id: ID of the tap to update
             beer_id: ID of the beer to assign (None to unassign)
+            conn: Optional database connection to use
             
         Returns:
             success: True if the tap was updated, False if not found
         """
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
+        try:
             # Check if tap exists
-            cursor.execute("SELECT idTap FROM taps WHERE idTap = ?", (tap_id,))
-            if not cursor.fetchone():
+            tap_exists = self.query(
+                "SELECT idTap FROM taps WHERE idTap = ?", 
+                (tap_id,),
+                conn=conn
+            )
+            
+            if not tap_exists:
                 logger.warning(f"Tap with ID {tap_id} not found for update")
                 return False
             
             # Update the tap
-            cursor.execute("UPDATE taps SET idBeer = ? WHERE idTap = ?", (beer_id, tap_id))
-            conn.commit()
+            result = self.query(
+                "UPDATE taps SET idBeer = ? WHERE idTap = ?", 
+                (beer_id, tap_id),
+                conn=conn
+            )
             
             logger.info(f"Updated tap {tap_id} with beer ID {beer_id}")
             return True
+        except Exception as e:
+            logger.error(f"Error updating tap {tap_id}: {e}")
+            raise
     
-    def delete_tap(self, tap_id):
+    def delete_tap(self, tap_id, conn=None):
         """Delete a tap from the database
         
         Args:
             tap_id: ID of the tap to delete
+            conn: Optional database connection to use
             
         Returns:
             success: True if deleted, False if not found
         """
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
+        try:
             # Check if tap exists
-            cursor.execute("SELECT idTap FROM taps WHERE idTap = ?", (tap_id,))
-            if not cursor.fetchone():
+            tap_exists = self.query(
+                "SELECT idTap FROM taps WHERE idTap = ?", 
+                (tap_id,),
+                conn=conn
+            )
+            
+            if not tap_exists:
                 logger.warning(f"Tap with ID {tap_id} not found for deletion")
                 return False
             
             # Delete the tap
-            cursor.execute("DELETE FROM taps WHERE idTap = ?", (tap_id,))
-            conn.commit()
+            result = self.query(
+                "DELETE FROM taps WHERE idTap = ?", 
+                (tap_id,),
+                conn=conn
+            )
             
             logger.info(f"Deleted tap {tap_id}")
             return True
+        except Exception as e:
+            logger.error(f"Error deleting tap {tap_id}: {e}")
+            raise
     
-    def get_tap(self, tap_id):
+    def get_tap(self, tap_id, conn=None):
         """Get a tap by ID
         
         Args:
             tap_id: ID of the tap to retrieve
+            conn: Optional database connection to use
             
         Returns:
             tap: Dictionary with tap information or None if not found
         """
-        with self.get_connection() as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            
-            cursor.execute(
+        try:
+            return self.query(
                 "SELECT t.*, b.Name as BeerName FROM taps t "
                 "LEFT JOIN beers b ON t.idBeer = b.idBeer "
                 "WHERE t.idTap = ?", 
-                (tap_id,)
+                (tap_id,),
+                row_factory=sqlite3.Row,
+                conn=conn
             )
-            
-            row = cursor.fetchone()
-            
-            if row:
-                return dict(row)
-            else:
-                return None
+        except Exception as e:
+            logger.error(f"Error retrieving tap {tap_id}: {e}")
+            return None
     
-    def get_all_taps(self):
+    def get_all_taps(self, conn=None):
         """Get all taps with their beer information
         
+        Args:
+            conn: Optional database connection to use
+            
         Returns:
             taps: List of dictionaries with tap information
         """
-        with self.get_connection() as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            
-            cursor.execute(
+        try:
+            return self.query(
                 "SELECT t.*, b.Name as BeerName FROM taps t "
                 "LEFT JOIN beers b ON t.idBeer = b.idBeer "
-                "ORDER BY t.idTap"
+                "ORDER BY t.idTap",
+                fetch_all=True,
+                row_factory=sqlite3.Row,
+                conn=conn
             )
-            
-            return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error retrieving all taps: {e}")
+            return []
     
-    def get_tap_with_beer(self, beer_id):
+    def get_tap_with_beer(self, beer_id, conn=None):
         """Get IDs of taps that have a specific beer assigned
         
         Args:
             beer_id: ID of the beer to look for
+            conn: Optional database connection to use
             
         Returns:
             list: List of tap IDs that have the beer assigned
         """
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute(
+        try:
+            rows = self.query(
                 "SELECT idTap FROM taps WHERE idBeer = ?",
-                (beer_id,)
+                (beer_id,),
+                fetch_all=True,
+                conn=conn
             )
             
-            return [row[0] for row in cursor.fetchall()]
+            return [row[0] for row in rows] if rows else []
+        except Exception as e:
+            logger.error(f"Error retrieving taps with beer {beer_id}: {e}")
+            return []
     
     def clear_beer(self, conn):
         """Delete all records from the beers table
