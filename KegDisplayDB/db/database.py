@@ -21,6 +21,10 @@ import socket
 active_connections = {}
 active_connections_lock = threading.RLock()
 
+# Database write serialization semaphore - ensures only one write operation happens at a time
+db_write_semaphore = {}
+db_write_semaphore_lock = threading.RLock()
+
 logger = logging.getLogger("KegDisplay")
 
 def register_connection(conn, origin):
@@ -110,6 +114,11 @@ class DatabaseManager:
         """
         self.db_path = db_path
         self.pool_size = pool_size
+        
+        # Ensure this database path has a write semaphore
+        with db_write_semaphore_lock:
+            if self.db_path not in db_write_semaphore:
+                db_write_semaphore[self.db_path] = threading.Semaphore(1)
         
         self._initialize_connection_pools()
         self.initialize_tables()
@@ -448,80 +457,120 @@ class DatabaseManager:
         current_delay = retry_delay
         last_error = None
         
-        while retries <= max_retries:
-            try:
-                # Get a connection if none was provided
-                if conn is None:
+        # Acquire database semaphore for all operations if we're starting a new connection
+        # Only skip if a connection was passed in (already part of a transaction)
+        db_lock_acquired = False
+        if conn is None:
+            # Get the semaphore for this database path
+            with db_write_semaphore_lock:
+                if self.db_path not in db_write_semaphore:
+                    db_write_semaphore[self.db_path] = threading.Semaphore(1)
+                db_semaphore = db_write_semaphore[self.db_path]
+            
+            # First try to acquire with a short timeout
+            initial_timeout = 0.5
+            start_time = time.time()
+            db_lock_acquired = db_semaphore.acquire(timeout=initial_timeout)
+            
+            # If we didn't get the lock within the initial timeout, log and try again with the remaining timeout
+            if not db_lock_acquired:
+                elapsed = time.time() - start_time
+                logger.info(f"Waiting for database lock ({elapsed:.2f}s) for query: {sql[:100]}...")
+                
+                # Try again with the remaining timeout (10 seconds total max wait)
+                remaining_timeout = 10.0 - elapsed
+                if remaining_timeout > 0:
+                    db_lock_acquired = db_semaphore.acquire(timeout=remaining_timeout)
+                    
+                    total_wait = time.time() - start_time
+                    if db_lock_acquired:
+                        logger.info(f"Acquired database lock after {total_wait:.2f}s for query: {sql[:100]}...")
+                    else:
+                        logger.warning(f"Failed to acquire database lock after {total_wait:.2f}s for query: {sql[:100]}...")
+            else:
+                logger.debug(f"Acquired database lock immediately for query: {sql[:60]}...")
+        
+        try:
+            while retries <= max_retries:
+                try:
+                    # Get a connection if none was provided
+                    if conn is None:
+                        if is_read_query:
+                            # Use read connection for SELECT/PRAGMA
+                            conn_context = self.get_read_connection()
+                        else:
+                            # Use transaction for writes
+                            conn_context = self.transaction()
+                        
+                        conn = conn_context.__enter__()
+                    
+                    if row_factory:
+                        conn.row_factory = row_factory
+                    cursor = conn.cursor()
+                    cursor.execute(sql, params)
+                    
                     if is_read_query:
-                        # Use read connection for SELECT/PRAGMA
-                        conn_context = self.get_read_connection()
+                        if fetch_all:
+                            return cursor.fetchall()
+                        else:
+                            return cursor.fetchone()
                     else:
-                        # Use transaction for writes
-                        conn_context = self.transaction()
-                    
-                    conn = conn_context.__enter__()
-                    
-                if row_factory:
-                    conn.row_factory = row_factory
-                cursor = conn.cursor()
-                cursor.execute(sql, params)
-                
-                if is_read_query:
-                    if fetch_all:
-                        return cursor.fetchall()
-                    else:
-                        return cursor.fetchone()
-                else:
-                    # Only commit if we created our own connection
-                    if should_commit:
-                        conn.commit()
-                    return cursor.lastrowid if cursor.lastrowid else cursor.rowcount
-                    
-            except RETRYABLE_ERRORS as e:
-                last_error = e
-                error_message = str(e).lower()
-                
-                # Check if this is a retryable error
-                if ("database is locked" in error_message or 
-                    "busy" in error_message or 
-                    "timeout" in error_message):
-                    
-                    retries += 1
-                    if retries <= max_retries:
-                        logger.warning(f"Database error attempting {sql[:60]}..., {retries}/{max_retries}, retrying in {current_delay:.2f}s: {e}")
+                        # Only commit if we created our own connection
+                        if should_commit:
+                            conn.commit()
+                        return cursor.lastrowid if cursor.lastrowid else cursor.rowcount
                         
-                        # Clean up connection if we created it
-                        if conn_context:
-                            conn_context.__exit__(type(e), e, None)
-                            conn_context = None
-                        
-                        # Wait before retrying, with exponential backoff
-                        time.sleep(current_delay)
-                        current_delay *= 2  # Exponential backoff
-                        continue
-                
-                # Not a retryable error or max retries exceeded
-                if should_commit and conn:
-                    conn.rollback()
-                logger.error(f"Error executing query (attempt {retries-1}/{max_retries}): {sql[:60]}..., {e}")
-                raise
-                
-            except Exception as e:
-                # Only rollback if we created our own connection
-                if should_commit and conn:
-                    conn.rollback()
-                logger.error(f"Error executing query: {sql[:100]}..., {e}")
-                raise
-                
-            finally:
-                # Clean up our connection if we created it
-                if conn_context:
-                    conn_context.__exit__(None, None, None)
-                    conn.commit()
+                except RETRYABLE_ERRORS as e:
+                    last_error = e
+                    error_message = str(e).lower()
                     
-        # If we get here, we've exceeded max retries
-        logger.error(f"Query failed after {max_retries} retries: {sql[:100]}...")
-        raise last_error
+                    # Check if this is a retryable error
+                    if ("database is locked" in error_message or 
+                        "busy" in error_message or 
+                        "timeout" in error_message):
+                        
+                        retries += 1
+                        if retries <= max_retries:
+                            logger.warning(f"Database error attempting {sql[:60]}..., {retries}/{max_retries}, retrying in {current_delay:.2f}s: {e}")
+                            
+                            # Clean up connection if we created it
+                            if conn_context:
+                                conn_context.__exit__(type(e), e, None)
+                                conn_context = None
+                            
+                            # Wait before retrying, with exponential backoff
+                            time.sleep(current_delay)
+                            current_delay *= 2  # Exponential backoff
+                            continue
+                    
+                    # Not a retryable error or max retries exceeded
+                    if should_commit and conn:
+                        conn.rollback()
+                    logger.error(f"Error executing query (attempt {retries-1}/{max_retries}): {sql[:60]}..., {e}")
+                    raise
+                    
+                except Exception as e:
+                    # Only rollback if we created our own connection
+                    if should_commit and conn:
+                        conn.rollback()
+                    logger.error(f"Error executing query: {sql[:100]}..., {e}")
+                    raise
+                    
+                finally:
+                    # Clean up our connection if we created it
+                    if conn_context:
+                        conn_context.__exit__(None, None, None)
+                    
+            # If we get here, we've exceeded max retries
+            logger.error(f"Query failed after {max_retries} retries: {sql[:100]}...")
+            raise last_error
+        finally:
+            # Release the database semaphore if we acquired it
+            if db_lock_acquired:
+                with db_write_semaphore_lock:
+                    if self.db_path in db_write_semaphore:
+                        db_write_semaphore[self.db_path].release()
+                        logger.debug(f"Released database lock after query: {sql[:60]}...")
     
     # ---- Beer Management Methods ----
     
