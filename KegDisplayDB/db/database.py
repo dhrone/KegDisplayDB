@@ -517,6 +517,7 @@ class DatabaseManager:
                 # Clean up our connection if we created it
                 if conn_context:
                     conn_context.__exit__(None, None, None)
+                    conn.commit()
                     
         # If we get here, we've exceeded max retries
         logger.error(f"Query failed after {max_retries} retries: {sql[:100]}...")
