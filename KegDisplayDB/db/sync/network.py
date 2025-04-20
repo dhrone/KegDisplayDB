@@ -199,7 +199,7 @@ class NetworkManager:
                 
                 # Skip messages from our own IP
                 if addr[0] not in self.local_ips:
-                    logger.info(f"Received broadcast from {addr[0]}, data length: {len(data)}")
+                    logger.info(f"Rcvd broadcast from {addr[0]} len:{len(data)}")
                     
                     # Try to log the first part of the message for debugging
                     try:
@@ -209,8 +209,13 @@ class NetworkManager:
                         # Try to parse the message to check if it's an update
                         try:
                             msg_data = json.loads(data.decode('utf-8'))
+                            VERSION = msg_data.get('version')
+                            HASH = msg_data.get('hash')[-10:]
+                            NODE_ID = VERSION.get('node_id')[-12:]
+                            TS = VERSION.get('timestamp')[-9:]
+                            CLK = VERSION.get('logical_clock')
                             if msg_data.get('type') == 'update':
-                                logger.info(f"Received UPDATE message from {addr[0]}: {msg_data}")
+                                logger.info(f"Received UPDATE message at {TS} from {addr[0]}: CLK {CLK} H {HASH} N {NODE_ID}")
                         except json.JSONDecodeError:
                             logger.debug(f"Could not parse message as JSON")
                             

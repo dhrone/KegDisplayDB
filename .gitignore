@@ -52,4 +52,4 @@ Thumbs.db
 # Database files
 *.db
 *.sqlite
-*.sqlite3 
+*.sqlite3

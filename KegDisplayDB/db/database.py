@@ -23,8 +23,9 @@ class DatabaseManager:
     Manages the beer and tap tables and provides CRUD operations.
     """
     
-    # Class variable to store connection pools for different database paths
-    _connection_pools = {}
+    # Class variables to store connection pools for different database paths
+    _rw_connection_pools = {}
+    _ro_connection_pools = {}
     _pool_locks = {}
     
     def __init__(self, db_path, pool_size=5):
@@ -37,25 +38,36 @@ class DatabaseManager:
         self.db_path = db_path
         self.pool_size = pool_size
         
-        self._initialize_connection_pool()
+        self._initialize_connection_pools()
         self.initialize_tables()
     
-    def _initialize_connection_pool(self):
-        """Initialize the connection pool for this database path"""
+    def _initialize_connection_pools(self):
+        """Initialize separate read-write and read-only connection pools for this database path"""
         
         # Create a pool lock if it doesn't exist
         if self.db_path not in self._pool_locks:
             self._pool_locks[self.db_path] = threading.Lock()
         
-        # Create a connection pool if it doesn't exist
+        # Create connection pools if they don't exist
         with self._pool_locks[self.db_path]:
-            if self.db_path not in self._connection_pools:
-                self._connection_pools[self.db_path] = queue.Queue(maxsize=self.pool_size)
+            # Initialize read-write pool
+            if self.db_path not in self._rw_connection_pools:
+                self._rw_connection_pools[self.db_path] = queue.Queue(maxsize=self.pool_size)
                 
-                # Pre-populate the pool with connections
+                # Pre-populate the read-write pool with connections
                 for _ in range(self.pool_size):
                     conn = sqlite3.connect(self.db_path, check_same_thread=False)
-                    self._connection_pools[self.db_path].put(conn)
+                    self._rw_connection_pools[self.db_path].put(conn)
+            
+            # Initialize read-only pool
+            if self.db_path not in self._ro_connection_pools:
+                self._ro_connection_pools[self.db_path] = queue.Queue(maxsize=self.pool_size)
+                
+                # Pre-populate the read-only pool with connections
+                for _ in range(self.pool_size):
+                    conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                    conn.execute("PRAGMA query_only = ON;")  # Set to read-only mode
+                    self._ro_connection_pools[self.db_path].put(conn)
     
     def initialize_tables(self, conn=None):
         """Initialize database tables if they don't exist
@@ -140,7 +152,7 @@ class DatabaseManager:
             raise
     
     def get_connection(self):
-        """Get a database connection from the pool or create a new one
+        """Get a read-write database connection from the pool or create a new one
         
         Returns:
             ConnectionContext: Context manager for the connection
@@ -161,7 +173,7 @@ class DatabaseManager:
                         # Rollback any uncommitted changes if there was an exception
                         if exc_type:
                             self.conn.rollback()
-                        self.db_manager._connection_pools[self.db_manager.db_path].put(self.conn)
+                        self.db_manager._rw_connection_pools[self.db_manager.db_path].put(self.conn)
                 except Exception as e:
                     logger.error(f"Error returning connection to pool: {e}")
                     # If there's an error returning to the pool, close it
@@ -169,10 +181,10 @@ class DatabaseManager:
                         self.conn.close()
 
         try:
-            if self.db_path in self._connection_pools:
+            if self.db_path in self._rw_connection_pools:
                 with self._pool_locks[self.db_path]:
                     try:
-                        conn = self._connection_pools[self.db_path].get(block=False)
+                        conn = self._rw_connection_pools[self.db_path].get(block=False)
                     except queue.Empty:
                         # If pool is empty, create a new connection
                         conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -209,13 +221,13 @@ class DatabaseManager:
                 finally:
                     if self.conn:
                         # Return connection to pool
-                        self.db_manager._connection_pools[self.db_manager.db_path].put(self.conn)
+                        self.db_manager._rw_connection_pools[self.db_manager.db_path].put(self.conn)
                         self.conn = None
                         
         return TransactionContext(self)
 
     def get_read_connection(self):
-        """Get a read-only database connection
+        """Get a read-only database connection from the read-only pool
         
         Returns:
             ReadConnectionContext: Context manager for read-only connections
@@ -226,17 +238,40 @@ class DatabaseManager:
                 self.conn = None
                 
             def __enter__(self):
-                # Get connection from pool
-                self.conn = self.db_manager.get_connection().__enter__()
-                # Set read-only mode
-                self.conn.execute("PRAGMA query_only = ON;")
+                # Get connection from read-only pool
+                try:
+                    if self.db_manager.db_path in self.db_manager._ro_connection_pools:
+                        with self.db_manager._pool_locks[self.db_manager.db_path]:
+                            try:
+                                self.conn = self.db_manager._ro_connection_pools[self.db_manager.db_path].get(block=False)
+                            except queue.Empty:
+                                # If pool is empty, create a new read-only connection
+                                self.conn = sqlite3.connect(self.db_manager.db_path, check_same_thread=False)
+                                self.conn.execute("PRAGMA query_only = ON;")
+                    else:
+                        # Fall back to direct connection if no pool exists
+                        self.conn = sqlite3.connect(self.db_manager.db_path, check_same_thread=False)
+                        self.conn.execute("PRAGMA query_only = ON;")
+                except Exception as e:
+                    logger.error(f"Error getting read-only connection: {e}")
+                    # Fall back to direct connection
+                    self.conn = sqlite3.connect(self.db_manager.db_path, check_same_thread=False)
+                    self.conn.execute("PRAGMA query_only = ON;")
+                
                 return self.conn
                 
             def __exit__(self, exc_type, exc_val, exc_tb):
                 if self.conn:
-                    # Return connection to pool
-                    self.db_manager._connection_pools[self.db_manager.db_path].put(self.conn)
-                    self.conn = None
+                    try:
+                        # Return connection to read-only pool
+                        self.db_manager._ro_connection_pools[self.db_manager.db_path].put(self.conn)
+                        self.conn = None
+                    except Exception as e:
+                        logger.error(f"Error returning read-only connection to pool: {e}")
+                        # If there's an error returning to the pool, close it
+                        if self.conn:
+                            self.conn.close()
+                            self.conn = None
                     
         return ReadConnectionContext(self)
         
@@ -264,16 +299,29 @@ class DatabaseManager:
                 return cursor.fetchone()
     
     def close_all_connections(self):
-        """Close all connections in the pool for this database path"""
-        if self.db_path in self._connection_pools:
-            with self._pool_locks[self.db_path]:
-                # Empty the queue and close all connections
-                while not self._connection_pools[self.db_path].empty():
-                    try:
-                        conn = self._connection_pools[self.db_path].get(block=False)
-                        conn.close()
-                    except Exception as e:
-                        logger.error(f"Error closing connection: {e}")
+        """Close all connections in both pools for this database path"""
+        try:
+            if self.db_path in self._rw_connection_pools:
+                with self._pool_locks[self.db_path]:
+                    # Empty the read-write queue and close all connections
+                    while not self._rw_connection_pools[self.db_path].empty():
+                        try:
+                            conn = self._rw_connection_pools[self.db_path].get(block=False)
+                            conn.close()
+                        except Exception as e:
+                            logger.error(f"Error closing read-write connection: {e}")
+            
+            if self.db_path in self._ro_connection_pools:
+                with self._pool_locks[self.db_path]:
+                    # Empty the read-only queue and close all connections
+                    while not self._ro_connection_pools[self.db_path].empty():
+                        try:
+                            conn = self._ro_connection_pools[self.db_path].get(block=False)
+                            conn.close()
+                        except Exception as e:
+                            logger.error(f"Error closing read-only connection: {e}")
+        except Exception as e:
+            logger.error(f"Error in close_all_connections: {e}")
     
     def __del__(self):
         """Clean up resources when the instance is destroyed"""
@@ -313,7 +361,9 @@ class DatabaseManager:
                 
             if row_factory:
                 conn.row_factory = row_factory
+            ro = self.is_read_only(conn)
             cursor = conn.cursor()
+            ro = self.is_read_only(conn)
             cursor.execute(sql, params)
             
             if is_read_query:
@@ -1201,3 +1251,8 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error calculating content hash: {e}")
             return "0"  # Fallback hash 
+        
+    def is_read_only(self,conn):
+        cursor = conn.execute('PRAGMA query_only;')
+        status = cursor.fetchone()[0]
+        return status == 1
