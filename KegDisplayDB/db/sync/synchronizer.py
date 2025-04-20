@@ -486,7 +486,9 @@ class DatabaseSynchronizer:
             message: Parsed message
             addr: Address the request came from
         """
+        start_time = time.time()
         peer_ip = addr[0]
+        logger.info(f"ENTRY _handle_sync_request from {peer_ip}")
         
         # Get the client's logical clock value and node ID
         last_clock = message.get('last_clock', 0)
@@ -508,6 +510,7 @@ class DatabaseSynchronizer:
         
         # Get a count of all changes in our change log
         total_changes = 0
+        changes = []
         try:
             with self.db_manager.transaction() as conn:
                 # Get total changes count
@@ -532,6 +535,9 @@ class DatabaseSynchronizer:
         except Exception as e:
             logger.error(f"Error getting change log stats: {e}")
             changes = []
+        
+        changes_time = time.time() - start_time
+        logger.debug(f"Time to get changes: {changes_time:.3f}s")
         
         if changes:
             logger.info(f"Found {len(changes)} changes to send to {peer_ip}")
@@ -563,17 +569,24 @@ class DatabaseSynchronizer:
                 if data != self.protocol.create_ack_message():
                     logger.warning(f"Invalid acknowledgment from {peer_ip}")
                     client_socket.close()
+                    elapsed = time.time() - start_time
+                    logger.info(f"EXIT _handle_sync_request from {peer_ip} - invalid acknowledgment - elapsed: {elapsed:.3f}s")
                     return
                 
                 # Send the changes in chunks
+                send_start = time.time()
                 changes_data = self.protocol.serialize_changes(changes)
                 self._send_data_chunked(client_socket, changes_data)
+                send_time = time.time() - send_start
+                logger.debug(f"Time to send changes: {send_time:.3f}s")
                 
                 # Wait for acknowledgment
                 data = client_socket.recv(self.buffer_size)
                 if data != self.protocol.create_ack_message():
                     logger.warning(f"Invalid acknowledgment from {peer_ip}")
                     client_socket.close()
+                    elapsed = time.time() - start_time
+                    logger.info(f"EXIT _handle_sync_request from {peer_ip} - invalid final acknowledgment - elapsed: {elapsed:.3f}s")
                     return
                 
                 logger.info(f"Sent changes to {peer_ip}")
@@ -587,13 +600,20 @@ class DatabaseSynchronizer:
                     except Exception as e:
                         logger.error(f"Error updating logical clock: {e}")
                 
+                elapsed = time.time() - start_time
+                logger.info(f"EXIT _handle_sync_request from {peer_ip} - sent {len(changes)} changes - elapsed: {elapsed:.3f}s")
+                
             except socket.timeout:
-                logger.error(f"Socket timeout while sending changes to {peer_ip}")
+                elapsed = time.time() - start_time
+                logger.error(f"Socket timeout while sending changes to {peer_ip} - elapsed: {elapsed:.3f}s")
                 client_socket.close()
+                logger.info(f"EXIT _handle_sync_request from {peer_ip} - socket timeout - elapsed: {elapsed:.3f}s")
                 return
             except Exception as e:
-                logger.error(f"Error sending changes to {peer_ip}: {e}")
+                elapsed = time.time() - start_time
+                logger.error(f"Error sending changes to {peer_ip}: {e} - elapsed: {elapsed:.3f}s")
                 client_socket.close()
+                logger.info(f"EXIT _handle_sync_request from {peer_ip} with error - elapsed: {elapsed:.3f}s")
                 return
         else:
             logger.info(f"No changes to send to {peer_ip}")
@@ -618,9 +638,14 @@ class DatabaseSynchronizer:
                             logger.debug(f"Updated our logical clock after successful sync (no changes) with peer's clock: {peer_clock}")
                     except Exception as e:
                         logger.error(f"Error updating logical clock: {e}")
+                        
+                elapsed = time.time() - start_time
+                logger.info(f"EXIT _handle_sync_request from {peer_ip} - no changes to send - elapsed: {elapsed:.3f}s")
             except Exception as e:
-                logger.error(f"Error sending response: {e}")
+                elapsed = time.time() - start_time
+                logger.error(f"Error sending response: {e} - elapsed: {elapsed:.3f}s")
                 client_socket.close()
+                logger.info(f"EXIT _handle_sync_request from {peer_ip} with error - elapsed: {elapsed:.3f}s")
                 return
         
         client_socket.close()
