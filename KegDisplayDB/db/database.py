@@ -16,6 +16,7 @@ import uuid
 import shutil
 import traceback
 import socket
+import re
 
 # Global transaction tracker dictionary to monitor all active database connections
 active_connections = {}
@@ -26,6 +27,24 @@ db_write_semaphore = {}
 db_write_semaphore_lock = threading.RLock()
 
 logger = logging.getLogger("KegDisplay")
+
+def format_stack_trace(stack):
+    """Format a stack trace to a concise format: file:line(function)--file:line(function)--etc
+    
+    Args:
+        stack: The stack trace to format (from traceback.extract_stack())
+        
+    Returns:
+        str: Formatted stack trace
+    """
+    frames = []
+    for frame in stack:
+        # Extract just the filename without directory
+        filename = os.path.basename(frame.filename)
+        frames.append(f"{filename}:{frame.lineno}({frame.name})")
+    
+    # Join with double hyphen separators
+    return "--".join(frames)
 
 def register_connection(conn, origin):
     """Register a connection in the global active_connections dictionary
@@ -40,10 +59,14 @@ def register_connection(conn, origin):
         stack = traceback.extract_stack()
         # Remove the last two frames which are this function and its caller
         stack = stack[:-2]
+        
+        # Format the stack trace in a concise format
+        formatted_stack = format_stack_trace(stack)
+        
         active_connections[conn_id] = {
             'connection': conn,
             'origin': origin,
-            'stack': ''.join(traceback.format_list(stack)),
+            'stack': formatted_stack,
             'thread': threading.current_thread().name,
             'time_opened': datetime.now().isoformat()
         }
@@ -75,11 +98,8 @@ def _connection_logger():
                         logger.info(f"  Origin: {info['origin']}")
                         logger.info(f"  Thread: {info['thread']}")
                         logger.info(f"  Opened at: {info['time_opened']}")
-                        # Show the full stack trace
-                        stack_full = info['stack'].strip()
-                        # Fix the backslash issue by using separate string concatenation
-                        indented_stack = stack_full.replace('\n', '\n    ')
-                        logger.info(f"  Stack: \n    {indented_stack}")
+                        # Log the simplified stack trace
+                        logger.info(f"  Stack: {info['stack']}")
                         logger.info("  " + "-" * 40)
                 else:
                     logger.info("No active database connections")
@@ -301,7 +321,7 @@ class DatabaseManager:
             # If we didn't get the lock within the initial timeout, log and try again with the remaining timeout
             if not acquired_lock:
                 elapsed = time.time() - start_time
-                logger.info(f"Waiting for database lock ({elapsed:.2f}s) in get_connection")
+                logger.info(f"Waiting for database lock ({elapsed:.2f}s) in get_connection: Next SQL likely a write operation")
                 
                 # Try again with the remaining timeout (10 seconds total max wait)
                 remaining_timeout = 10.0 - elapsed
@@ -310,9 +330,9 @@ class DatabaseManager:
                     
                     total_wait = time.time() - start_time
                     if acquired_lock:
-                        logger.info(f"Acquired database lock after {total_wait:.2f}s in get_connection")
+                        logger.info(f"Acquired database lock after {total_wait:.2f}s in get_connection: Next SQL likely a write operation")
                     else:
-                        logger.warning(f"Failed to acquire database lock after {total_wait:.2f}s in get_connection")
+                        logger.warning(f"Failed to acquire database lock after {total_wait:.2f}s in get_connection: Next SQL likely a write operation")
             else:
                 logger.debug(f"Acquired database lock immediately in get_connection")
             
@@ -373,7 +393,8 @@ class DatabaseManager:
                 # If we didn't get the lock within the initial timeout, log and try again
                 if not self.acquired_lock:
                     elapsed = time.time() - start_time
-                    logger.info(f"Waiting for database lock ({elapsed:.2f}s) in transaction from {self.origin}")
+                    caller_info = f"from {self.origin}"
+                    logger.info(f"Waiting for database lock ({elapsed:.2f}s) in transaction {caller_info}")
                     
                     # Try again with the remaining timeout (10 seconds total max wait)
                     remaining_timeout = 10.0 - elapsed
@@ -382,11 +403,11 @@ class DatabaseManager:
                         
                         total_wait = time.time() - start_time
                         if self.acquired_lock:
-                            logger.info(f"Acquired database lock after {total_wait:.2f}s in transaction")
+                            logger.info(f"Acquired database lock after {total_wait:.2f}s in transaction {caller_info}")
                         else:
-                            logger.warning(f"Failed to acquire database lock after {total_wait:.2f}s in transaction")
+                            logger.warning(f"Failed to acquire database lock after {total_wait:.2f}s in transaction {caller_info}")
                 else:
-                    logger.debug(f"Acquired database lock immediately in transaction")
+                    logger.debug(f"Acquired database lock immediately in transaction from {self.origin}")
                 
                 # Get a connection from the pool
                 try:
@@ -462,7 +483,8 @@ class DatabaseManager:
                 # If we didn't get the lock within the initial timeout, log and try again
                 if not self.acquired_lock:
                     elapsed = time.time() - start_time
-                    logger.info(f"Waiting for database lock ({elapsed:.2f}s) in read connection")
+                    caller_info = f"from {self.origin}"
+                    logger.info(f"Waiting for database lock ({elapsed:.2f}s) in read connection {caller_info}")
                     
                     # Try again with the remaining timeout (10 seconds total max wait)
                     remaining_timeout = 10.0 - elapsed
@@ -471,9 +493,9 @@ class DatabaseManager:
                         
                         total_wait = time.time() - start_time
                         if self.acquired_lock:
-                            logger.info(f"Acquired database lock after {total_wait:.2f}s in read connection")
+                            logger.info(f"Acquired database lock after {total_wait:.2f}s in read connection {caller_info}")
                         else:
-                            logger.warning(f"Failed to acquire database lock after {total_wait:.2f}s in read connection")
+                            logger.warning(f"Failed to acquire database lock after {total_wait:.2f}s in read connection {caller_info}")
                 else:
                     logger.debug(f"Acquired database lock immediately in read connection")
                 
@@ -545,6 +567,16 @@ class DatabaseManager:
         should_commit = conn is None and not is_read_query
         conn_context = None
         
+        # Log every query execution
+        # Truncate really long queries and format parameters for logs
+        query_log = sql[:500] + ("..." if len(sql) > 500 else "")
+        params_str = str(params)[:100] if params else "()"
+        
+        if is_read_query:
+            logger.debug(f"Executing READ query: {query_log} with params {params_str}")
+        else:
+            logger.info(f"Executing WRITE query: {query_log} with params {params_str}")
+        
         # Transient errors that can be retried
         RETRYABLE_ERRORS = (
             sqlite3.OperationalError,  # Lock timeout, database is locked, etc.
@@ -576,18 +608,32 @@ class DatabaseManager:
                     if row_factory:
                         conn.row_factory = row_factory
                     cursor = conn.cursor()
+                    
+                    # Track query execution time
+                    start_time = time.time()
                     cursor.execute(sql, params)
+                    execution_time = time.time() - start_time
+                    
+                    # Log slow queries (more than 100ms)
+                    if execution_time > 0.1:
+                        logger.info(f"Slow query ({execution_time:.3f}s): {query_log}")
                     
                     if is_read_query:
+                        result = None
                         if fetch_all:
-                            return cursor.fetchall()
+                            result = cursor.fetchall()
+                            logger.debug(f"Query returned {len(result) if result else 0} rows in {execution_time:.3f}s")
                         else:
-                            return cursor.fetchone()
+                            result = cursor.fetchone()
+                            logger.debug(f"Query returned {'data' if result else 'no data'} in {execution_time:.3f}s")
+                        return result
                     else:
                         # Only commit if we created our own connection
                         if should_commit:
                             conn.commit()
-                        return cursor.lastrowid if cursor.lastrowid else cursor.rowcount
+                        result = cursor.lastrowid if cursor.lastrowid else cursor.rowcount
+                        logger.debug(f"Write query affected {cursor.rowcount} rows, last rowid: {cursor.lastrowid}, execution time: {execution_time:.3f}s")
+                        return result
                         
                 except RETRYABLE_ERRORS as e:
                     last_error = e
@@ -622,7 +668,7 @@ class DatabaseManager:
                     # Only rollback if we created our own connection
                     if should_commit and conn:
                         conn.rollback()
-                    logger.error(f"Error executing query: {sql[:100]}..., {e}")
+                    logger.error(f"Error executing query: {query_log}, {e}")
                     raise
                     
                 finally:
@@ -631,7 +677,7 @@ class DatabaseManager:
                         conn_context.__exit__(None, None, None)
                     
             # If we get here, we've exceeded max retries
-            logger.error(f"Query failed after {max_retries} retries: {sql[:100]}...")
+            logger.error(f"Query failed after {max_retries} retries: {query_log}")
             raise last_error
         finally:
             # We don't need to release semaphore here anymore - transaction/connection contexts will handle it
