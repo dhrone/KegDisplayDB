@@ -1637,13 +1637,12 @@ class DatabaseSynchronizer:
         
         while self.running:
             try:
-                # Use a transaction for database operations
-                with self.db_manager.transaction() as conn:
-                    # Increment logical clock for this control message
-                    self.change_tracker.increment_logical_clock(conn=conn)
-                    
-                    # Get current database version
-                    version = self.change_tracker.get_db_version(conn=conn)
+
+                # Increment logical clock for this control message
+                self.change_tracker.increment_logical_clock()
+                
+                # Get current database version
+                version = self.change_tracker.get_db_version()
                 
                 # Network operations outside the transaction
                 # Create and broadcast heartbeat message

@@ -212,8 +212,7 @@ def get_db_tables():
             logger.error("Database synchronization service not available")
             return []
             
-        with synced_db.db_manager.transaction() as conn:
-            tables = synced_db.db_manager.query("SELECT name FROM sqlite_master WHERE type='table';", conn=conn)
+        tables = synced_db.db_manager.execute("SELECT name FROM sqlite_master WHERE type='table'")
         return [table[0] for table in tables]
     except Exception as e:
         logger.error(f"Error getting database tables: {e}")
@@ -227,8 +226,7 @@ def get_table_schema(table_name):
             logger.error("Database synchronization service not available")
             return []
             
-        with synced_db.db_manager.transaction() as conn:
-            schema = synced_db.db_manager.query(f"PRAGMA table_info({table_name});", conn=conn)
+        schema = synced_db.db_manager.execute(f"PRAGMA table_info({table_name})")
         return schema
     except Exception as e:
         logger.error(f"Error getting schema for table {table_name}: {e}")
@@ -242,10 +240,9 @@ def get_table_data(table_name):
             logger.error("Database synchronization service not available")
             return [], []
             
-        with synced_db.db_manager.transaction() as conn:
-            data = synced_db.db_manager.query(f"SELECT * FROM {table_name};", conn=conn)
-            schema = get_table_schema(table_name)
-            columns = [col[1] for col in schema]
+        data = synced_db.db_manager.execute(f"SELECT * FROM {table_name}")
+        schema = get_table_schema(table_name)
+        columns = [col[1] for col in schema]
         return columns, data
     except Exception as e:
         logger.error(f"Error getting data from table {table_name}: {e}")
