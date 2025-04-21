@@ -268,6 +268,7 @@ class DatabaseManager:
                 self.acquired_lock = acquired_lock
             
             def __enter__(self):
+                logger.info(f"ENTRY rw connection from {self.origin}")  
                 # Register the connection in the global tracker
                 register_connection(self.conn, self.origin)
                 return self.conn
@@ -302,6 +303,8 @@ class DatabaseManager:
                                 if self.db_manager.db_path in db_write_semaphore:
                                     db_write_semaphore[self.db_manager.db_path].release()
                                     logger.debug(f"Released database lock in connection exception handler")
+                finally:   
+                    logger.info(f"EXIT rw connection from {self.origin}")
 
         try:
             # Acquire the database semaphore
@@ -380,6 +383,7 @@ class DatabaseManager:
                 
             def __enter__(self):
                 # Acquire the database semaphore
+                logger.info(f"ENTRY transaction from {self.origin}")
                 with db_write_semaphore_lock:
                     if self.db_manager.db_path not in db_write_semaphore:
                         db_write_semaphore[self.db_manager.db_path] = threading.Semaphore(1)
@@ -439,6 +443,7 @@ class DatabaseManager:
                         else:
                             self.conn.rollback()
                 finally:
+                    logger.info(f"EXIT transaction from {self.origin}")
                     if self.conn:
                         # Unregister from global tracker
                         unregister_connection(self.conn)
@@ -470,6 +475,7 @@ class DatabaseManager:
                 
             def __enter__(self):
                 # Acquire the database semaphore
+                logger.info(f"ENTRY read connection from {self.origin}")
                 with db_write_semaphore_lock:
                     if self.db_manager.db_path not in db_write_semaphore:
                         db_write_semaphore[self.db_manager.db_path] = threading.Semaphore(1)
@@ -545,6 +551,7 @@ class DatabaseManager:
                         if self.db_manager.db_path in db_write_semaphore:
                             db_write_semaphore[self.db_manager.db_path].release()
                             logger.debug(f"Released database lock in read connection exit")
+                logger.info(f"EXIT read connection from {self.origin}")
                     
         return ReadConnectionContext(self)
         
@@ -573,7 +580,7 @@ class DatabaseManager:
         params_str = str(params)[:100] if params else "()"
         
         if is_read_query:
-            logger.debug(f"Executing READ query: {query_log} with params {params_str}")
+            logger.info(f"Executing READ query: {query_log} with params {params_str}")
         else:
             logger.info(f"Executing WRITE query: {query_log} with params {params_str}")
         
