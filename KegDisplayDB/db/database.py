@@ -18,6 +18,10 @@ import traceback
 import socket
 import re
 
+from concurrent.futures import Future
+from typing import Callable, TypeVar, Any, Optional
+
+
 # Global transaction tracker dictionary to monitor all active database connections
 active_connections = {}
 active_connections_lock = threading.RLock()
@@ -46,73 +50,197 @@ def format_stack_trace(stack):
     # Join with double hyphen separators
     return "--".join(frames)
 
-def register_connection(conn, origin):
-    """Register a connection in the global active_connections dictionary
-    
-    Args:
-        conn: The database connection
-        origin: String description or stack trace of where the connection was opened
-    """
-    with active_connections_lock:
-        # Use connection object's ID as a unique identifier
-        conn_id = id(conn)
-        stack = traceback.extract_stack()
-        # Remove the last two frames which are this function and its caller
-        stack = stack[:-2]
         
-        # Format the stack trace in a concise format
-        formatted_stack = format_stack_trace(stack)
-        
-        active_connections[conn_id] = {
-            'connection': conn,
-            'origin': origin,
-            'stack': formatted_stack,
-            'thread': threading.current_thread().name,
-            'time_opened': datetime.now().isoformat()
+# Generic return type for transactional functions
+R = TypeVar("R")
+
+class DBService:
+    def __init__(
+        self,
+        db_path: str,
+        pragmas: Optional[dict[str, Any]] = None,
+        busy_timeout: int = 5000
+    ):
+        """
+        Initialize the DBService and open the SQLite connection in __init__.
+
+        db_path: Path to SQLite file.
+        pragmas: PRAGMA settings (e.g. {'journal_mode': 'WAL'}).
+        busy_timeout: Milliseconds SQLite will wait when database is busy.
+        """
+        self._db_path = db_path
+        self._pragmas = pragmas or {
+            'journal_mode': 'WAL',
+            'synchronous': 'NORMAL'
         }
-        
-def unregister_connection(conn):
-    """Remove a connection from the global active_connections dictionary
-    
-    Args:
-        conn: The database connection to unregister
-    """
-    with active_connections_lock:
-        conn_id = id(conn)
-        if conn_id in active_connections:
-            del active_connections[conn_id]
+        self._busy_timeout = busy_timeout
+        # Queue holds tuples: (kind, payload, future, enqueue_time)
+        self._queue: "queue.Queue[tuple[str, Any, Future, float]]" = queue.Queue()
+        self._shutdown_event = threading.Event()
 
-# Thread function to periodically log active connections
-def _connection_logger():
-    """Background thread that logs all active connections every 10 seconds"""
-    while True:
+
+        # Open connection now, allowing cross-thread use
         try:
-            time.sleep(1)  # Log every 10 seconds
-            with active_connections_lock:
-                conn_count = len(active_connections)
-                if conn_count > 0:
-                    logger.info(f"==== ACTIVE DATABASE CONNECTIONS: {conn_count} ====")
-                    for conn_id, info in active_connections.items():
-                        # Format a readable log entry for each connection
-                        logger.info(f"Connection {conn_id}:")
-                        logger.info(f"  Origin: {info['origin']}")
-                        logger.info(f"  Thread: {info['thread']}")
-                        logger.info(f"  Opened at: {info['time_opened']}")
-                        # Log the simplified stack trace
-                        logger.info(f"  Stack: {info['stack']}")
-                        logger.info("  " + "-" * 40)
-                else:
-                    logger.info("No active database connections")
-        except Exception as e:
-            logger.error(f"Error in connection logger thread: {e}")
+            self._conn = sqlite3.connect(
+                self._db_path,
+                check_same_thread=False,
+                isolation_level=None  # autocommit off; manage transactions manually
+            )
+            self._configure_pragmas()
+        except Exception:
+            self.logger.exception("DBS INIT ERROR: Failed to open SQLite connection.")
+            raise
 
-# Start the connection logger thread
-connection_logger_thread = threading.Thread(
-    target=_connection_logger,
-    name="ConnectionLogger",
-    daemon=True  # Make thread exit when main program exits
-)
-connection_logger_thread.start()
+        # Start actor thread
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _configure_pragmas(self) -> None:
+        """Apply PRAGMAs and busy timeout settings on the connection."""
+        cursor = self._conn.cursor()
+        for key, value in self._pragmas.items():
+            cursor.execute(f"PRAGMA {key}={value};")
+        cursor.execute(f"PRAGMA busy_timeout={self._busy_timeout};")
+        cursor.close()
+
+    @staticmethod
+    def _normalize_sql(sql: str) -> str:
+        """Normalize SQL to a single line with trimmed whitespace."""
+        return ' '.join(sql.split())
+
+    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> Any:
+        """
+        Execute a single SQL statement.
+        - SELECT returns list of rows;
+        - other DML returns number of affected rows.
+        """
+        enqueue_time = time.monotonic()
+        norm_sql = self._normalize_sql(sql)
+        self.logger.debug(
+            "DBS QUEUED EXECUTE: %s (%r)",
+            norm_sql, params
+        )
+        future = Future()
+        self._queue.put(("single", (sql, params), future, enqueue_time))
+        return future.result()
+
+    def run_in_transaction(self, fn: Callable[[sqlite3.Connection], R]) -> R:
+        """
+        Run arbitrary logic fn inside a single transaction, returning fn's result.
+        The entire operation is atomic: commit on success, rollback on error.
+        """
+        enqueue_time = time.monotonic()
+        fn_name = getattr(fn, '__name__', repr(fn))
+        self.logger.debug(
+            "DBS QUEUED TRANSACTION: %s",
+            fn_name
+        )
+        future: Future = Future()
+        self._queue.put(("tx", fn, future, enqueue_time))
+        return future.result()
+
+    def shutdown(self, wait: bool = True) -> None:
+        """
+        Signal the actor loop to exit, close connection, and clean up.
+        If wait is True, block until shutdown completes.
+        """
+        enqueue_time = time.monotonic()
+        self.logger.debug(
+            "DBS QUEUED SHUTDOWN"
+        )
+        future = Future()
+        self._queue.put(("shutdown", None, future, enqueue_time))
+        if wait:
+            future.result()
+            self._thread.join()
+
+    def _run(self) -> None:
+        """Actor loop: processes all DB requests serially in a single thread."""
+        while not self._shutdown_event.is_set():
+            kind, payload, future, enqueue_time = self._queue.get()
+            dequeue_time = time.monotonic()
+            wait_time = dequeue_time - enqueue_time
+            try:
+                if kind == "single":
+                    sql, params = payload
+                    norm_sql = self._normalize_sql(sql)
+                    self.logger.debug(
+                        "DBS PROCESS EXECUTE: %s (%r) (waited %.3fs)",
+                        norm_sql, wait_time, params
+                    )
+                    start_time = time.monotonic()
+                    cur = self._conn.execute(sql, params)
+                    if sql.strip().upper().startswith("SELECT"):
+                        result = cur.fetchall()
+                    else:
+                        result = cur.rowcount
+                        self._conn.commit()
+                    duration = time.monotonic() - start_time
+                    self.logger.debug(
+                        "DBS COMPLETE EXECUTE: %s (%r) (took %.3fs) ",
+                        norm_sql, duration, params
+                    )
+                    future.set_result(result)
+
+                elif kind == "tx":
+                    fn: Callable[[sqlite3.Connection], R] = payload
+                    fn_name = getattr(fn, '__name__', repr(fn))
+                    self.logger.debug(
+                        "DBS PROCESS TRANSACTION: %s (waited %.3fs)",
+                        fn_name, wait_time
+                    )
+                    start_time = time.monotonic()
+                    try:
+                        self._conn.execute("BEGIN;")
+                        outcome: R = fn(self._conn)
+                        self._conn.commit()
+                        duration = time.monotonic() - start_time
+                        self.logger.debug(
+                            "DBS COMPLETE TRANSACTION: %s (took %.3fs)",
+                            fn_name, duration
+                        )
+                        future.set_result(outcome)
+                    except Exception as e:
+                        self._conn.rollback()
+                        self.logger.debug(
+                            "DBS TRANSACTION FAILED: %s after %.3fs: %s",
+                            fn_name, time.monotonic() - start_time, e
+                        )
+                        future.set_exception(e)
+
+                elif kind == "shutdown":
+                    self.logger.debug(
+                        "DBS PROCESS SHUTDOWN (waited %.3fs)",
+                        wait_time
+                    )
+                    self._shutdown_event.set()
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        self.logger.exception(
+                            "DBS SHUTDOWN ERROR: Error closing SQLite connection."
+                        )
+                    future.set_result(None)
+
+                else:
+                    future.set_exception(
+                        ValueError(f"DBS UNKNOWN REQUEST KIND: {kind}")
+                    )
+
+            except Exception as exc:
+                self.logger.exception(
+                    "DBS ERROR HANDLING REQUEST '%s' after %.3fs.",
+                    kind, wait_time
+                )
+                try:
+                    future.set_exception(exc)
+                except Exception:
+                    self.logger.exception(
+                        "DBS ERROR SETTING EXCEPTION FOR '%s'.",
+                        kind
+                    )
+
+
 
 class DatabaseManager:
     """
@@ -132,46 +260,48 @@ class DatabaseManager:
             db_path: Path to the SQLite database file
             pool_size: Size of the connection pool
         """
-        self.db_path = db_path
-        self.pool_size = pool_size
-        
-        # Ensure this database path has a write semaphore
-        with db_write_semaphore_lock:
-            if self.db_path not in db_write_semaphore:
-                db_write_semaphore[self.db_path] = threading.Semaphore(1)
-        
-        self._initialize_connection_pools()
+        self.db_path = db_path        
         self.initialize_tables()
+        self.dbs = DBService(db_path)
     
-    def _initialize_connection_pools(self):
-        """Initialize separate read-write and read-only connection pools for this database path"""
+    def __del__(self):
+        """Cleanup method to ensure DBService is properly shut down"""
+        if hasattr(self, 'dbs'):
+            try:
+                self.dbs.shutdown()
+            except Exception as e:
+                logger.error(f"Error shutting down DBService: {e}")
+    
+    def execute(self, sql, params=()):
+        """
+        Execute a single SQL statement through DBService
         
-        # Create a pool lock if it doesn't exist
-        if self.db_path not in self._pool_locks:
-            self._pool_locks[self.db_path] = threading.Lock()
-        
-        # Create connection pools if they don't exist
-        with self._pool_locks[self.db_path]:
-            # Initialize read-write pool
-            if self.db_path not in self._rw_connection_pools:
-                self._rw_connection_pools[self.db_path] = queue.Queue(maxsize=self.pool_size)
-                
-                # Pre-populate the read-write pool with connections
-                for _ in range(self.pool_size):
-                    conn = sqlite3.connect(self.db_path, check_same_thread=False)
-                    self._rw_connection_pools[self.db_path].put(conn)
+        Args:
+            sql: SQL statement to execute
+            params: Parameters for the SQL statement
+            conn: Optional connection for backwards compatibility (ignored)
             
-            # Initialize read-only pool
-            if self.db_path not in self._ro_connection_pools:
-                self._ro_connection_pools[self.db_path] = queue.Queue(maxsize=self.pool_size)
-                
-                # Pre-populate the read-only pool with connections
-                for _ in range(self.pool_size):
-                    conn = sqlite3.connect(self.db_path, check_same_thread=False)
-                    conn.execute("PRAGMA query_only = ON;")  # Set to read-only mode
-                    self._ro_connection_pools[self.db_path].put(conn)
+        Returns:
+            For SELECT statements: List of rows
+            For other DML: Number of affected rows
+        """
+            
+        return self.dbs.execute(sql, params)
     
-    def initialize_tables(self, conn=None):
+    def transaction(self, fn=None):
+        """
+        Run a function inside a transaction through DBService
+        
+        Args:
+            fn: Function to run in the transaction
+            
+        Returns:
+            Result of the function or transaction context manager if fn is None
+        """
+
+        return self.dbs.run_in_transaction(fn)
+    
+    def initialize_tables(self):
         """Initialize database tables if they don't exist
         
         Args:
@@ -179,7 +309,7 @@ class DatabaseManager:
         """
         try:
             # Create beers table if it doesn't exist
-            self.query('''
+            self.execute('''
                 CREATE TABLE IF NOT EXISTS beers (
                     idBeer INTEGER PRIMARY KEY,
                     Name tinytext NOT NULL,
@@ -194,18 +324,18 @@ class DatabaseManager:
                     Tapped datetime,
                     Notes TEXT
                 )
-            ''', conn=conn)
+            ''')
             
             # Create taps table if it doesn't exist
-            self.query('''
+            self.execute('''
                 CREATE TABLE IF NOT EXISTS taps (
                     idTap INTEGER PRIMARY KEY,
                     idBeer INTEGER
                 )
-            ''', conn=conn)
+            ''')
             
             # Create change_log table if it doesn't exist
-            self.query('''
+            self.execute('''
                 CREATE TABLE IF NOT EXISTS change_log (
                     id INTEGER PRIMARY KEY,
                     table_name TEXT NOT NULL,
@@ -217,10 +347,10 @@ class DatabaseManager:
                     logical_clock INTEGER DEFAULT 0,
                     node_id TEXT
                 )
-            ''', conn=conn)
+            ''')
             
             # Create version table if it doesn't exist
-            self.query('''
+            self.execute('''
                 CREATE TABLE IF NOT EXISTS version (
                     id INTEGER PRIMARY KEY,
                     timestamp TEXT NOT NULL,
@@ -228,24 +358,23 @@ class DatabaseManager:
                     logical_clock INTEGER DEFAULT 0,
                     node_id TEXT
                 )
-            ''', conn=conn)
+            ''')
             
             # Initialize version table with a valid record if it doesn't exist
-            count = self.query("SELECT COUNT(*) FROM version WHERE id = 1", conn=conn)
-            if count and count[0] == 0:
+            count_result = self.execute("SELECT COUNT(*) FROM version WHERE id = 1")
+            if count_result and count_result[0][0] == 0:
                 # Generate a node ID for this instance
                 node_id = str(uuid.uuid4())
                 
                 # Calculate initial hash for empty tables
                 tables = ['beers', 'taps']
-                initial_hash = self._calculate_db_hash(tables, conn)
+                initial_hash = self._calculate_db_hash(tables)
                 
                 # Create initial version record
                 timestamp = datetime.now(UTC).isoformat()
-                self.query(
+                self.execute(
                     "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, 0, ?)",
-                    (timestamp, initial_hash, node_id),
-                    conn=conn
+                    (timestamp, initial_hash, node_id)
                 )
             
             logger.info("Database tables initialized")
@@ -253,448 +382,11 @@ class DatabaseManager:
             logger.error(f"Error initializing database tables: {e}")
             raise
     
-    def get_connection(self):
-        """Get a read-write database connection from the pool or create a new one
-        
-        Returns:
-            ConnectionContext: Context manager for the connection
-        """
-        # Use a context manager to ensure connections are returned to the pool
-        class ConnectionContext:
-            def __init__(self, db_manager, conn, acquired_lock=False):
-                self.db_manager = db_manager
-                self.conn = conn
-                self.origin = f"RW Connection from {traceback.extract_stack()[-3].name}"
-                self.acquired_lock = acquired_lock
-            
-            def __enter__(self):
-                logger.info(f"ENTRY rw connection from {self.origin}")  
-                # Register the connection in the global tracker
-                register_connection(self.conn, self.origin)
-                return self.conn
-            
-            def __exit__(self, exc_type, exc_val, exc_tb):
-                # Return connection to the pool instead of closing it
-                try:
-                    if self.conn:
-                        # Rollback any uncommitted changes if there was an exception
-                        if exc_type:
-                            self.conn.rollback()
-                        # Unregister from global tracker before returning to pool
-                        unregister_connection(self.conn)
-                        self.db_manager._rw_connection_pools[self.db_manager.db_path].put(self.conn)
-                        
-                        # Release the semaphore if we acquired it
-                        if self.acquired_lock:
-                            with db_write_semaphore_lock:
-                                if self.db_manager.db_path in db_write_semaphore:
-                                    db_write_semaphore[self.db_manager.db_path].release()
-                                    logger.debug(f"Released database lock in connection exit")
-                except Exception as e:
-                    logger.error(f"Error returning connection to pool: {e}")
-                    # If there's an error returning to the pool, close it
-                    if self.conn:
-                        unregister_connection(self.conn)
-                        self.conn.close()
-                        
-                        # Release the semaphore if we acquired it
-                        if self.acquired_lock:
-                            with db_write_semaphore_lock:
-                                if self.db_manager.db_path in db_write_semaphore:
-                                    db_write_semaphore[self.db_manager.db_path].release()
-                                    logger.debug(f"Released database lock in connection exception handler")
-                finally:   
-                    logger.info(f"EXIT rw connection from {self.origin}")
-
-        try:
-            # Acquire the database semaphore
-            acquired_lock = False
-            
-            # Get the semaphore for this database path
-            with db_write_semaphore_lock:
-                if self.db_path not in db_write_semaphore:
-                    db_write_semaphore[self.db_path] = threading.Semaphore(1)
-                db_semaphore = db_write_semaphore[self.db_path]
-            
-            # First try to acquire with a short timeout
-            initial_timeout = 0.5
-            start_time = time.time()
-            acquired_lock = db_semaphore.acquire(timeout=initial_timeout)
-            
-            # If we didn't get the lock within the initial timeout, log and try again with the remaining timeout
-            if not acquired_lock:
-                elapsed = time.time() - start_time
-                logger.info(f"Waiting for database lock ({elapsed:.2f}s) in get_connection: Next SQL likely a write operation")
-                
-                # Try again with the remaining timeout (10 seconds total max wait)
-                remaining_timeout = 10.0 - elapsed
-                if remaining_timeout > 0:
-                    acquired_lock = db_semaphore.acquire(timeout=remaining_timeout)
-                    
-                    total_wait = time.time() - start_time
-                    if acquired_lock:
-                        logger.info(f"Acquired database lock after {total_wait:.2f}s in get_connection: Next SQL likely a write operation")
-                    else:
-                        logger.warning(f"Failed to acquire database lock after {total_wait:.2f}s in get_connection: Next SQL likely a write operation")
-            else:
-                logger.debug(f"Acquired database lock immediately in get_connection")
-            
-            if self.db_path in self._rw_connection_pools:
-                with self._pool_locks[self.db_path]:
-                    try:
-                        conn = self._rw_connection_pools[self.db_path].get(block=False)
-                    except queue.Empty:
-                        # If pool is empty, create a new connection
-                        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-                
-                return ConnectionContext(self, conn, acquired_lock)
-            
-            # If we failed to get a connection but acquired a lock, release it
-            if acquired_lock:
-                with db_write_semaphore_lock:
-                    if self.db_path in db_write_semaphore:
-                        db_write_semaphore[self.db_path].release()
-                        logger.debug(f"Released database lock due to connection failure")
-                
-        except Exception as e:
-            logger.error(f"Error getting connection from pool: {e}")
-            
-            # Make sure to release the lock if we acquired it but hit an exception
-            if acquired_lock:
-                with db_write_semaphore_lock:
-                    if self.db_path in db_write_semaphore:
-                        db_write_semaphore[self.db_path].release()
-                        logger.debug(f"Released database lock due to exception in get_connection")
-                        
-            raise
-            
-    def transaction(self):
-        """Create a transaction context for atomic write operations
-        
-        Returns:
-            TransactionContext: A context manager for transaction handling
-        """
-        class TransactionContext:
-            def __init__(self, db_manager):
-                self.db_manager = db_manager
-                self.conn = None
-                self.origin = f"Transaction from {traceback.extract_stack()[-3].name}"
-                self.acquired_lock = False
-                self.start_time = time.time()
-                
-            def __enter__(self):
-                # Acquire the database semaphore
-                logger.info(f"ENTRY transaction from {self.origin} started {self.start_time}")
-                with db_write_semaphore_lock:
-                    if self.db_manager.db_path not in db_write_semaphore:
-                        db_write_semaphore[self.db_manager.db_path] = threading.Semaphore(1)
-                    db_semaphore = db_write_semaphore[self.db_manager.db_path]
-                
-                # First try to acquire with a short timeout
-                initial_timeout = 0.5
-                start_time = time.time()
-                self.acquired_lock = db_semaphore.acquire(timeout=initial_timeout)
-                
-                # If we didn't get the lock within the initial timeout, log and try again
-                if not self.acquired_lock:
-                    elapsed = time.time() - start_time
-                    caller_info = f"from {self.origin}"
-                    logger.info(f"Waiting for database lock ({elapsed:.2f}s) in transaction {caller_info}")
-                    
-                    # Try again with the remaining timeout (10 seconds total max wait)
-                    remaining_timeout = 10.0 - elapsed
-                    if remaining_timeout > 0:
-                        self.acquired_lock = db_semaphore.acquire(timeout=remaining_timeout)
-                        
-                        total_wait = time.time() - start_time
-                        if self.acquired_lock:
-                            logger.info(f"Acquired database lock after {total_wait:.2f}s in transaction {caller_info}")
-                        else:
-                            logger.warning(f"Failed to acquire database lock after {total_wait:.2f}s in transaction {caller_info}")
-                else:
-                    logger.debug(f"Acquired database lock immediately in transaction from {self.origin}")
-                
-                # Get a connection from the pool
-                try:
-                    with self.db_manager._pool_locks[self.db_manager.db_path]:
-                        try:
-                            self.conn = self.db_manager._rw_connection_pools[self.db_manager.db_path].get(block=False)
-                        except queue.Empty:
-                            # If pool is empty, create a new connection
-                            self.conn = sqlite3.connect(self.db_manager.db_path, check_same_thread=False)
-                    
-                    self.conn.execute('BEGIN TRANSACTION')
-                    # Register the transaction in the global tracker
-                    register_connection(self.conn, self.origin)
-                    return self.conn
-                except Exception as e:
-                    # If we fail to get a connection, release the lock if we acquired it
-                    if self.acquired_lock:
-                        with db_write_semaphore_lock:
-                            if self.db_manager.db_path in db_write_semaphore:
-                                db_write_semaphore[self.db_manager.db_path].release()
-                                logger.debug(f"Released database lock due to exception in transaction")
-                    raise
-                
-            def __exit__(self, exc_type, exc_val, exc_tb):
-                try:
-                    if self.conn:
-                        if exc_type is None:
-                            self.conn.commit()
-                        else:
-                            self.conn.rollback()
-                finally:
-                    logger.info(f"EXIT transaction from {self.origin} duration {time.time() - self.start_time:.2f}s")
-                    if self.conn:
-                        # Unregister from global tracker
-                        unregister_connection(self.conn)
-                        # Return connection to pool
-                        self.db_manager._rw_connection_pools[self.db_manager.db_path].put(self.conn)
-                        self.conn = None
-                    
-                    # Release the lock if we acquired it
-                    if self.acquired_lock:
-                        with db_write_semaphore_lock:
-                            if self.db_manager.db_path in db_write_semaphore:
-                                db_write_semaphore[self.db_manager.db_path].release()
-                                logger.debug(f"Released database lock in transaction exit")
-                        
-        return TransactionContext(self)
-
-    def get_read_connection(self):
-        """Get a read-only database connection from the read-only pool
-        
-        Returns:
-            ReadConnectionContext: Context manager for read-only connections
-        """
-        class ReadConnectionContext:
-            def __init__(self, db_manager):
-                self.db_manager = db_manager
-                self.conn = None
-                self.origin = f"RO Connection from {traceback.extract_stack()[-3].name}"
-                self.acquired_lock = False
-                
-            def __enter__(self):
-                # Acquire the database semaphore
-                logger.info(f"ENTRY read connection from {self.origin}")
-                with db_write_semaphore_lock:
-                    if self.db_manager.db_path not in db_write_semaphore:
-                        db_write_semaphore[self.db_manager.db_path] = threading.Semaphore(1)
-                    db_semaphore = db_write_semaphore[self.db_manager.db_path]
-                
-                # First try to acquire with a short timeout
-                initial_timeout = 0.5
-                start_time = time.time()
-                self.acquired_lock = db_semaphore.acquire(timeout=initial_timeout)
-                
-                # If we didn't get the lock within the initial timeout, log and try again
-                if not self.acquired_lock:
-                    elapsed = time.time() - start_time
-                    caller_info = f"from {self.origin}"
-                    logger.info(f"Waiting for database lock ({elapsed:.2f}s) in read connection {caller_info}")
-                    
-                    # Try again with the remaining timeout (10 seconds total max wait)
-                    remaining_timeout = 10.0 - elapsed
-                    if remaining_timeout > 0:
-                        self.acquired_lock = db_semaphore.acquire(timeout=remaining_timeout)
-                        
-                        total_wait = time.time() - start_time
-                        if self.acquired_lock:
-                            logger.info(f"Acquired database lock after {total_wait:.2f}s in read connection {caller_info}")
-                        else:
-                            logger.warning(f"Failed to acquire database lock after {total_wait:.2f}s in read connection {caller_info}")
-                else:
-                    logger.debug(f"Acquired database lock immediately in read connection")
-                
-                # Get connection from read-only pool
-                try:
-                    if self.db_manager.db_path in self.db_manager._ro_connection_pools:
-                        with self.db_manager._pool_locks[self.db_manager.db_path]:
-                            try:
-                                self.conn = self.db_manager._ro_connection_pools[self.db_manager.db_path].get(block=False)
-                            except queue.Empty:
-                                # If pool is empty, create a new read-only connection
-                                self.conn = sqlite3.connect(self.db_manager.db_path, check_same_thread=False)
-                                self.conn.execute("PRAGMA query_only = ON;")
-                    else:
-                        # Fall back to direct connection if no pool exists
-                        self.conn = sqlite3.connect(self.db_manager.db_path, check_same_thread=False)
-                        self.conn.execute("PRAGMA query_only = ON;")
-                except Exception as e:
-                    logger.error(f"Error getting read-only connection: {e}")
-                    # Fall back to direct connection
-                    self.conn = sqlite3.connect(self.db_manager.db_path, check_same_thread=False)
-                    self.conn.execute("PRAGMA query_only = ON;")
-                
-                # Register the connection in the global tracker
-                register_connection(self.conn, self.origin)
-                return self.conn
-                
-            def __exit__(self, exc_type, exc_val, exc_tb):
-                if self.conn:
-                    try:
-                        # Unregister from global tracker
-                        unregister_connection(self.conn)
-                        # Return connection to read-only pool
-                        self.db_manager._ro_connection_pools[self.db_manager.db_path].put(self.conn)
-                        self.conn = None
-                    except Exception as e:
-                        logger.error(f"Error returning read-only connection to pool: {e}")
-                        # If there's an error returning to the pool, close it
-                        if self.conn:
-                            unregister_connection(self.conn)
-                            self.conn.close()
-                            self.conn = None
-                
-                # Release the lock if we acquired it
-                if self.acquired_lock:
-                    with db_write_semaphore_lock:
-                        if self.db_manager.db_path in db_write_semaphore:
-                            db_write_semaphore[self.db_manager.db_path].release()
-                            logger.debug(f"Released database lock in read connection exit")
-                logger.info(f"EXIT read connection from {self.origin}")
-                    
-        return ReadConnectionContext(self)
-        
-    def query(self, sql, params=(), fetch_all=False, row_factory=None, conn=None, max_retries=5, retry_delay=0.1):
-        """Execute a query and return results
-        
-        Args:
-            sql: SQL query string
-            params: Parameters for the query
-            fetch_all: Whether to fetch all results or just one
-            row_factory: Optional row factory to use for result rows
-            conn: Optional database connection to use (to avoid nested transactions)
-            max_retries: Maximum number of retry attempts for transient errors
-            retry_delay: Initial delay between retries in seconds (doubles on each retry)
-            
-        Returns:
-            Result of the query execution
-        """
-        is_read_query = sql.strip().upper().startswith(("SELECT", "PRAGMA"))
-        should_commit = conn is None and not is_read_query
-        conn_context = None
-        
-        # Log every query execution
-        # Truncate really long queries and format parameters for logs
-        query_log = sql[:500] + ("..." if len(sql) > 500 else "")
-        params_str = str(params)[:100] if params else "()"
-        
-        if is_read_query:
-            logger.info(f"Executing READ query: {query_log} with params {params_str}")
-        else:
-            logger.info(f"Executing WRITE query: {query_log} with params {params_str}")
-        
-        # Transient errors that can be retried
-        RETRYABLE_ERRORS = (
-            sqlite3.OperationalError,  # Lock timeout, database is locked, etc.
-            sqlite3.DatabaseError      # Generic database error
-        )
-        
-        retries = 0
-        current_delay = retry_delay
-        last_error = None
-        
-        # We don't need to acquire semaphore here anymore since transaction/get_connection will handle it
-        # Just make sure we don't release it in finally if we didn't acquire it here
-        db_lock_acquired = False
-        
-        try:
-            while retries <= max_retries:
-                try:
-                    # Get a connection if none was provided
-                    if conn is None:
-                        if is_read_query:
-                            # Use read connection for SELECT/PRAGMA
-                            conn_context = self.get_read_connection()
-                        else:
-                            # Use transaction for writes
-                            conn_context = self.transaction()
-                        
-                        conn = conn_context.__enter__()
-                    
-                    if row_factory:
-                        conn.row_factory = row_factory
-                    cursor = conn.cursor()
-                    
-                    # Track query execution time
-                    start_time = time.time()
-                    cursor.execute(sql, params)
-                    execution_time = time.time() - start_time
-                    
-                    # Log slow queries (more than 100ms)
-                    if execution_time > 0.1:
-                        logger.info(f"Slow query ({execution_time:.3f}s): {query_log}")
-                    
-                    if is_read_query:
-                        result = None
-                        if fetch_all:
-                            result = cursor.fetchall()
-                            logger.debug(f"Query returned {len(result) if result else 0} rows in {execution_time:.3f}s")
-                        else:
-                            result = cursor.fetchone()
-                            logger.debug(f"Query returned {'data' if result else 'no data'} in {execution_time:.3f}s")
-                        return result
-                    else:
-                        # Only commit if we created our own connection
-                        if should_commit:
-                            conn.commit()
-                        result = cursor.lastrowid if cursor.lastrowid else cursor.rowcount
-                        logger.debug(f"Write query affected {cursor.rowcount} rows, last rowid: {cursor.lastrowid}, execution time: {execution_time:.3f}s")
-                        return result
-                        
-                except RETRYABLE_ERRORS as e:
-                    last_error = e
-                    error_message = str(e).lower()
-                    
-                    # Check if this is a retryable error
-                    if ("database is locked" in error_message or 
-                        "busy" in error_message or 
-                        "timeout" in error_message):
-                        
-                        retries += 1
-                        if retries <= max_retries:
-                            logger.warning(f"Database error attempting {sql[:60]}..., {retries}/{max_retries}, retrying in {current_delay:.2f}s: {e}")
-                            
-                            # Clean up connection if we created it
-                            if conn_context:
-                                conn_context.__exit__(type(e), e, None)
-                                conn_context = None
-                            
-                            # Wait before retrying, with exponential backoff
-                            time.sleep(current_delay)
-                            current_delay *= 2  # Exponential backoff
-                            continue
-                    
-                    # Not a retryable error or max retries exceeded
-                    if should_commit and conn:
-                        conn.rollback()
-                    logger.error(f"Error executing query (attempt {retries-1}/{max_retries}): {sql[:60]}..., {e}")
-                    raise
-                    
-                except Exception as e:
-                    # Only rollback if we created our own connection
-                    if should_commit and conn:
-                        conn.rollback()
-                    logger.error(f"Error executing query: {query_log}, {e}")
-                    raise
-                    
-                finally:
-                    # Clean up our connection if we created it
-                    if conn_context:
-                        conn_context.__exit__(None, None, None)
-                    
-            # If we get here, we've exceeded max retries
-            logger.error(f"Query failed after {max_retries} retries: {query_log}")
-            raise last_error
-        finally:
-            # We don't need to release semaphore here anymore - transaction/connection contexts will handle it
-            pass
     
     # ---- Beer Management Methods ----
     
     def add_beer(self, name, abv=None, ibu=None, color=None, og=None, fg=None, 
-                description=None, brewed=None, kegged=None, tapped=None, notes=None, conn=None):
+                description=None, brewed=None, kegged=None, tapped=None, notes=None):
         """Add a new beer to the database
         
         Args:
@@ -709,7 +401,6 @@ class DatabaseManager:
             kegged: Keg date (datetime object or string)
             tapped: Tap date (datetime object or string)
             notes: Additional notes
-            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             id: The ID of the newly added beer
@@ -741,7 +432,7 @@ class DatabaseManager:
         params = (name, abv, ibu, color, og, fg, description, brewed, kegged, tapped, notes)
         
         try:
-            beer_id = self.query(sql, params, conn=conn)
+            beer_id = self.execute(sql, params)
             logger.info(f"Added beer '{name}' with ID {beer_id}")
             return beer_id
         except Exception as e:
@@ -749,7 +440,7 @@ class DatabaseManager:
             raise
     
     def update_beer(self, beer_id, name=None, abv=None, ibu=None, color=None, og=None, fg=None,
-                   description=None, brewed=None, kegged=None, tapped=None, notes=None, conn=None):
+                   description=None, brewed=None, kegged=None, tapped=None, notes=None):
         """Update an existing beer in the database
         
         Args:
@@ -771,7 +462,7 @@ class DatabaseManager:
             success: Whether the update was successful
         """
         # First check if the beer exists
-        if not self.get_beer(beer_id, conn=conn):
+        if not self.get_beer(beer_id):
             logger.error(f"Cannot update beer with ID {beer_id}: Beer not found")
             return False
         
@@ -793,47 +484,56 @@ class DatabaseManager:
             tapped = tapped.strftime("%Y-%m-%d %H:%M:%S")
         
         try:
-            # Get existing data for any fields not specified
-            existing_beer = self.query(
-                "SELECT * FROM beers WHERE idBeer = ?",
-                (beer_id,),
-                row_factory=sqlite3.Row,
-                conn=conn
-            )
+            def update_transaction(conn):
+                # Get existing data for any fields not specified
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM beers WHERE idBeer = ?", (beer_id,))
+                existing_beer = cursor.fetchone()
+                
+                if not existing_beer:
+                    logger.error(f"Cannot update beer with ID {beer_id}: Beer not found")
+                    return False
+                
+                # Get column names from cursor description
+                columns = [desc[0] for desc in cursor.description]
+                existing_beer_dict = {columns[i]: existing_beer[i] for i in range(len(columns))}
+                
+                # Update only the fields that were specified
+                update_name = name if name is not None else existing_beer_dict['Name']
+                update_abv = abv if abv is not None else existing_beer_dict['ABV']
+                update_ibu = ibu if ibu is not None else existing_beer_dict['IBU']
+                update_color = color if color is not None else existing_beer_dict['Color']
+                update_og = og if og is not None else existing_beer_dict['OriginalGravity']
+                update_fg = fg if fg is not None else existing_beer_dict['FinalGravity']
+                update_description = description if description is not None else existing_beer_dict['Description']
+                update_brewed = brewed if brewed is not None else existing_beer_dict['Brewed']
+                update_kegged = kegged if kegged is not None else existing_beer_dict['Kegged']
+                update_tapped = tapped if tapped is not None else existing_beer_dict['Tapped']
+                update_notes = notes if notes is not None else existing_beer_dict['Notes']
+                
+                # Update the database
+                cursor.execute('''
+                    UPDATE beers SET
+                        Name = ?, ABV = ?, IBU = ?, Color = ?, OriginalGravity = ?, FinalGravity = ?,
+                        Description = ?, Brewed = ?, Kegged = ?, Tapped = ?, Notes = ?
+                    WHERE idBeer = ?
+                ''', (
+                    update_name, update_abv, update_ibu, update_color, update_og, update_fg,
+                    update_description, update_brewed, update_kegged, update_tapped, update_notes,
+                    beer_id
+                ))
+                
+                return True
             
-            if not existing_beer:
-                logger.error(f"Cannot update beer with ID {beer_id}: Beer not found")
+            # Execute the transaction
+            result = self.dbs.run_in_transaction(update_transaction)
+            
+            if result:
+                logger.info(f"Updated beer {beer_id}")
+                return True
+            else:
                 return False
                 
-            # Update only the fields that were specified
-            update_name = name if name is not None else existing_beer['Name']
-            update_abv = abv if abv is not None else existing_beer['ABV']
-            update_ibu = ibu if ibu is not None else existing_beer['IBU']
-            update_color = color if color is not None else existing_beer['Color']
-            update_og = og if og is not None else existing_beer['OriginalGravity']
-            update_fg = fg if fg is not None else existing_beer['FinalGravity']
-            update_description = description if description is not None else existing_beer['Description']
-            update_brewed = brewed if brewed is not None else existing_beer['Brewed']
-            update_kegged = kegged if kegged is not None else existing_beer['Kegged']
-            update_tapped = tapped if tapped is not None else existing_beer['Tapped']
-            update_notes = notes if notes is not None else existing_beer['Notes']
-            
-            # Update the database using query
-            sql = '''
-                UPDATE beers SET
-                    Name = ?, ABV = ?, IBU = ?, Color = ?, OriginalGravity = ?, FinalGravity = ?,
-                    Description = ?, Brewed = ?, Kegged = ?, Tapped = ?, Notes = ?
-                WHERE idBeer = ?
-            '''
-            params = (
-                update_name, update_abv, update_ibu, update_color, update_og, update_fg,
-                update_description, update_brewed, update_kegged, update_tapped, update_notes,
-                beer_id
-            )
-            
-            self.query(sql, params, conn=conn)
-            logger.info(f"Updated beer {beer_id} with name '{update_name}'")
-            return True
         except Exception as e:
             logger.error(f"Error updating beer with ID {beer_id}: {e}")
             raise
@@ -850,24 +550,16 @@ class DatabaseManager:
         """
         try:
             # First check if beer exists
-            beer = self.query(
-                "SELECT Name FROM beers WHERE idBeer = ?",
-                (beer_id,),
-                conn=conn
-            )
+            beer = self.execute("SELECT Name FROM beers WHERE idBeer = ?", (beer_id,))
             
             if not beer:
                 logger.warning(f"Beer with ID {beer_id} not found for deletion")
                 return False
             
-            beer_name = beer[0]
+            beer_name = beer[0][0]
             
             # Delete the beer
-            result = self.query(
-                "DELETE FROM beers WHERE idBeer = ?",
-                (beer_id,),
-                conn=conn
-            )
+            result = self.execute("DELETE FROM beers WHERE idBeer = ?", (beer_id,))
             
             if result > 0:
                 logger.info(f"Deleted beer '{beer_name}' with ID {beer_id}")
@@ -879,7 +571,7 @@ class DatabaseManager:
             logger.error(f"Error deleting beer with ID {beer_id}: {e}")
             raise
     
-    def get_beer(self, beer_id, conn=None):
+    def get_beer(self, beer_id):
         """Get a beer by ID
         
         Args:
@@ -890,17 +582,23 @@ class DatabaseManager:
             beer: Dictionary with beer information or None if not found
         """
         try:
-            return self.query(
-                "SELECT * FROM beers WHERE idBeer = ?", 
-                (beer_id,),
-                row_factory=sqlite3.Row,
-                conn=conn
-            )
+            results = self.execute("SELECT * FROM beers WHERE idBeer = ?", (beer_id,))
+            
+            if not results:
+                return None
+                
+            # Convert to dictionary using column names
+            columns = [
+                "idBeer", "Name", "ABV", "IBU", "Color", "OriginalGravity", 
+                "FinalGravity", "Description", "Brewed", "Kegged", "Tapped", "Notes"
+            ]
+            beer_dict = {columns[i]: results[0][i] for i in range(len(columns))}
+            return beer_dict
         except Exception as e:
             logger.error(f"Error retrieving beer with ID {beer_id}: {e}")
             return None
     
-    def get_all_beers(self, conn=None):
+    def get_all_beers(self):
         """Get all beers from the database
         
         Args:
@@ -910,19 +608,30 @@ class DatabaseManager:
             beers: List of dictionaries with beer information
         """
         try:
-            return self.query(
-                "SELECT * FROM beers ORDER BY Name",
-                fetch_all=True,
-                row_factory=sqlite3.Row,
-                conn=conn
-            )
+            results = self.execute("SELECT * FROM beers ORDER BY idBeer")
+            
+            if not results:
+                return []
+                
+            # Convert rows to dictionaries using column names
+            columns = [
+                "idBeer", "Name", "ABV", "IBU", "Color", "OriginalGravity", 
+                "FinalGravity", "Description", "Brewed", "Kegged", "Tapped", "Notes"
+            ]
+            
+            beer_dicts = []
+            for row in results:
+                beer_dict = {columns[i]: row[i] for i in range(len(columns))}
+                beer_dicts.append(beer_dict)
+                
+            return beer_dicts
         except Exception as e:
             logger.error(f"Error retrieving all beers: {e}")
             return []
     
     # ---- Tap Management Methods ----
     
-    def add_tap(self, tap_id=None, beer_id=None, conn=None):
+    def add_tap(self, tap_id=None, beer_id=None):
         """Add a new tap to the database
         
         Args:
@@ -936,37 +645,25 @@ class DatabaseManager:
         try:
             if tap_id:
                 # Check if tap with this ID already exists
-                existing_tap = self.query(
-                    "SELECT COUNT(*) FROM taps WHERE idTap = ?", 
-                    (tap_id,),
-                    conn=conn
-                )
+                existing_tap = self.execute("SELECT COUNT(*) FROM taps WHERE idTap = ?", (tap_id,))
                 
-                if existing_tap and existing_tap[0] > 0:
+                if existing_tap and existing_tap[0][0] > 0:
                     logger.warning(f"Tap with ID {tap_id} already exists")
                     return None
                 
                 # Insert with specified ID
-                tap_id = self.query(
-                    "INSERT INTO taps (idTap, idBeer) VALUES (?, ?)",
-                    (tap_id, beer_id),
-                    conn=conn
-                )
+                self.execute("INSERT INTO taps (idTap, idBeer) VALUES (?, ?)", (tap_id, beer_id))
+                return tap_id
             else:
                 # Auto-generate ID
-                tap_id = self.query(
-                    "INSERT INTO taps (idBeer) VALUES (?)",
-                    (beer_id,),
-                    conn=conn
-                )
-            
-            logger.info(f"Added tap {tap_id} with beer ID {beer_id}")
-            return tap_id
+                last_id = self.execute("INSERT INTO taps (idBeer) VALUES (?)", (beer_id,))
+                logger.info(f"Added tap with beer ID {beer_id}")
+                return last_id
         except Exception as e:
             logger.error(f"Error adding tap: {e}")
             raise
     
-    def update_tap(self, tap_id, beer_id, conn=None):
+    def update_tap(self, tap_id, beer_id):
         """Update a tap's beer assignment
         
         Args:
@@ -979,22 +676,14 @@ class DatabaseManager:
         """
         try:
             # Check if tap exists
-            tap_exists = self.query(
-                "SELECT idTap FROM taps WHERE idTap = ?", 
-                (tap_id,),
-                conn=conn
-            )
+            tap_exists = self.execute("SELECT idTap FROM taps WHERE idTap = ?", (tap_id,))
             
             if not tap_exists:
                 logger.warning(f"Tap with ID {tap_id} not found for update")
                 return False
             
             # Update the tap
-            result = self.query(
-                "UPDATE taps SET idBeer = ? WHERE idTap = ?", 
-                (beer_id, tap_id),
-                conn=conn
-            )
+            self.execute("UPDATE taps SET idBeer = ? WHERE idTap = ?", (beer_id, tap_id))
             
             logger.info(f"Updated tap {tap_id} with beer ID {beer_id}")
             return True
@@ -1002,7 +691,7 @@ class DatabaseManager:
             logger.error(f"Error updating tap {tap_id}: {e}")
             raise
     
-    def delete_tap(self, tap_id, conn=None):
+    def delete_tap(self, tap_id):
         """Delete a tap from the database
         
         Args:
@@ -1014,22 +703,14 @@ class DatabaseManager:
         """
         try:
             # Check if tap exists
-            tap_exists = self.query(
-                "SELECT idTap FROM taps WHERE idTap = ?", 
-                (tap_id,),
-                conn=conn
-            )
+            tap_exists = self.execute("SELECT idTap FROM taps WHERE idTap = ?", (tap_id,))
             
             if not tap_exists:
                 logger.warning(f"Tap with ID {tap_id} not found for deletion")
                 return False
             
             # Delete the tap
-            result = self.query(
-                "DELETE FROM taps WHERE idTap = ?", 
-                (tap_id,),
-                conn=conn
-            )
+            result = self.execute("DELETE FROM taps WHERE idTap = ?", (tap_id,))
             
             logger.info(f"Deleted tap {tap_id}")
             return True
@@ -1037,7 +718,7 @@ class DatabaseManager:
             logger.error(f"Error deleting tap {tap_id}: {e}")
             raise
     
-    def get_tap(self, tap_id, conn=None):
+    def get_tap(self, tap_id):
         """Get a tap by ID
         
         Args:
@@ -1048,19 +729,25 @@ class DatabaseManager:
             tap: Dictionary with tap information or None if not found
         """
         try:
-            return self.query(
+            results = self.execute(
                 "SELECT t.*, b.Name as BeerName FROM taps t "
                 "LEFT JOIN beers b ON t.idBeer = b.idBeer "
                 "WHERE t.idTap = ?", 
-                (tap_id,),
-                row_factory=sqlite3.Row,
-                conn=conn
+                (tap_id,)
             )
+            
+            if not results:
+                return None
+                
+            # Get column names (need to determine them dynamically due to join)
+            columns = ["idTap", "idBeer", "BeerName"]
+            tap_dict = {columns[i]: results[0][i] for i in range(len(results[0]))}
+            return tap_dict
         except Exception as e:
             logger.error(f"Error retrieving tap {tap_id}: {e}")
             return None
     
-    def get_all_taps(self, conn=None):
+    def get_all_taps(self):
         """Get all taps with their beer information
         
         Args:
@@ -1070,19 +757,29 @@ class DatabaseManager:
             taps: List of dictionaries with tap information
         """
         try:
-            return self.query(
+            results = self.execute(
                 "SELECT t.*, b.Name as BeerName FROM taps t "
                 "LEFT JOIN beers b ON t.idBeer = b.idBeer "
-                "ORDER BY t.idTap",
-                fetch_all=True,
-                row_factory=sqlite3.Row,
-                conn=conn
+                "ORDER BY t.idTap"
             )
+            
+            if not results:
+                return []
+                
+            # Get column names (need to determine them dynamically due to join)
+            columns = ["idTap", "idBeer", "BeerName"]
+            
+            tap_dicts = []
+            for row in results:
+                tap_dict = {columns[i]: row[i] for i in range(len(row))}
+                tap_dicts.append(tap_dict)
+                
+            return tap_dicts
         except Exception as e:
             logger.error(f"Error retrieving all taps: {e}")
             return []
     
-    def get_tap_with_beer(self, beer_id, conn=None):
+    def get_tap_with_beer(self, beer_id):
         """Get IDs of taps that have a specific beer assigned
         
         Args:
@@ -1093,11 +790,9 @@ class DatabaseManager:
             list: List of tap IDs that have the beer assigned
         """
         try:
-            rows = self.query(
+            rows = self.execute(
                 "SELECT idTap FROM taps WHERE idBeer = ?",
-                (beer_id,),
-                fetch_all=True,
-                conn=conn
+                (beer_id,)
             )
             
             return [row[0] for row in rows] if rows else []
@@ -1105,7 +800,7 @@ class DatabaseManager:
             logger.error(f"Error retrieving taps with beer {beer_id}: {e}")
             return []
     
-    def clear_beer(self, conn=None):
+    def clear_beer(self):
         """Delete all records from the beers table
         
         Args:
@@ -1115,7 +810,7 @@ class DatabaseManager:
             success: True if the operation was successful
         """
         try:
-            self.query("DELETE FROM beers", conn=conn)
+            self.execute("DELETE FROM beers")
             logger.debug(f"Cleared all records from beers table")
             return True
         except Exception as e:
@@ -1132,7 +827,7 @@ class DatabaseManager:
             success: True if the operation was successful
         """
         try:
-            self.query("DELETE FROM taps", conn=conn)
+            self.execute("DELETE FROM taps")
             logger.debug(f"Cleared all records from taps table")
             return True
         except Exception as e:
@@ -1144,6 +839,7 @@ class DatabaseManager:
         
         Args:
             changes: List of changes to apply
+
             
         Note:
             This implements the Lamport Clock rule for receiving sync responses:
@@ -1155,6 +851,7 @@ class DatabaseManager:
                d. change_log.insert({op, t, origin})
             2. Otherwise skip
         """
+              
         if not changes:
             logger.info("No changes to apply")
             return
@@ -1501,12 +1198,11 @@ class DatabaseManager:
     
 
 
-    def _calculate_db_hash(self, tables, conn=None):
+    def _calculate_db_hash(self, tables):
         """Calculate a hash based on database content for version tracking
         
         Args:
             tables: List of table names to include in the hash
-            conn: Optional database connection to use (to avoid nested transactions)
             
         Returns:
             str: MD5 hash of relevant database content
@@ -1517,10 +1213,10 @@ class DatabaseManager:
             for table in tables:
                 # Get all rows from the table for hashing
                 try:
-                    rows = self.query(f"SELECT * FROM {table}", fetch_all=True, conn=conn)
+                    rows = self.execute(f"SELECT * FROM {table}")
                     
                     # Get column names
-                    column_info = self.query(f"PRAGMA table_info({table})", fetch_all=True, conn=conn)
+                    column_info = self.execute(f"PRAGMA table_info({table})")
                     column_names = [col[1] for col in column_info]
                     
                     # Create normalized representation
@@ -1554,26 +1250,3 @@ class DatabaseManager:
             logger.error(f"Error calculating content hash: {e}")
             return "0"  # Fallback hash 
         
-    def is_read_only(self, conn):
-        """Check if a connection is in read-only mode
-        
-        Args:
-            conn: Database connection to check
-            
-        Returns:
-            bool: True if connection is read-only, False otherwise
-        """
-        try:
-            cursor = conn.execute('PRAGMA query_only;')
-            result = cursor.fetchone()
-            
-            # Check if result is valid and has a value
-            if result and len(result) > 0:
-                return result[0] == 1
-            
-            # Default to False if no result
-            return False
-        except Exception as e:
-            # Log the error and default to False
-            logger.warning(f"Error checking read-only status: {e}")
-            return False
