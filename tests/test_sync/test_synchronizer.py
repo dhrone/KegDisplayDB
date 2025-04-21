@@ -7,6 +7,8 @@ import json
 from unittest import mock
 from datetime import datetime
 import glob
+import gc
+import sqlite3
 
 from KegDisplayDB.db.sync.synchronizer import DatabaseSynchronizer
 from KegDisplayDB.db.sync.protocol import SyncProtocol
@@ -52,6 +54,9 @@ class TestDatabaseSynchronizer(unittest.TestCase):
             
         # Clean up any temporary MagicMock files
         self.cleanup_magicmock_files()
+        
+        # Clean up any leaked database connections
+        self.cleanup_db_connections()
     
     def cleanup_magicmock_files(self):
         """Clean up any temporary files with MagicMock in their names."""
@@ -74,6 +79,19 @@ class TestDatabaseSynchronizer(unittest.TestCase):
                 print(f"Removed temporary test file: {f}")
             except Exception as e:
                 print(f"Failed to remove {f}: {e}")
+    
+    def cleanup_db_connections(self):
+        """Clean up any database connections that might be leaked during tests."""
+        # Force garbage collection to close potentially leaked connections
+        gc.collect()
+        
+        # Check for unclosed sqlite3 connections and close them
+        for obj in gc.get_objects():
+            if isinstance(obj, sqlite3.Connection):
+                try:
+                    obj.close()
+                except:
+                    pass
     
     def test_init(self):
         """Test initialization of the database synchronizer."""

@@ -54,6 +54,28 @@ class SyncedDatabase:
             # The actual NetworkManager will be mocked in tests
             self.synchronizer = None
     
+    def __del__(self):
+        """Cleanup resources when the instance is being garbage collected"""
+        self.close()
+        
+    def close(self):
+        """Close database connections and cleanup resources"""
+        try:
+            # Stop the synchronizer if it exists
+            if not self.test_mode and hasattr(self, 'synchronizer') and self.synchronizer:
+                self.synchronizer.stop()
+                self.synchronizer = None
+                
+            # Close database manager if it exists
+            if hasattr(self, 'db_manager') and self.db_manager:
+                # Remove reference to allow garbage collection
+                db_manager = self.db_manager
+                self.db_manager = None
+                
+                # Let garbage collector handle the rest
+        except Exception as e:
+            logger.error(f"Error in SyncedDatabase.close(): {e}")
+    
     def add_test_peer(self, peer):
         """Add a peer for test mode synchronization"""
         if self.test_mode and peer not in self.test_peers:
@@ -111,8 +133,7 @@ class SyncedDatabase:
     
     def stop(self):
         """Stop the sync service"""
-        if not self.test_mode and hasattr(self, 'synchronizer'):
-            self.synchronizer.stop()
+        self.close()
     
     # ---- Beer Management Methods ----
     
@@ -206,10 +227,20 @@ class SyncedDatabase:
             bool: Success or failure
         """
         try:
-
+            # Get taps with this beer before deleting (so we can update them)
+            tap_ids = self.db_manager.get_tap_with_beer(beer_id)
+            
+            # Delete the beer
             success = self.db_manager.delete_beer(beer_id)
             if success:
                 self.change_tracker.log_change("beers", "DELETE", beer_id)
+
+                # Update any taps that had this beer to have None
+                if tap_ids:
+                    for tap_id in tap_ids:
+                        update_success = self.db_manager.update_tap(tap_id, None)
+                        if update_success:
+                            self.change_tracker.log_change("taps", "UPDATE", tap_id)
                 
                 if notify:
                     self.notify_update()
@@ -414,56 +445,52 @@ class SyncedDatabase:
         
         # Start a transaction for the entire import
         try:
-            with self.db_manager.transaction() as conn:
-                # Clear all existing beers
-                cleared = self.db_manager.clear_beer()
-                if not cleared:
-                    logger.error("Failed to clear beer table")
-                    return (0, ["Failed to clear beer table"])
+            # Clear all existing beers
+            cleared = self.db_manager.clear_beer()
+            if not cleared:
+                logger.error("Failed to clear beer table")
+                return (0, ["Failed to clear beer table"])
+            
+            # Process beers in batches
+            for batch_start in range(0, len(sorted_beers), BATCH_SIZE):
+                batch_end = min(batch_start + BATCH_SIZE, len(sorted_beers))
+                batch = sorted_beers[batch_start:batch_end]
                 
-                # Process beers in batches
-                for batch_start in range(0, len(sorted_beers), BATCH_SIZE):
-                    batch_end = min(batch_start + BATCH_SIZE, len(sorted_beers))
-                    batch = sorted_beers[batch_start:batch_end]
-                    
-                    logger.info(f"Processing batch {batch_start//BATCH_SIZE + 1} with {len(batch)} beers")
-                    
-                    # Process each beer in the batch
-                    batch_success_count = 0
-                    for idx, beer_data in enumerate(batch):
-                        try:
-                            # Add beer using db_manager (all operations are inserts)
-                            beer_id = self.db_manager.add_beer(
-                                name=beer_data.get('Name'),
-                                abv=beer_data.get('ABV'),
-                                ibu=beer_data.get('IBU'),
-                                color=beer_data.get('Color'),
-                                og=beer_data.get('OriginalGravity'),
-                                fg=beer_data.get('FinalGravity'),
-                                description=beer_data.get('Description'),
-                                brewed=beer_data.get('Brewed'),
-                                kegged=beer_data.get('Kegged'),
-                                tapped=beer_data.get('Tapped'),
-                                notes=beer_data.get('Notes')
-                            )
-                            
-                            if beer_id:
-                                batch_success_count += 1
-                                logger.info(f"Added beer '{beer_data.get('Name')}' with ID {beer_id}")
-                            
-                        except Exception as e:
-                            logger.error(f"Error processing beer {batch_start + idx + 1}: {str(e)}")
-                            errors.append(f"Error on beer {batch_start + idx + 1}: {str(e)}")
-                    
-                    # Update total success count
-                    success_count += batch_success_count
+                logger.info(f"Processing batch {batch_start//BATCH_SIZE + 1} with {len(batch)} beers")
+                
+                # Process each beer in the batch
+                batch_success_count = 0
+                for idx, beer_data in enumerate(batch):
+                    try:
+                        # Add beer using db_manager (all operations are inserts)
+                        beer_id = self.db_manager.add_beer(
+                            name=beer_data.get('Name'),
+                            abv=beer_data.get('ABV'),
+                            ibu=beer_data.get('IBU'),
+                            color=beer_data.get('Color'),
+                            og=beer_data.get('OriginalGravity'),
+                            fg=beer_data.get('FinalGravity'),
+                            description=beer_data.get('Description'),
+                            brewed=beer_data.get('Brewed'),
+                            kegged=beer_data.get('Kegged'),
+                            tapped=beer_data.get('Tapped'),
+                            notes=beer_data.get('Notes')
+                        )
+                        self.change_tracker.log_change("beers", "INSERT", beer_id)
+                        
+                        if beer_id:
+                            batch_success_count += 1
+                            logger.info(f"Added beer '{beer_data.get('Name')}' with ID {beer_id}")
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing beer {batch_start + idx + 1}: {str(e)}")
+                        errors.append(f"Error on beer {batch_start + idx + 1}: {str(e)}")
+                
+                # Update total success count
+                success_count += batch_success_count
                 
                 # If we have successful imports, log the change
                 if success_count > 0:
-                    # Log the change
-                    self.change_tracker.log_change("version", "IMPORT", 1)
-                    
-                    # Notify peers about the import
                     self.notify_update()
             
             logger.info(f"Successfully imported {success_count} beers")

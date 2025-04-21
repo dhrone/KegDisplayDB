@@ -5,22 +5,17 @@ import sqlite3
 from datetime import datetime, UTC
 
 from KegDisplayDB.db.database import DatabaseManager
+from tests.test_db.test_base import DatabaseTest
 
-class TestDatabaseManager(unittest.TestCase):
+class TestDatabaseManager(DatabaseTest):
     """Test class for the DatabaseManager component."""
     
     def setUp(self):
         """Set up a fresh database for each test."""
-        self.temp_dir = tempfile.mkdtemp()
-        self.db_path = os.path.join(self.temp_dir, 'test_db.db')
+        super().setUp()
         self.db_manager = DatabaseManager(self.db_path)
     
-    def tearDown(self):
-        """Clean up resources after each test."""
-        if os.path.exists(self.db_path):
-            os.remove(self.db_path)
-        if os.path.exists(self.temp_dir):
-            os.rmdir(self.temp_dir)
+    # The tearDown method is now inherited from DatabaseTest
     
     def test_initialize_tables(self):
         """Test that database tables are properly initialized."""
@@ -223,51 +218,51 @@ class TestDatabaseManager(unittest.TestCase):
         self.assertEqual(len(taps), 0, "Should return empty list for non-existent beer")
     
     def test_query_method(self):
-        """Test the general query method."""
+        """Test the execute method which replaced the old query method."""
         # Add some test data
         self.db_manager.add_beer("Query Test 1", abv=4.0)
         self.db_manager.add_beer("Query Test 2", abv=5.0)
         
-        # Test single row query
-        result = self.db_manager.query(
+        # Test SELECT query
+        results = self.db_manager.execute(
             "SELECT * FROM beers WHERE Name = ?", 
-            ("Query Test 1",),
-            fetch_all=False
+            ("Query Test 1",)
         )
-        self.assertIsNotNone(result, "Query should return a row")
+        self.assertIsNotNone(results, "Execute should return results")
+        self.assertEqual(len(results), 1, "Should return one row")
         
-        # Test multi-row query
-        results = self.db_manager.query(
+        # Test multi-row SELECT query
+        results = self.db_manager.execute(
             "SELECT * FROM beers WHERE Name LIKE ?",
-            ("Query Test%",),
-            fetch_all=True
+            ("Query Test%",)
         )
         self.assertEqual(len(results), 2, "Query should return 2 rows")
         
-        # Test with row factory
+        # Test row factory with transaction
         def dict_factory(cursor, row):
             d = {}
             for idx, col in enumerate(cursor.description):
                 d[col[0]] = row[idx]
             return d
             
-        result = self.db_manager.query(
-            "SELECT * FROM beers WHERE Name = ?",
-            ("Query Test 1",),
-            row_factory=dict_factory
-        )
+        def query_with_factory(conn):
+            conn.row_factory = dict_factory
+            cursor = conn.execute("SELECT * FROM beers WHERE Name = ?", ("Query Test 1",))
+            return cursor.fetchone()
+            
+        result = self.db_manager.dbs.run_in_transaction(query_with_factory)
         self.assertIsInstance(result, dict, "Result should be a dictionary")
         self.assertEqual(result["Name"], "Query Test 1", "Name should match")
         
-        # Test insert operation
-        row_id = self.db_manager.query(
+        # Test INSERT operation
+        row_id = self.db_manager.execute(
             "INSERT INTO beers (Name, ABV) VALUES (?, ?)",
             ("Query Insert Test", 7.0)
         )
         self.assertGreater(row_id, 0, "Insert should return a valid row ID")
         
-        # Test update operation
-        rows_affected = self.db_manager.query(
+        # Test UPDATE operation
+        rows_affected = self.db_manager.execute(
             "UPDATE beers SET ABV = ? WHERE Name = ?",
             (8.0, "Query Insert Test")
         )

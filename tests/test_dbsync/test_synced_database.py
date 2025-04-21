@@ -8,28 +8,45 @@ from datetime import datetime
 import glob
 
 from KegDisplayDB.db import SyncedDatabase
+from tests.test_db.test_base import DatabaseTest
 
-class TestSyncedDatabase(unittest.TestCase):
+class TestSyncedDatabase(DatabaseTest):
     """Test class for the SyncedDatabase component."""
     
     def setUp(self):
         """Set up a fresh database for each test."""
-        self.temp_dir = tempfile.mkdtemp()
-        self.db_path = os.path.join(self.temp_dir, 'test_db.db')
+        super().setUp()
         # Use test_mode=True to avoid actual network operations
         self.db = SyncedDatabase(self.db_path, test_mode=True)
+        # Set db_manager property for parent class
+        self.db_manager = self.db.db_manager
     
     def tearDown(self):
         """Clean up resources after each test."""
-        # Stop synchronization
-        if hasattr(self, 'db'):
-            self.db.stop()
-        if os.path.exists(self.db_path):
-            os.remove(self.db_path)
-        # Clean up any other files that might be in the temp directory
-        if os.path.exists(self.temp_dir):
-            # Use shutil.rmtree to remove directory even if not empty
-            shutil.rmtree(self.temp_dir)
+        # Explicitly close the database connections
+        if hasattr(self, 'db') and self.db is not None:
+            try:
+                # First call close method which also calls stop
+                self.db.close()
+                
+                # Ensure all references are cleared
+                if hasattr(self.db, 'db_manager') and self.db.db_manager:
+                    # Explicitly close DBService in database manager
+                    if hasattr(self.db.db_manager, 'dbs') and self.db.db_manager.dbs:
+                        try:
+                            self.db.db_manager.dbs.shutdown(wait=True)
+                        except Exception as e:
+                            print(f"Error shutting down DBService: {e}")
+                            
+                # Remove all references
+                self.db.db_manager = None
+                self.db_manager = None
+                self.db = None
+            except Exception as e:
+                print(f"Error in tearDown: {e}")
+        
+        # Let parent class handle file cleanup
+        super().tearDown()
             
         # Clean up any temporary MagicMock files
         self.cleanup_magicmock_files()

@@ -112,19 +112,19 @@ class ChangeTracker:
             return temp_id
     
     def increment_logical_clock(self, received_clock=None):
-        """
-        Increment the logical clock in the version table
+        """Increment the logical clock
         
         Args:
-            conn: Optional database connection to use within an existing transaction
+            received_clock: Optional external clock value to incorporate (for Lamport clock protocol)
+
             
         Returns:
-            New logical clock value or None if unsuccessful
+            int: New logical clock value
         """
         try:
 
             # Get current logical clock value
-            current_clock_row = self.db_manager.execute("SELECT logical_clock FROM version WHERE id = 1")
+            current_clock_row = self.db_manager.execute("SELECT logical_clock FROM version WHERE id = 1")[0]
 
             # Determine the new clock value based on whether a row exists
             if current_clock_row is None:
@@ -133,7 +133,7 @@ class ChangeTracker:
             else:
                 current_clock = current_clock_row[0] if current_clock_row[0] is not None else 0
                 # Lamport clock rule: local_clock = max(local_clock, received_clock) + 1
-                new_clock = max(current_clock, received_clock) + 1            
+                new_clock = max(current_clock, received_clock if received_clock else 0) + 1            
 
 
             # Calculate a fresh content hash
@@ -167,15 +167,15 @@ class ChangeTracker:
                 
         except Exception as e:
             logger.error(f"Error incrementing logical clock: {e}")
-            return None
+            return 0  # Return 0 as a safe default
     
     def update_logical_clock(self, received_clock):
         """
         Update logical clock based on received clock value (Lamport algorithm)
+        and persist it to the version table.
         
         Args:
             received_clock: Clock value received from another node
-            conn: Optional database connection to use within an existing transaction
             
         Returns:
             New clock value or None if unsuccessful
@@ -198,8 +198,7 @@ class ChangeTracker:
                 
             # Check if the version table exists
             version_exists = self.db_manager.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='version'",
-                fetch_all=True
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='version'"
             )
             
             if not version_exists:
@@ -253,7 +252,7 @@ class ChangeTracker:
             db_content_hash = self._calculate_content_hash()
             
             # Update version table with new logical clock and all other fields
-            version_update_result = self.db_manager.query(
+            version_update_result = self.db_manager.execute(
                 """
                 UPDATE version SET timestamp = ?, hash = ?, logical_clock = ?, node_id = ? WHERE id = 1
                 """,
@@ -262,7 +261,7 @@ class ChangeTracker:
             
             # If no rows were updated, insert a new row
             if version_update_result == 0:
-                self.db_manager.query(
+                self.db_manager.execute(
                     "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
                     (timestamp, db_content_hash, new_clock, self.node_id),
                 )
@@ -343,31 +342,41 @@ class ChangeTracker:
 
         try:
             # Get timestamp, hash, logical_clock, and node_id from version table
-            version_row = self.db_manager.execute(
+            version_rows = self.db_manager.execute(
                 "SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1 LIMIT 1"
             )
             
-            if version_row:
-                timestamp, stored_hash, logical_clock, node_id = version_row
-                logical_clock = logical_clock if logical_clock is not None else 0
-                node_id = node_id if node_id else self.node_id
+            if version_rows and len(version_rows) > 0:
+                # Get the first row from results
+                version_row = version_rows[0]
+                
+                # Make sure the row has enough elements
+                if len(version_row) >= 4:
+                    timestamp, stored_hash, logical_clock, node_id = version_row
+                    logical_clock = logical_clock if logical_clock is not None else 0
+                    node_id = node_id if node_id else self.node_id
+                
+                    # Return version information
+                    return {
+                        'hash': stored_hash,
+                        'timestamp': timestamp,
+                        'logical_clock': logical_clock,
+                        'node_id': node_id
+                    }
             
-                # Return version information
-                return {
-                    'hash': stored_hash,
-                    'timestamp': timestamp,
-                    'logical_clock': logical_clock,
-                    'node_id': node_id
-                }
+            # If we get here, something went wrong with retrieving the version info
+            logger.warning("Could not retrieve version information from database, returning default version")
+            
         except Exception as e:
             logger.error(f"Error getting version information from database: {e}")
-            # Return a default version if we couldn't get from DB
-            return {
-                'hash': '0',
-                'timestamp': datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                'logical_clock': 0,
-                'node_id': self.node_id
-            }
+            
+        # Return a default version if we couldn't get from DB
+        return {
+            'hash': '0',
+            'timestamp': datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            'logical_clock': 0,
+            'node_id': self.node_id
+        }
 
     
     def _get_row_content(self, table_name, row_id):
@@ -384,27 +393,37 @@ class ChangeTracker:
 
         try:
             # Get row data
-            row = self.db_manager.execute(f"SELECT * FROM {table_name} WHERE rowid = ?", (row_id,))
+            rows = self.db_manager.execute(f"SELECT * FROM {table_name} WHERE rowid = ?", (row_id,))
             
-            if row:
+            # Check if we got any results
+            if rows and len(rows) > 0:
+                row = rows[0]  # Get the first row
+                
                 # Get column names
-                columns = self.db_manager.execute(f"PRAGMA table_info({table_name})")
-                column_names = [info[1] for info in columns]
+                columns_info = self.db_manager.execute(f"PRAGMA table_info({table_name})")
                 
-                # Convert row to dict for JSON serialization
-                row_dict = {}
-                for i, col in enumerate(column_names):
-                    row_dict[col] = row[i]
-                
-                return json.dumps(row_dict)
-            else:
-                return "{}"
+                # Make sure we have column info
+                if columns_info and len(columns_info) > 0:
+                    column_names = [info[1] for info in columns_info]
+                    
+                    # Make sure we have the right number of columns
+                    if len(column_names) == len(row):
+                        # Convert row to dict for JSON serialization
+                        row_dict = {}
+                        for i, col in enumerate(column_names):
+                            row_dict[col] = row[i]
+                        
+                        return json.dumps(row_dict)
+            
+            # If we get here, something went wrong with getting the data
+            logger.warning(f"Could not fully retrieve data for {table_name}.{row_id}, returning empty object")
+            return "{}"
         except Exception as e:
             logger.error(f"Error getting row content for {table_name}.{row_id}: {e}")
             return "{}"
 
     
-    def is_database_empty(self, conn=None):
+    def is_database_empty(self):
         """Check if the database is empty (no beers or taps)
         
         Args:
@@ -462,3 +481,20 @@ class ChangeTracker:
         is_newer = node_id1 > node_id2
         logger.debug(f"Tie-breaking with node IDs: {node_id1} vs {node_id2}, result: {is_newer}")
         return is_newer 
+
+    def _calculate_content_hash(self):
+        """Calculate content hash for database
+        
+        This delegates to the DatabaseManager._calculate_db_hash method which
+        computes a hash based on the content of tracked tables.
+        
+        Returns:
+            str: Hash of database content
+        """
+        try:
+            # Use the db_manager's _calculate_db_hash method to get content hash
+            tracked_tables = ['beers', 'taps']
+            return self.db_manager._calculate_db_hash(tracked_tables)
+        except Exception as e:
+            logger.error(f"Error calculating content hash: {e}")
+            return "0"  # Default hash

@@ -3,6 +3,8 @@ import socket
 import threading
 from unittest import mock
 import time
+import sqlite3
+import gc
 
 from KegDisplayDB.db.sync.network import NetworkManager
 
@@ -59,6 +61,22 @@ class TestNetworkManager(unittest.TestCase):
         self.socket_patcher.stop()
         self.get_local_ips_patcher.stop()
         self.get_local_ip_patcher.stop()
+        
+        # Close any leaked database connections from message handlers
+        self.cleanup_db_connections()
+    
+    def cleanup_db_connections(self):
+        """Clean up any database connections that might be leaked during tests."""
+        # Force garbage collection to close potentially leaked connections
+        gc.collect()
+        
+        # Check for unclosed sqlite3 connections and close them
+        for obj in gc.get_objects():
+            if isinstance(obj, sqlite3.Connection):
+                try:
+                    obj.close()
+                except:
+                    pass
     
     def test_init(self):
         """Test initialization of the network manager."""
@@ -285,6 +303,16 @@ class TestNetworkManager(unittest.TestCase):
         
         # Check if the message handler was called with the received data
         mock_handler.assert_called_with(test_data, test_addr)
+        
+        # Close any open database connections in the handler to fix resource warnings
+        # If the handler was called multiple times, ensure each connection is closed
+        for call in mock_handler.call_args_list:
+            handler_args = call[0]
+            if len(handler_args) > 0 and hasattr(handler_args[0], 'close') and callable(handler_args[0].close):
+                try:
+                    handler_args[0].close()
+                except:
+                    pass
     
     def test_sync_listener(self):
         """Test the sync listener thread."""
@@ -316,6 +344,16 @@ class TestNetworkManager(unittest.TestCase):
         
         # Check if the message handler was called with the client socket
         mock_handler.assert_called_with(mock_client, test_addr, is_sync=True)
+        
+        # Close any open database connections in the handler to fix resource warnings
+        for call in mock_handler.call_args_list:
+            handler_args = call[0]
+            for arg in handler_args:
+                if hasattr(arg, 'close') and callable(arg.close):
+                    try:
+                        arg.close()
+                    except:
+                        pass
     
     def test_handle_sync_connection(self):
         """Test handling a sync connection."""

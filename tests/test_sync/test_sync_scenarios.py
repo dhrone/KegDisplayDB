@@ -5,6 +5,7 @@ import time
 import json
 import sqlite3
 import shutil
+import gc
 from unittest import mock
 from datetime import datetime, UTC
 
@@ -71,6 +72,22 @@ class TestSyncScenarios(unittest.TestCase):
         # Clean up temporary directory and its contents
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
+        
+        # Clean up any leaked database connections
+        self.cleanup_db_connections()
+    
+    def cleanup_db_connections(self):
+        """Clean up any database connections that might be leaked during tests."""
+        # Force garbage collection to close potentially leaked connections
+        gc.collect()
+        
+        # Check for unclosed sqlite3 connections and close them
+        for obj in gc.get_objects():
+            if isinstance(obj, sqlite3.Connection):
+                try:
+                    obj.close()
+                except:
+                    pass
     
     def test_database_change_handling(self):
         """Test handling changes to the database and logging them correctly.

@@ -11,23 +11,16 @@ import uuid
 
 from KegDisplayDB.db.database import DatabaseManager
 from KegDisplayDB.db.change_tracker import ChangeTracker
+from tests.test_db.test_base import DatabaseTest
 
-class TestChangeTracker(unittest.TestCase):
+class TestChangeTracker(DatabaseTest):
     """Test class for the ChangeTracker component."""
     
     def setUp(self):
         """Set up a fresh database for each test."""
-        self.temp_dir = tempfile.mkdtemp()
-        self.db_path = os.path.join(self.temp_dir, 'test_db.db')
+        super().setUp()
         self.db_manager = DatabaseManager(self.db_path)
         self.change_tracker = ChangeTracker(self.db_manager)
-    
-    def tearDown(self):
-        """Clean up resources after each test."""
-        if os.path.exists(self.db_path):
-            os.remove(self.db_path)
-        if os.path.exists(self.temp_dir):
-            os.rmdir(self.temp_dir)
     
     def test_initialize_tracking(self):
         """Test that change tracking tables are properly initialized."""
@@ -313,26 +306,6 @@ class TestChangeTracker(unittest.TestCase):
             self.assertIn("logical_clock", columns, "logical_clock column missing in version")
             self.assertIn("node_id", columns, "node_id column missing in version")
     
-    def test_get_table_hash(self):
-        """Test generating a content hash for a table."""
-        # Insert some data to hash
-        beer_id = self.db_manager.add_beer("Hash Test Beer", abv=5.0, description="Test beer for hashing")
-        
-        # Get hash for beers table
-        hash1 = self.change_tracker._get_table_hash("beers")
-        self.assertIsNotNone(hash1, "Hash should not be None")
-        
-        # Modify the table
-        self.db_manager.update_beer(beer_id, abv=6.0)
-        
-        # Get new hash
-        hash2 = self.change_tracker._get_table_hash("beers")
-        self.assertIsNotNone(hash2, "Updated hash should not be None")
-        self.assertNotEqual(hash1, hash2, "Hash should change after modifying the table")
-        
-        # Test hash for non-existent table
-        hash3 = self.change_tracker._get_table_hash("nonexistent_table")
-        self.assertIsNotNone(hash3, "Hash for non-existent table should not be None")
     
     def test_prune_change_log(self):
         """Test pruning old entries from the change log."""

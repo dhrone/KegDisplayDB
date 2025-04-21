@@ -98,13 +98,11 @@ class DatabaseSynchronizer:
     def notify_update(self):
         """Notify other instances that a change has been made"""
         try:
-            # Use a transaction for database operations
-            with self.db_manager.transaction() as conn:
-                # Increment logical clock for this control message
-                self.change_tracker.increment_logical_clock(conn=conn)
-                
-                # Get current database version
-                version = self.change_tracker.get_db_version(conn=conn)
+            # Increment logical clock for this control message
+            self.change_tracker.increment_logical_clock()
+            
+            # Get current database version
+            version = self.change_tracker.get_db_version()
             
             # Network operations outside the transaction
             # Broadcast the update to all peers
@@ -211,7 +209,7 @@ class DatabaseSynchronizer:
         try:
             # Get our current database version for comparison
             with self.db_manager.transaction() as conn:
-                our_version = self.change_tracker.get_db_version(conn=conn)
+                our_version = self.change_tracker.get_db_version()
                 
                 # Get logical clock values
                 peer_clock = peer_version.get("logical_clock", 0)
@@ -238,7 +236,7 @@ class DatabaseSynchronizer:
                     # 2. version_table.clock = localClock
                     # 3. Initiate sync
                     logger.debug(f"Peer has higher logical clock ({peer_clock} > {our_clock}), updating our clock and initiating sync")
-                    self.change_tracker.update_logical_clock(peer_clock, conn=conn)
+                    self.change_tracker.update_logical_clock(peer_clock)
                     should_sync = True
                     
                 elif peer_clock == our_clock and content_differs:
@@ -249,7 +247,7 @@ class DatabaseSynchronizer:
                     #    • If you lose, initiate sync
                     #    • If you win, ignore
                     logger.debug(f"Equal logical clocks ({peer_clock}) with hash mismatch, incrementing our clock and using tie-breaker")
-                    self.change_tracker.increment_logical_clock(conn=conn)
+                    self.change_tracker.increment_logical_clock()
                     
                     # Tie-breaking using node IDs
                     if self.change_tracker.is_newer_version(peer_version, our_version):
@@ -264,10 +262,10 @@ class DatabaseSynchronizer:
                     # 2. version_table.clock = localClock
                     # 3. Ignore (you're ahead)
                     logger.debug(f"Our logical clock is higher ({our_clock} > {peer_clock}), incrementing our clock (we're ahead)")
-                    self.change_tracker.increment_logical_clock(conn=conn)
+                    self.change_tracker.increment_logical_clock()
                     
                 # Special case: if our database is empty but peer has data, sync regardless of clocks
-                elif self.change_tracker.is_database_empty(conn=conn) and not peer_version.get("hash") == "0":
+                elif self.change_tracker.is_database_empty() and not peer_version.get("hash") == "0":
                     logger.debug(f"We have empty database but peer has data, initiating sync")
                     should_sync = True
             
@@ -309,7 +307,7 @@ class DatabaseSynchronizer:
         try:
             # Get our current database version for comparison
             with self.db_manager.transaction() as conn:
-                our_version = self.change_tracker.get_db_version(conn=conn)
+                our_version = self.change_tracker.get_db_version()
                 
                 # Get logical clock values
                 peer_clock = peer_version.get("logical_clock", 0)
@@ -336,7 +334,7 @@ class DatabaseSynchronizer:
                     # 2. version_table.clock = localClock
                     # 3. Initiate sync
                     logger.info(f"Peer has higher logical clock ({peer_clock} > {our_clock}), updating our clock and initiating sync")
-                    self.change_tracker.update_logical_clock(peer_clock, conn=conn)
+                    self.change_tracker.update_logical_clock(peer_clock)
                     should_sync = True
                     
                 elif peer_clock == our_clock and content_differs:
@@ -347,7 +345,7 @@ class DatabaseSynchronizer:
                     #    • If you lose, initiate sync
                     #    • If you win, ignore
                     logger.info(f"Equal logical clocks ({peer_clock}) with hash mismatch, incrementing our clock and using tie-breaker")
-                    self.change_tracker.increment_logical_clock(conn=conn)
+                    self.change_tracker.increment_logical_clock()
                     
                     # Tie-breaking using node IDs
                     if self.change_tracker.is_newer_version(peer_version, our_version):
@@ -362,10 +360,10 @@ class DatabaseSynchronizer:
                     # 2. version_table.clock = localClock
                     # 3. Ignore (you're ahead)
                     logger.info(f"Our logical clock is higher ({our_clock} > {peer_clock}), incrementing our clock (we're ahead)")
-                    self.change_tracker.increment_logical_clock(conn=conn)
+                    self.change_tracker.increment_logical_clock()
                     
                 # Special case: if our database is empty but peer has data, sync regardless of clocks
-                elif self.change_tracker.is_database_empty(conn=conn) and not peer_version.get("hash") == "0":
+                elif self.change_tracker.is_database_empty() and not peer_version.get("hash") == "0":
                     logger.info(f"We have empty database but peer has data, initiating sync")
                     should_sync = True
             
@@ -412,7 +410,7 @@ class DatabaseSynchronizer:
         try:
             # Get our current database version for comparison
             with self.db_manager.transaction() as conn:
-                our_version = self.change_tracker.get_db_version(conn=conn)
+                our_version = self.change_tracker.get_db_version()
                 
                 # Get logical clock values
                 peer_clock = peer_version.get("logical_clock", 0)
@@ -430,7 +428,7 @@ class DatabaseSynchronizer:
                     # 2. version_table.clock = localClock
                     # 3. Initiate sync
                     logger.info(f"Peer has higher logical clock ({peer_clock} > {our_clock}), updating our clock and initiating sync")
-                    self.change_tracker.update_logical_clock(peer_clock, conn=conn)
+                    self.change_tracker.update_logical_clock(peer_clock)
                     should_sync = True
                     
                 elif peer_clock == our_clock and content_differs:
@@ -441,7 +439,7 @@ class DatabaseSynchronizer:
                     #    • If you lose, initiate sync
                     #    • If you win, ignore
                     logger.info(f"Equal logical clocks ({peer_clock}) with hash mismatch, incrementing our clock and using tie-breaker")
-                    self.change_tracker.increment_logical_clock(conn=conn)
+                    self.change_tracker.increment_logical_clock()
                     
                     # Tie-breaking using node IDs
                     if self.change_tracker.is_newer_version(peer_version, our_version):
@@ -456,7 +454,7 @@ class DatabaseSynchronizer:
                     # 2. version_table.clock = localClock
                     # 3. No further action (you're in sync)
                     logger.info(f"Equal logical clocks ({peer_clock}) with matching hash, incrementing our clock (already in sync)")
-                    self.change_tracker.increment_logical_clock(conn=conn)
+                    self.change_tracker.increment_logical_clock()
                     
                 elif peer_clock < our_clock:
                     # Receive broadcast; incomingClock < localClock
@@ -464,10 +462,10 @@ class DatabaseSynchronizer:
                     # 2. version_table.clock = localClock
                     # 3. Ignore (you're ahead)
                     logger.info(f"Our logical clock is higher ({our_clock} > {peer_clock}), incrementing our clock (we're ahead)")
-                    self.change_tracker.increment_logical_clock(conn=conn)
+                    self.change_tracker.increment_logical_clock()
                     
                 # Special case: if our database is empty but peer has data, sync regardless of clocks
-                elif self.change_tracker.is_database_empty(conn=conn) and not peer_version.get("hash") == "0":
+                elif self.change_tracker.is_database_empty() and not peer_version.get("hash") == "0":
                     logger.info(f"We have empty database but peer has data, initiating sync")
                     should_sync = True
             
@@ -512,26 +510,21 @@ class DatabaseSynchronizer:
         total_changes = 0
         changes = []
         try:
-            with self.db_manager.transaction() as conn:
-                # Get total changes count
-                total_changes = self.db_manager.query(
-                    "SELECT COUNT(*) FROM change_log",
-                    fetch_all=False,
-                    conn=conn
-                )[0]
-                logger.debug(f"Total changes in change_log: {total_changes}")
-                
-                # Get the highest logical clock for comparison
-                highest_clock = self.db_manager.query(
-                    "SELECT MAX(logical_clock) FROM change_log",
-                    fetch_all=False,
-                    conn=conn
-                )[0]
-                if highest_clock:
-                    logger.debug(f"Highest logical clock in change_log: {highest_clock}")
+
+            total_changes = self.db_manager.execute(
+                "SELECT COUNT(*) FROM change_log",
+            )[0][0]
+            logger.debug(f"Total changes in change_log: {total_changes}")
+            
+            # Get the highest logical clock for comparison
+            highest_clock = self.db_manager.execute(
+                "SELECT MAX(logical_clock) FROM change_log",
+            )[0][0]
+            if highest_clock:
+                logger.debug(f"Highest logical clock in change_log: {highest_clock}")
                 
                 # Use the method that filters by logical clock
-                changes = self.change_tracker.get_changes_since_clock(last_clock, peer_node_id, conn=conn)
+                changes = self.change_tracker.get_changes_since_clock(last_clock, peer_node_id)
         except Exception as e:
             logger.error(f"Error getting change log stats: {e}")
             changes = []
@@ -1794,7 +1787,7 @@ class DatabaseSynchronizer:
         """Find peer with latest database version"""
         try:
             with self.db_manager.transaction() as conn:
-                our_version = self.change_tracker.get_db_version(conn=conn)
+                our_version = self.change_tracker.get_db_version()
                 our_clock = our_version.get('logical_clock', 0)
                 
                 latest_peer = None
