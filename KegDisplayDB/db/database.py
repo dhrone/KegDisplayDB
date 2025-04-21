@@ -380,10 +380,11 @@ class DatabaseManager:
                 self.conn = None
                 self.origin = f"Transaction from {traceback.extract_stack()[-3].name}"
                 self.acquired_lock = False
+                self.start_time = time.time()
                 
             def __enter__(self):
                 # Acquire the database semaphore
-                logger.info(f"ENTRY transaction from {self.origin}")
+                logger.info(f"ENTRY transaction from {self.origin} started {self.start_time}")
                 with db_write_semaphore_lock:
                     if self.db_manager.db_path not in db_write_semaphore:
                         db_write_semaphore[self.db_manager.db_path] = threading.Semaphore(1)
@@ -443,7 +444,7 @@ class DatabaseManager:
                         else:
                             self.conn.rollback()
                 finally:
-                    logger.info(f"EXIT transaction from {self.origin}")
+                    logger.info(f"EXIT transaction from {self.origin} duration {time.time() - self.start_time:.2f}s")
                     if self.conn:
                         # Unregister from global tracker
                         unregister_connection(self.conn)
