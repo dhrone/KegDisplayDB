@@ -538,12 +538,11 @@ class DatabaseManager:
             logger.error(f"Error updating beer with ID {beer_id}: {e}")
             raise
     
-    def delete_beer(self, beer_id, conn=None):
+    def delete_beer(self, beer_id):
         """Delete a beer from the database
         
         Args:
             beer_id: ID of the beer to delete
-            conn: Optional database connection to use
             
         Returns:
             success: True if the beer was deleted, False if not found
@@ -803,9 +802,6 @@ class DatabaseManager:
     def clear_beer(self):
         """Delete all records from the beers table
         
-        Args:
-            conn: Database connection to use
-            
         Returns:
             success: True if the operation was successful
         """
@@ -815,14 +811,11 @@ class DatabaseManager:
             return True
         except Exception as e:
             logger.error(f"Error clearing beers table: {e}")
-            return False
+            raise
     
-    def clear_tap(self, conn=None):
+    def clear_tap(self):
         """Delete all records from the taps table
         
-        Args:
-            conn: Database connection to use
-            
         Returns:
             success: True if the operation was successful
         """
@@ -832,7 +825,7 @@ class DatabaseManager:
             return True
         except Exception as e:
             logger.error(f"Error clearing taps table: {e}")
-            return False
+            raise
             
     def apply_sync_changes(self, changes):
         """Apply changes received during sync
@@ -857,191 +850,202 @@ class DatabaseManager:
             return
             
         logger.info(f"Applying {len(changes)} sync changes")
-        applied_changes = 0
-        failed_changes = 0
-            
+        total_applied_changes = 0
+        total_failed_changes = 0
+        highest_logical_clock = 0
+        
         try:
-            # Start transaction
-            with self.transaction() as conn:
-                # Track the highest logical clock from applied changes
-                highest_logical_clock = 0
-                peer_node_id = None
-                
-                # Get current logical clock
-                current_clock_row = self.query(
-                    "SELECT logical_clock, node_id FROM version WHERE id = 1", 
-                    conn=conn
+            # Get current logical clock
+            current_clock_row = self.execute(
+                "SELECT logical_clock, node_id FROM version WHERE id = 1"
+            )
+            current_clock = current_clock_row[0][0] if current_clock_row and current_clock_row[0][0] is not None else 0
+            local_node_id = current_clock_row[0][1] if current_clock_row and current_clock_row[0][1] is not None else str(uuid.uuid4())
+            
+            # Sort the changes by logical clock and origin node
+            changes = sorted(
+                changes,
+                key=lambda c: (
+                    c[6] if len(c) > 6 else 0,          # logical clock
+                    c[7] if len(c) > 7 else local_node_id  # origin node
                 )
-                current_clock = current_clock_row[0] if current_clock_row and current_clock_row[0] is not None else 0
-                local_node_id = current_clock_row[1] if current_clock_row and current_clock_row[1] is not None else str(uuid.uuid4())
+            )
+            
+            # Process changes in batches of 100
+            batch_size = 100
+            
+            # Process all changes in batches
+            for i in range(0, len(changes), batch_size):
+                batch = changes[i:i+batch_size]
+                batch_clock = current_clock  # Current clock at the start of this batch
+                logger.info(f"Processing batch {i//batch_size + 1}/{(len(changes)-1)//batch_size + 1} ({len(batch)} changes)")
                 
-                # Sort the changes by logical clock and origin node
-                changes = sorted(
-                    changes,
-                    key=lambda c: (
-                        c[6] if len(c) > 6 else 0,          # logical clock
-                        c[7] if len(c) > 7 else local_node_id  # origin node
-                    )
-                )
-                
-                # Process each change in clock-ordered stream
-                for change_index, change in enumerate(changes):
-                    try:
-                        # Ensure the change has all the required fields
-                        if len(change) < 6:
-                            logger.warning(f"Change at index {change_index} is missing required fields: {change}")
-                            failed_changes += 1
-                            continue
-                        
-                        # Extract change information
-                        table_name = change[0]
-                        operation = change[1]
-                        row_id = change[2]
-                        timestamp = change[3]
-                        content = change[4]
-                        content_hash = change[5]
-                        
-                        # Extract logical clock and node_id if present
-                        logical_clock = 0
-                        node_id = None
-                        if len(change) >= 7:
+                # Define the transaction function for this batch
+                def process_batch(conn):
+                    nonlocal batch_clock, total_applied_changes, total_failed_changes, highest_logical_clock
+                    
+                    applied_changes = 0
+                    failed_changes = 0
+                    batch_highest_clock = batch_clock
+                    
+                    # Process each change in the batch
+                    for change_index, change in enumerate(batch):
+                        try:
+                            # Ensure the change has all the required fields
+                            if len(change) != 8:
+                                logger.warning(f"Change at index {change_index} is missing required fields: {change}")
+                                failed_changes += 1
+                                continue
+                            
+                            # Extract change information
+                            table_name = change[0]
+                            operation = change[1]
+                            row_id = change[2]
+                            timestamp = change[3]
+                            content = change[4]
+                            content_hash = change[5]
                             logical_clock = change[6]
-                        if len(change) >= 8:
                             node_id = change[7]
-                            # Store peer node ID for version table update
-                            if not peer_node_id:
-                                peer_node_id = node_id
-                        
-                        # Check if this change is already in our change_log
-                        existing_change = self.query(
-                            """
-                            SELECT COUNT(*) FROM change_log 
-                            WHERE table_name = ? AND operation = ? AND row_id = ? AND logical_clock = ? AND node_id = ?
-                            """,
-                            (table_name, operation, row_id, logical_clock, node_id),
-                            conn=conn
-                        )
-                        
-                        if existing_change and existing_change[0] > 0:
-                            # Skip changes we've already processed
-                            logger.debug(f"Skipping already applied change: {operation} on {table_name}.{row_id}")
-                            continue
                             
-                        # Verify content hash (security check)
-                        if hashlib.md5(content.encode()).hexdigest() != content_hash:
-                            logger.warning(f"Content hash mismatch for change at index {change_index}")
-                            failed_changes += 1
-                            continue
-                        
-                        # Update our logical clock (Lamport rule: localClock = max(localClock, t) + 1)
-                        new_clock = max(current_clock, logical_clock) + 1
-                        current_clock = new_clock  # Update for next iteration
-                        
-                        # Track the highest computed clock
-                        if new_clock > highest_logical_clock:
-                            highest_logical_clock = new_clock
-                        
-                        logger.debug(f"Applying change: {operation} to {table_name}.{row_id} (logical clock: {logical_clock}, our new clock: {new_clock})")
-                        
-                        # Apply the change based on operation type
-                        if operation == 'INSERT' or operation == 'UPDATE':
-                            try:
-                                # Parse the content as JSON and build the SQL
-                                row_data = json.loads(content)
+                            # Check if this change is already in our change_log
+                            cursor = conn.execute(
+                                """
+                                SELECT COUNT(*) FROM change_log 
+                                WHERE table_name = ? AND operation = ? AND row_id = ? AND logical_clock = ? AND node_id = ?
+                                """,
+                                (table_name, operation, row_id, logical_clock, node_id)
+                            )
+                            existing_change = cursor.fetchone()
+                            
+                            if existing_change and existing_change[0] > 0:
+                                # Skip changes we've already processed
+                                logger.debug(f"Skipping already applied change: {operation} on {table_name}.{row_id}")
+                                continue
                                 
-                                if operation == 'INSERT':
-                                    # Build INSERT statement
-                                    columns = ', '.join(row_data.keys())
-                                    placeholders = ', '.join(['?'] * len(row_data))
-                                    sql = f"INSERT OR REPLACE INTO {table_name} ({columns}) VALUES ({placeholders})"
-                                    self.query(sql, list(row_data.values()), conn=conn)
+                            # Verify content hash (security check)
+                            if hashlib.md5(content.encode()).hexdigest() != content_hash:
+                                logger.warning(f"Content hash mismatch for change at index {change_index}")
+                                failed_changes += 1
+                                continue
+                            
+                            # Update our logical clock (Lamport rule: localClock = max(localClock, t) + 1)
+                            new_clock = max(batch_clock, logical_clock) + 1
+                            batch_clock = new_clock  # Update for next iteration
+                            
+                            # Track the highest computed clock
+                            if new_clock > batch_highest_clock:
+                                batch_highest_clock = new_clock
+                            
+                            logger.debug(f"Applying change: {operation} to {table_name}.{row_id} (logical clock: {logical_clock}, our new clock: {new_clock})")
+                            
+                            # Apply the change based on operation type
+                            if operation == 'INSERT' or operation == 'UPDATE':
+                                try:
+                                    # Parse the content as JSON and build the SQL
+                                    row_data = json.loads(content)
                                     
-                                elif operation == 'UPDATE':
-                                    # Build UPDATE statement
-                                    set_clause = ', '.join([f"{col} = ?" for col in row_data.keys()])
-                                    sql = f"UPDATE {table_name} SET {set_clause} WHERE rowid = ?"
-                                    params = list(row_data.values()) + [row_id]
-                                    self.query(sql, params, conn=conn)
-                                
-                                # Log the change in our change_log table with OUR new clock value
-                                self.query(
-                                    """
-                                    INSERT INTO change_log 
-                                    (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                                    """,
-                                    (table_name, operation, row_id, timestamp, content, content_hash, new_clock, node_id),
-                                    conn=conn
-                                )
-                                applied_changes += 1
-                                
-                            except Exception as e:
-                                logger.error(f"Error applying {operation} change to {table_name}.{row_id}: {e}")
+                                    if operation == 'INSERT':
+                                        # Build INSERT statement
+                                        columns = ', '.join(row_data.keys())
+                                        placeholders = ', '.join(['?'] * len(row_data))
+                                        sql = f"INSERT OR REPLACE INTO {table_name} ({columns}) VALUES ({placeholders})"
+                                        conn.execute(sql, list(row_data.values()))
+                                        
+                                    elif operation == 'UPDATE':
+                                        # Build UPDATE statement
+                                        set_clause = ', '.join([f"{col} = ?" for col in row_data.keys()])
+                                        sql = f"UPDATE {table_name} SET {set_clause} WHERE rowid = ?"
+                                        params = list(row_data.values()) + [row_id]
+                                        conn.execute(sql, params)
+                                    
+                                    # Log the change in our change_log table with OUR new clock value
+                                    conn.execute(
+                                        """
+                                        INSERT INTO change_log 
+                                        (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                        """,
+                                        (table_name, operation, row_id, timestamp, content, content_hash, new_clock, node_id)
+                                    )
+                                    applied_changes += 1
+                                    
+                                except Exception as e:
+                                    logger.error(f"Error applying {operation} change to {table_name}.{row_id}: {e}")
+                                    failed_changes += 1
+                                    
+                            elif operation == 'DELETE':
+                                try:
+                                    # Execute DELETE statement
+                                    sql = f"DELETE FROM {table_name} WHERE rowid = ?"
+                                    conn.execute(sql, (row_id,))
+                                    
+                                    # Log the change in our change_log table with OUR new clock value
+                                    conn.execute(
+                                        """
+                                        INSERT INTO change_log 
+                                        (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                        """,
+                                        (table_name, operation, row_id, timestamp, content, content_hash, new_clock, node_id)
+                                    )
+                                    applied_changes += 1
+                                    
+                                except Exception as e:
+                                    logger.error(f"Error applying DELETE change to {table_name}.{row_id}: {e}")
+                                    failed_changes += 1
+                            else:
+                                logger.warning(f"Unknown operation '{operation}' in change at index {change_index}")
                                 failed_changes += 1
                                 
-                        elif operation == 'DELETE':
-                            try:
-                                # Execute DELETE statement
-                                sql = f"DELETE FROM {table_name} WHERE rowid = ?"
-                                self.query(sql, (row_id,), conn=conn)
-                                
-                                # Log the change in our change_log table with OUR new clock value
-                                self.query(
-                                    """
-                                    INSERT INTO change_log 
-                                    (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                                    """,
-                                    (table_name, operation, row_id, timestamp, content, content_hash, new_clock, node_id),
-                                    conn=conn
-                                )
-                                applied_changes += 1
-                                
-                            except Exception as e:
-                                logger.error(f"Error applying DELETE change to {table_name}.{row_id}: {e}")
-                                failed_changes += 1
-                        else:
-                            logger.warning(f"Unknown operation '{operation}' in change at index {change_index}")
+                        except Exception as e:
+                            logger.error(f"Error processing change at index {change_index}: {e}")
                             failed_changes += 1
-                            
-                    except Exception as e:
-                        logger.error(f"Error processing change at index {change_index}: {e}")
-                        failed_changes += 1
+                    
+                    # Update tracking variables after batch processing
+                    total_applied_changes += applied_changes
+                    total_failed_changes += failed_changes
+                    if batch_highest_clock > highest_logical_clock:
+                        highest_logical_clock = batch_highest_clock
+                    
+                    # Return the new clock value to use for the next batch
+                    return batch_highest_clock
                 
-                # Update the version table with the highest computed logical clock
-                if highest_logical_clock > 0:
-                    # Update version table with new logical clock and timestamp
-                    timestamp = datetime.now(UTC).isoformat()
-                    
-                    # Calculate current database hash
-                    tables = ['beers', 'taps']
-                    new_hash = self._calculate_db_hash(tables, conn)
-                    
-                    self.query(
-                        """
-                        UPDATE version 
-                        SET timestamp = ?,
-                            hash = ?,
-                            logical_clock = ?,
-                            node_id = ?
-                        WHERE id = 1
-                        """,
-                        (timestamp, new_hash, highest_logical_clock, peer_node_id),
-                        conn=conn
-                    )
-                    
-                    logger.info(f"Updated version with logical clock {highest_logical_clock}")
+                # Execute the batch transaction
+                batch_result = self.dbs.run_in_transaction(process_batch)
+                current_clock = batch_result  # Update current clock for next batch
+            
+            # Update the version table with the highest computed logical clock
+            if highest_logical_clock > 0:
+                # Calculate current database hash
+                tables = ['beers', 'taps']
+                new_hash = self._calculate_db_hash(tables)
                 
-            logger.info(f"Successfully applied {applied_changes} changes, {failed_changes} failed")
+                # Update version table with new logical clock and timestamp
+                timestamp = datetime.now(UTC).isoformat()
+                
+                self.execute(
+                    """
+                    UPDATE version 
+                    SET timestamp = ?,
+                        hash = ?,
+                        logical_clock = ?,
+                        node_id = ?
+                    WHERE id = 1
+                    """,
+                    (timestamp, new_hash, highest_logical_clock, local_node_id)
+                )
+                
+                logger.info(f"Updated version with logical clock {highest_logical_clock}")
+                
+            logger.info(f"Successfully applied {total_applied_changes} changes, {total_failed_changes} failed")
+            return total_applied_changes > 0
                 
         except Exception as e:
             logger.error(f"Error applying sync changes: {e}")
-            return False
-        
-        return applied_changes > 0
+            raise
     
     def import_from_file(self, temp_db_path):
-        """Import the entire database from a file without replacing the original
+        """Import the entire database from a file using ATTACH DATABASE
         
         Args:
             temp_db_path: Path to the database file to import from
@@ -1050,6 +1054,11 @@ class DatabaseManager:
             success: Whether the import was successful
         """
         logger.info(f"Importing database from {temp_db_path}")
+        
+        # Ensure the temp database file exists
+        if not os.path.exists(temp_db_path):
+            logger.error(f"Import failed: Source database file {temp_db_path} does not exist")
+            return False
         
         try:
             # Create a backup before importing if the database exists
@@ -1060,90 +1069,120 @@ class DatabaseManager:
                 else:
                     logger.warning("Failed to create backup before importing database")
             
-            # This operation uses direct connections since we need to connect to
-            # two different database files simultaneously
-            with sqlite3.connect(self.db_path) as main_conn, sqlite3.connect(temp_db_path) as temp_conn:
-                main_conn.execute("BEGIN TRANSACTION")
-                
-                # Clear existing tables
-                self.clear_beer(main_conn)
-                self.clear_tap(main_conn)
-                
-                # Get all beers from temp db
-                temp_cursor = temp_conn.cursor()
-                temp_cursor.execute("SELECT * FROM beers")
-                beers = temp_cursor.fetchall()
-                
-                # Insert beers into main db
-                main_cursor = main_conn.cursor()
-                if beers:
-                    beer_columns = [d[0] for d in temp_cursor.description]
-                    beer_placeholders = ", ".join(["?"] * len(beer_columns))
-                    beer_insert_sql = f"INSERT INTO beers ({', '.join(beer_columns)}) VALUES ({beer_placeholders})"
-                    
-                    for beer in beers:
-                        main_cursor.execute(beer_insert_sql, beer)
-                
-                # Get all taps from temp db
-                temp_cursor.execute("SELECT * FROM taps")
-                taps = temp_cursor.fetchall()
-                
-                # Insert taps into main db
-                if taps:
-                    tap_columns = [d[0] for d in temp_cursor.description]
-                    tap_placeholders = ", ".join(["?"] * len(tap_columns))
-                    tap_insert_sql = f"INSERT INTO taps ({', '.join(tap_columns)}) VALUES ({tap_placeholders})"
-                    
-                    for tap in taps:
-                        main_cursor.execute(tap_insert_sql, tap)
-                
-                # Get the version information from the temp database
+            # Get absolute paths for both databases to ensure consistent referencing
+            abs_temp_path = os.path.abspath(temp_db_path)
+            
+            # Define the import function that will run in a transaction
+            def perform_import(conn):
                 try:
+                    # Attach the temporary database
+                    conn.execute(f"ATTACH DATABASE '{abs_temp_path}' AS temp_db")
+                    
+                    # Check if required tables exist in the temp database
+                    cursor = conn.execute("SELECT name FROM temp_db.sqlite_master WHERE type='table' AND (name='beers' OR name='taps')")
+                    tables = [row[0] for row in cursor.fetchall()]
+                    
+                    if 'beers' not in tables or 'taps' not in tables:
+                        logger.error("Import failed: Required tables not found in source database")
+                        conn.execute("DETACH DATABASE temp_db")
+                        return False
+                    
                     # Get our local node_id
-                    main_cursor.execute("SELECT node_id FROM version WHERE id = 1")
-                    local_node_id_row = main_cursor.fetchone()
-                    local_node_id = local_node_id_row[0] if local_node_id_row else None
+                    cursor = conn.execute("SELECT node_id FROM version WHERE id = 1")
+                    local_node_id_row = cursor.fetchone()
+                    local_node_id = local_node_id_row[0] if local_node_id_row else str(uuid.uuid4())
                     
-                    if not local_node_id:
-                        # If we don't have a node_id, generate one
-                        local_node_id = str(uuid.uuid4())
-                        logger.info(f"Generated new node_id for import: {local_node_id}")
+                    # Clear existing tables
+                    conn.execute("DELETE FROM beers")
+                    conn.execute("DELETE FROM taps")
                     
-                    # Check if version table exists and has logical_clock column
-                    temp_cursor.execute("PRAGMA table_info(version)")
-                    version_columns = [col[1] for col in temp_cursor.fetchall()]
+                    # Get column names from both tables to ensure schema compatibility
+                    cursor = conn.execute("PRAGMA table_info(beers)")
+                    local_beer_columns = [row[1] for row in cursor.fetchall()]
                     
-                    if 'logical_clock' in version_columns:
-                        temp_cursor.execute("SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1")
-                        version_row = temp_cursor.fetchone()
-                        if version_row:
-                            timestamp, db_hash, logical_clock, node_id = version_row
+                    cursor = conn.execute("PRAGMA temp_db.table_info(beers)")
+                    temp_beer_columns = [row[1] for row in cursor.fetchall()]
+                    
+                    # Find common columns for beers
+                    common_beer_columns = [col for col in temp_beer_columns if col in local_beer_columns]
+                    beer_columns_str = ", ".join(common_beer_columns)
+                    
+                    # Copy beers data
+                    conn.execute(f"INSERT INTO beers ({beer_columns_str}) SELECT {beer_columns_str} FROM temp_db.beers")
+                    
+                    # Do the same for taps
+                    cursor = conn.execute("PRAGMA table_info(taps)")
+                    local_tap_columns = [row[1] for row in cursor.fetchall()]
+                    
+                    cursor = conn.execute("PRAGMA temp_db.table_info(taps)")
+                    temp_tap_columns = [row[1] for row in cursor.fetchall()]
+                    
+                    # Find common columns for taps
+                    common_tap_columns = [col for col in temp_tap_columns if col in local_tap_columns]
+                    tap_columns_str = ", ".join(common_tap_columns)
+                    
+                    # Copy taps data
+                    conn.execute(f"INSERT INTO taps ({tap_columns_str}) SELECT {tap_columns_str} FROM temp_db.taps")
+                    
+                    # Handle version information
+                    try:
+                        # Check if version table exists in the temp database
+                        cursor = conn.execute("SELECT COUNT(*) FROM temp_db.sqlite_master WHERE type='table' AND name='version'")
+                        if cursor.fetchone()[0] > 0:
+                            # Check if logical_clock column exists
+                            cursor = conn.execute("PRAGMA temp_db.table_info(version)")
+                            version_columns = [row[1] for row in cursor.fetchall()]
                             
-                            # Preserve the imported logical clock value
-                            logger.info(f"Importing version data with logical_clock {logical_clock}")
-                            
-                            # Check if version table exists in our DB
-                            main_cursor.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='version'")
-                            if main_cursor.fetchone()[0] > 0:
-                                # Update our version table with the imported values but keep our node_id
-                                main_cursor.execute("""
-                                    UPDATE version 
-                                    SET timestamp = ?, hash = ?, logical_clock = ?
-                                    WHERE id = 1
-                                """, (timestamp, db_hash, logical_clock))
-                            else:
-                                # Create version record if it doesn't exist
-                                main_cursor.execute("""
-                                    INSERT INTO version (id, timestamp, hash, logical_clock, node_id)
-                                    VALUES (1, ?, ?, ?, ?)
-                                """, (timestamp, db_hash, logical_clock, local_node_id))
+                            if 'logical_clock' in version_columns:
+                                # Get version info from temp db
+                                cursor = conn.execute("SELECT timestamp, hash, logical_clock, node_id FROM temp_db.version WHERE id = 1")
+                                version_row = cursor.fetchone()
+                                
+                                if version_row:
+                                    timestamp, db_hash, logical_clock, node_id = version_row
+                                    logger.info(f"Importing version data with logical_clock {logical_clock}")
+                                    
+                                    # Get our current logical clock
+                                    cursor = conn.execute("SELECT logical_clock FROM version WHERE id = 1")
+                                    local_clock = cursor.fetchone()[0] or 0
+                                    
+                                    # Apply Lamport rule: new_clock = max(local_clock, imported_clock) + 1  
+                                    new_clock = max(local_clock, logical_clock) + 1
+                                    
+                                    # Update with new values
+                                    conn.execute("""
+                                        UPDATE version 
+                                        SET timestamp = ?, hash = ?, logical_clock = ?
+                                        WHERE id = 1
+                                    """, (datetime.now(UTC).isoformat(), self._calculate_db_hash(['beers', 'taps']), new_clock))
+                    except Exception as e:
+                        logger.warning(f"Could not import version information: {e}")
+                    
+                    # Detach the temporary database
+                    conn.execute("DETACH DATABASE temp_db")
+                    
+                    # Count imported records
+                    cursor = conn.execute("SELECT COUNT(*) FROM beers")
+                    beer_count = cursor.fetchone()[0]
+                    
+                    cursor = conn.execute("SELECT COUNT(*) FROM taps")
+                    tap_count = cursor.fetchone()[0]
+                    
+                    logger.info(f"Successfully imported database with {beer_count} beers and {tap_count} taps")
+                    return True
+                    
                 except Exception as e:
-                    logger.warning(f"Could not import version information: {e}")
-                
-                # Commit transaction
-                main_conn.commit()
-                logger.info(f"Successfully imported database with {len(beers)} beers and {len(taps)} taps")
-                return True
+                    # Make sure to detach the database even if an error occurs
+                    try:
+                        conn.execute("DETACH DATABASE IF EXISTS temp_db")
+                    except:
+                        pass
+                    logger.error(f"Error during database import transaction: {e}")
+                    return False
+            
+            # Execute the import using DBService transaction
+            result = self.dbs.run_in_transaction(perform_import)
+            return result
                 
         except Exception as e:
             logger.error(f"Error importing database: {e}")
