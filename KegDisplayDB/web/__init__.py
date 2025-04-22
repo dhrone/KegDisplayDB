@@ -2,4 +2,4 @@
 Web interface for KegDisplayDB
 """
 
-from .webinterface import app, start, parse_args
+from .web_service import app, main as start, parse_args

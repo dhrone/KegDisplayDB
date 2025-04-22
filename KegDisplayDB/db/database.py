@@ -262,6 +262,8 @@ class DBService:
     def _watchdog(self):
         while not self._shutdown_event.is_set():
             time.sleep(5)
+            if self._queue.qsize() == 0:
+                self._last_processed = time.monotonic() # reset last processed time if queue is empty            
             delta = time.monotonic() - self._last_processed
             if delta > 2.0:
                 logger.error("DBS WATCHDOG: no requests processed in %.1fs", delta)
