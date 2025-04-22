@@ -546,9 +546,8 @@ class DatabaseSynchronizer:
                         logger.debug(f"Change {i+1}: {operation} on {table_name} row {row_id} at {timestamp}")
             
             try:
-                # Get the latest version after getting changes
-                with self.db_manager.transaction() as conn:
-                    latest_version = self.change_tracker.get_db_version(conn=conn)
+
+                latest_version = self.change_tracker.get_db_version()
                 
                 # Send response with changes
                 response = self.protocol.create_sync_response(
@@ -587,9 +586,8 @@ class DatabaseSynchronizer:
                 # Update our logical clock based on peer's version ONLY after successful transfer
                 if 'logical_clock' in peer_version:
                     try:
-                        with self.db_manager.transaction() as conn:
-                            self.change_tracker.update_logical_clock(peer_clock, conn=conn)
-                            logger.debug(f"Updated our logical clock after successful sync with peer's clock: {peer_clock}")
+                        self.change_tracker.update_logical_clock(peer_clock)
+                        logger.debug(f"Updated our logical clock after successful sync with peer's clock: {peer_clock}")
                     except Exception as e:
                         logger.error(f"Error updating logical clock: {e}")
                 
@@ -614,8 +612,7 @@ class DatabaseSynchronizer:
             
             try:
                 # Get the latest version
-                with self.db_manager.transaction() as conn:
-                    latest_version = self.change_tracker.get_db_version(conn=conn)
+                latest_version = self.change_tracker.get_db_version()
                 
                 response = self.protocol.create_sync_response(
                     latest_version, 
@@ -626,9 +623,8 @@ class DatabaseSynchronizer:
                 # Even if no changes, we successfully completed the sync, so update the clock
                 if 'logical_clock' in peer_version:
                     try:
-                        with self.db_manager.transaction() as conn:
-                            self.change_tracker.update_logical_clock(peer_clock, conn=conn)
-                            logger.debug(f"Updated our logical clock after successful sync (no changes) with peer's clock: {peer_clock}")
+                        self.change_tracker.update_logical_clock(peer_clock)
+                        logger.debug(f"Updated our logical clock after successful sync (no changes) with peer's clock: {peer_clock}")
                     except Exception as e:
                         logger.error(f"Error updating logical clock: {e}")
                         
@@ -1125,14 +1121,13 @@ class DatabaseSynchronizer:
         
         # Prepare version and logical clock data before socket connection
         try:
-            with self.db_manager.transaction() as conn:
-                logical_clock = self.change_tracker.increment_logical_clock(conn=conn)
-                if logical_clock is None:
-                    logical_clock = 0
+            logical_clock = self.change_tracker.increment_logical_clock()
+            if logical_clock is None:
+                logical_clock = 0
                 
-                # Get our updated version (includes node_id)
-                version = self.change_tracker.get_db_version(conn=conn)
-                node_id = version.get('node_id')
+            # Get our updated version (includes node_id)
+            version = self.change_tracker.get_db_version()
+            node_id = version.get('node_id')
         except Exception as e:
             logger.error(f"Error getting version and incrementing clock for sync request: {e}")
             logical_clock = 0
@@ -1223,11 +1218,10 @@ class DatabaseSynchronizer:
                     
                     try:
                         # Use a single transaction for applying all changes
-                        with self.db_manager.transaction() as conn:
-                            self.db_manager.apply_sync_changes(changes, conn=conn)
+                        self.db_manager.apply_sync_changes(changes)
                             
-                            # Force recalculation of our database version after applying changes
-                            our_new_version = self.change_tracker.get_db_version(conn=conn)
+                        # Force recalculation of our database version after applying changes
+                        our_new_version = self.change_tracker.get_db_version()
                         
                         logger.info(f"Our version after applying changes: {our_new_version}")
                         
@@ -1547,19 +1541,53 @@ class DatabaseSynchronizer:
         logger.info(f"ENTRY _initial_peer_discovery")
         
         try:
-            # Use a transaction for database operations
-            with self.db_manager.transaction() as conn:
-                # Increment logical clock for this control message
-                self.change_tracker.increment_logical_clock(conn=conn)
-                
-                # Get current database version
-                version = self.change_tracker.get_db_version(conn=conn)
+            # Add defensive checks to identify which object might be None
+            if self.change_tracker is None:
+                logger.error("change_tracker is None")
+                return
+            
+            # Check if increment_logical_clock is callable
+            if not callable(getattr(self.change_tracker, 'increment_logical_clock', None)):
+                logger.error(f"change_tracker.increment_logical_clock is not callable: {getattr(self.change_tracker, 'increment_logical_clock', None)}")
+                return
+            
+            # Increment logical clock for this control message
+            try:
+                self.change_tracker.increment_logical_clock()
+            except Exception as e:
+                logger.error(f"Error calling increment_logical_clock: {e}")
+                return
+            
+            # Get current database version with defensive check
+            if not callable(getattr(self.change_tracker, 'get_db_version', None)):
+                logger.error(f"change_tracker.get_db_version is not callable: {getattr(self.change_tracker, 'get_db_version', None)}")
+                return
+            
+            version = self.change_tracker.get_db_version()
+            
+            # Check protocol and network objects
+            if self.protocol is None:
+                logger.error("protocol is None")
+                return
+            
+            if self.network is None:
+                logger.error("network is None")
+                return
+            
+            if not callable(getattr(self.protocol, 'create_discovery_message', None)):
+                logger.error(f"protocol.create_discovery_message is not callable: {getattr(self.protocol, 'create_discovery_message', None)}")
+                return
             
             # Create and broadcast discovery message
             discovery_message = self.protocol.create_discovery_message(
                 version, 
                 self.network.sync_port
             )
+            
+            if not callable(getattr(self.network, 'send_broadcast', None)):
+                logger.error(f"network.send_broadcast is not callable: {getattr(self.network, 'send_broadcast', None)}")
+                return
+            
             self.network.send_broadcast(discovery_message)
             
             logger.info("Sent initial peer discovery broadcast")
@@ -1570,50 +1598,49 @@ class DatabaseSynchronizer:
             time.sleep(discovery_time)
             
             # Find peer with the latest version
-            with self.db_manager.transaction() as conn:
-                latest_peer = None
-                latest_port = None
-                latest_version = self.change_tracker.get_db_version(conn=conn)
-                latest_clock = latest_version.get("logical_clock", 0)
+            latest_peer = None
+            latest_port = None
+            latest_version = self.change_tracker.get_db_version()
+            latest_clock = latest_version.get("logical_clock", 0)
+            
+            is_empty = self.change_tracker.is_database_empty()
+            
+            with self.lock:
+                logger.info(f"Found {len(self.peers)} peers during discovery")
                 
-                is_empty = self.change_tracker.is_database_empty(conn=conn)
-                
-                with self.lock:
-                    logger.info(f"Found {len(self.peers)} peers during discovery")
+                for ip, (version, _, port) in self.peers.items():
+                    # Get the peer's logical clock
+                    peer_clock = version.get('logical_clock', 0)
                     
-                    for ip, (version, _, port) in self.peers.items():
-                        # Get the peer's logical clock
-                        peer_clock = version.get('logical_clock', 0)
+                    # Check if this peer's hash is different
+                    content_differs = version.get('hash') != latest_version.get('hash')
+                    
+                    if content_differs:
+                        logger.info(f"Peer {ip} has different hash: {version.get('hash')} vs our {latest_version.get('hash')}")
                         
-                        # Check if this peer's hash is different
-                        content_differs = version.get('hash') != latest_version.get('hash')
-                        
-                        if content_differs:
-                            logger.info(f"Peer {ip} has different hash: {version.get('hash')} vs our {latest_version.get('hash')}")
-                            
-                            # Special case for empty database
-                            if is_empty:
-                                logger.info(f"We have empty database but peer has data, considering peer newer")
-                                if latest_peer is None or peer_clock > latest_clock:
-                                    latest_peer = ip
-                                    latest_port = port
-                                    latest_version = version
-                                    latest_clock = peer_clock
-                                    logger.info(f"This is now the latest peer (empty database case)")
-                            # Otherwise, compare logical clocks
-                            elif peer_clock > latest_clock:
+                        # Special case for empty database
+                        if is_empty:
+                            logger.info(f"We have empty database but peer has data, considering peer newer")
+                            if latest_peer is None or peer_clock > latest_clock:
                                 latest_peer = ip
                                 latest_port = port
                                 latest_version = version
                                 latest_clock = peer_clock
-                                logger.info(f"This is now the latest peer (logical clock: {peer_clock} > {latest_clock})")
-                            # If clocks are equal, use tie-breaking
-                            elif peer_clock == latest_clock and self.change_tracker.is_newer_version(version, latest_version):
-                                latest_peer = ip
-                                latest_port = port
-                                latest_version = version
-                                logger.info(f"This is now the latest peer (won tie-breaking)")
-            
+                                logger.info(f"This is now the latest peer (empty database case)")
+                        # Otherwise, compare logical clocks
+                        elif peer_clock > latest_clock:
+                            latest_peer = ip
+                            latest_port = port
+                            latest_version = version
+                            latest_clock = peer_clock
+                            logger.info(f"This is now the latest peer (logical clock: {peer_clock} > {latest_clock})")
+                        # If clocks are equal, use tie-breaking
+                        elif peer_clock == latest_clock and self.change_tracker.is_newer_version(version, latest_version):
+                            latest_peer = ip
+                            latest_port = port
+                            latest_version = version
+                            logger.info(f"This is now the latest peer (won tie-breaking)")
+        
             if latest_peer:
                 logger.info(f"Found peer with latest version: {latest_peer}, requesting full database")
                 db_request_start = time.time()
@@ -1629,6 +1656,8 @@ class DatabaseSynchronizer:
         except Exception as e:
             elapsed = time.time() - start_time
             logger.error(f"Error in initial peer discovery: {e} - elapsed: {elapsed:.3f}s")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             logger.info(f"EXIT _initial_peer_discovery with error - elapsed: {elapsed:.3f}s")
     
     def _heartbeat_sender(self):
@@ -1723,61 +1752,60 @@ class DatabaseSynchronizer:
             peer: Peer instance to sync with
         """
         try:
-            # Use a transaction for database operations
-            with self.db_manager.transaction() as conn:
-                # Get our version information
-                our_version = self.change_tracker.get_db_version(conn=conn)
-                    
-                our_clock = our_version.get('logical_clock', 0)
-                our_node_id = our_version.get('node_id')
-                logger.info(f"Syncing with peer. Our logical clock: {our_clock}")
-                
-                # Get peer version - this won't use our transaction as it's on a different peer
-                peer_version = peer.change_tracker.get_db_version()
-                peer_clock = peer_version.get('logical_clock', 0)
-                logger.info(f"Peer version: logical clock {peer_clock}")
-                
-                # Skip if versions are identical
-                if our_version.get('hash') == peer_version.get('hash'):
-                    logger.debug("Versions identical, skipping sync")
-                    return
-                
-                # Get changes from peer since our logical clock
-                changes = peer.change_tracker.get_changes_since_clock(our_clock, our_node_id)
-                logger.info(f"Got {len(changes)} changes from peer in test mode")
-                
-                # Log details of changes for debugging
-                for i, change in enumerate(changes):
-                    if len(change) >= 8:  # Should have (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id)
-                        table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id = change
-                        logger.info(f"Change {i+1}: {operation} on {table_name} row {row_id} at logical clock {logical_clock}")
-                        logger.debug(f"Content: {content}")
-                    else:
-                        logger.warning(f"Invalid change format at index {i}: {change}")
-                
-                if changes:
-                    # Apply the changes directly to the database
-                    try:
-                        self.db_manager.apply_sync_changes(changes, conn=conn)
-                        logger.info(f"Successfully applied {len(changes)} changes from peer")
-                        
-                        # Update our logical clock after applying changes
-                        our_new_version = self.change_tracker.get_db_version(conn=conn)
-                        our_new_clock = our_new_version.get('logical_clock', 0)
-                        
-                        # Make sure our clock is at least as high as the peer's
-                        if peer_clock > our_new_clock:
-                            self.change_tracker.update_logical_clock(peer_clock, conn=conn)
-                                
-                            logger.info(f"Updated our logical clock to match peer: {peer_clock}")
-                        
-                        logger.info(f"Updated our version to: logical clock {our_new_clock} after applying changes")
-                        
-                    except Exception as e:
-                        logger.error(f"Error applying test mode changes: {e}")
-                        raise
+
+            # Get our version information
+            our_version = self.change_tracker.get_db_version()
+            
+            our_clock = our_version.get('logical_clock', 0)
+            our_node_id = our_version.get('node_id')
+            logger.info(f"Syncing with peer. Our logical clock: {our_clock}")
+            
+            # Get peer version - this won't use our transaction as it's on a different peer
+            peer_version = peer.change_tracker.get_db_version()
+            peer_clock = peer_version.get('logical_clock', 0)
+            logger.info(f"Peer version: logical clock {peer_clock}")
+            
+            # Skip if versions are identical
+            if our_version.get('hash') == peer_version.get('hash'):
+                logger.debug("Versions identical, skipping sync")
+                return
+            
+            # Get changes from peer since our logical clock
+            changes = peer.change_tracker.get_changes_since_clock(our_clock, our_node_id)
+            logger.info(f"Got {len(changes)} changes from peer in test mode")
+            
+            # Log details of changes for debugging
+            for i, change in enumerate(changes):
+                if len(change) >= 8:  # Should have (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id)
+                    table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id = change
+                    logger.info(f"Change {i+1}: {operation} on {table_name} row {row_id} at logical clock {logical_clock}")
+                    logger.debug(f"Content: {content}")
                 else:
-                    logger.info("No changes to apply from peer in test mode")
+                    logger.warning(f"Invalid change format at index {i}: {change}")
+            
+            if changes:
+                # Apply the changes directly to the database
+                try:
+                    self.db_manager.apply_sync_changes(changes)
+                    logger.info(f"Successfully applied {len(changes)} changes from peer")
+                    
+                    # Update our logical clock after applying changes
+                    our_new_version = self.change_tracker.get_db_version()
+                    our_new_clock = our_new_version.get('logical_clock', 0)
+                    
+                    # Make sure our clock is at least as high as the peer's
+                    if peer_clock > our_new_clock:
+                        self.change_tracker.update_logical_clock(peer_clock)
+                            
+                        logger.info(f"Updated our logical clock to match peer: {peer_clock}")
+                    
+                    logger.info(f"Updated our version to: logical clock {our_new_clock} after applying changes")
+                    
+                except Exception as e:
+                    logger.error(f"Error applying test mode changes: {e}")
+                    raise
+            else:
+                logger.info("No changes to apply from peer in test mode")
                 
         except Exception as e:
             logger.error(f"Test mode sync error: {e}")
@@ -1785,43 +1813,42 @@ class DatabaseSynchronizer:
     def _find_latest_peer(self):
         """Find peer with latest database version"""
         try:
-            with self.db_manager.transaction() as conn:
-                our_version = self.change_tracker.get_db_version()
-                our_clock = our_version.get('logical_clock', 0)
+            our_version = self.change_tracker.get_db_version()
+            our_clock = our_version.get('logical_clock', 0)
+            
+            latest_peer = None
+            latest_port = None
+            latest_version = our_version
+            latest_clock = our_clock
+            
+            logger.info(f"Looking for peers with newer database version than ours (logical clock: {our_clock})")
+            
+            with self.lock:
+                logger.info(f"Found {len(self.peers)} peers during discovery")
                 
-                latest_peer = None
-                latest_port = None
-                latest_version = our_version
-                latest_clock = our_clock
-                
-                logger.info(f"Looking for peers with newer database version than ours (logical clock: {our_clock})")
-                
-                with self.lock:
-                    logger.info(f"Found {len(self.peers)} peers during discovery")
+                for ip, (version, _, port) in self.peers.items():
+                    # Get peer's logical clock
+                    peer_clock = version.get('logical_clock', 0)
                     
-                    for ip, (version, _, port) in self.peers.items():
-                        # Get peer's logical clock
-                        peer_clock = version.get('logical_clock', 0)
+                    # Check if content differs
+                    content_differs = version.get("hash") != our_version.get("hash")
+                    
+                    if content_differs:
+                        logger.info(f"Peer {ip} has different hash (content differs)")
                         
-                        # Check if content differs
-                        content_differs = version.get("hash") != our_version.get("hash")
-                        
-                        if content_differs:
-                            logger.info(f"Peer {ip} has different hash (content differs)")
-                            
-                            # Compare logical clocks
-                            if peer_clock > latest_clock:
-                                latest_peer = ip
-                                latest_port = port
-                                latest_version = version
-                                latest_clock = peer_clock
-                                logger.info(f"This is now the latest peer (logical clock: {peer_clock} > {our_clock})")
-                            # If clocks are equal, use tie-breaking with node IDs
-                            elif peer_clock == latest_clock and self.change_tracker.is_newer_version(version, latest_version):
-                                latest_peer = ip
-                                latest_port = port
-                                latest_version = version
-                                logger.info(f"This is now the latest peer (won tie-breaking with equal clocks: {peer_clock})")
+                        # Compare logical clocks
+                        if peer_clock > latest_clock:
+                            latest_peer = ip
+                            latest_port = port
+                            latest_version = version
+                            latest_clock = peer_clock
+                            logger.info(f"This is now the latest peer (logical clock: {peer_clock} > {our_clock})")
+                        # If clocks are equal, use tie-breaking with node IDs
+                        elif peer_clock == latest_clock and self.change_tracker.is_newer_version(version, latest_version):
+                            latest_peer = ip
+                            latest_port = port
+                            latest_version = version
+                            logger.info(f"This is now the latest peer (won tie-breaking with equal clocks: {peer_clock})")
             
             if latest_peer:
                 logger.info(f"Found peer with latest version: {latest_peer}, requesting full database")
