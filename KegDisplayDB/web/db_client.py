@@ -1,4 +1,7 @@
 import requests
+import os
+import tempfile
+import shutil
 
 class DbClient:
     """
@@ -86,13 +89,28 @@ class DbClient:
         file_obj: werkzeug FileStorage from Flask request.files
         Returns the JSON response and status code.
         """
-        files = {'file': (file_obj.filename, file_obj.stream, file_obj.content_type)}
-        r = requests.post(f"{self.base}/rpc/beers/import", files=files)
+        # Create a temporary file to store the uploaded content
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.csv')
         try:
-            r.raise_for_status()
-        except Exception:
-            return r.json(), r.status_code
-        return r.json(), r.status_code
+            # Save the uploaded file to the temporary location
+            file_obj.save(temp_file.name)
+            temp_file.close()
+            
+            # Open the saved file for sending
+            with open(temp_file.name, 'rb') as f:
+                files = {'file': (file_obj.filename, f, file_obj.content_type)}
+                r = requests.post(f"{self.base}/rpc/beers/import", files=files)
+                try:
+                    r.raise_for_status()
+                except Exception:
+                    return r.json(), r.status_code
+                return r.json(), r.status_code
+        finally:
+            # Clean up the temporary file
+            try:
+                os.unlink(temp_file.name)
+            except:
+                pass
 
     def get_import_status(self):
         """

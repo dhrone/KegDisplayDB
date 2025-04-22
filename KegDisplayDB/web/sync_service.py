@@ -260,16 +260,16 @@ def rpc_import_beers():
     }
     temp_path = os.path.join(DATA_DIR, f"temp_import_{uuid.uuid4()}.csv")
 
+    # Save file immediately
+    try:
+        file.save(temp_path)
+    except Exception as e:
+        import_status["in_progress"] = False
+        return jsonify({"error": f"Failed to save file: {str(e)}"}), 500
+
     def background_import():
         global import_status
         try:
-            # Save file to disk
-            with open(temp_path, 'wb') as f:
-                while True:
-                    chunk = file.stream.read(1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)
             import_status["last_import"]["status"] = "Parsing CSV..."
             # Parse CSV
             with open(temp_path, 'r', newline='') as f:
