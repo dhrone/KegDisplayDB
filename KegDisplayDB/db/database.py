@@ -136,6 +136,18 @@ class DBService:
         The entire operation is atomic: commit on success, rollback on error.
         """
         enqueue_time = time.monotonic()
+        
+        # Add defensive checks before enqueueing
+        if fn is None:
+            error_msg = "Cannot run transaction with None function"
+            logger.error(f"DBS ERROR: {error_msg}")
+            raise ValueError(error_msg)
+            
+        if not callable(fn):
+            error_msg = f"Transaction requires callable function, got {type(fn)}"
+            logger.error(f"DBS ERROR: {error_msg}")
+            raise TypeError(error_msg)
+            
         fn_name = getattr(fn, '__name__', repr(fn))
         logger.debug(
             "DBS QUEUED TRANSACTION: %s",
@@ -244,6 +256,21 @@ class DBService:
                     elif kind == "tx":
                         fn: Callable[[sqlite3.Connection], R] = payload
                         fn_name = getattr(fn, '__name__', repr(fn))
+                        
+                        # Add defensive check for None function
+                        if fn is None:
+                            error_msg = "Transaction function is None, cannot execute"
+                            logger.error(f"DBS ERROR: {error_msg}")
+                            future.set_exception(ValueError(error_msg))
+                            continue
+                        
+                        # Add check for non-callable function
+                        if not callable(fn):
+                            error_msg = f"Transaction payload is not callable: {type(fn)}"
+                            logger.error(f"DBS ERROR: {error_msg}")
+                            future.set_exception(TypeError(error_msg))
+                            continue
+                            
                         logger.debug(
                             "DBS PROCESS TRANSACTION: %s (waited %.3fs)",
                             fn_name, wait_time
