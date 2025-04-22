@@ -17,6 +17,7 @@ import shutil
 import traceback
 import socket
 import re
+import concurrent.futures
 
 from concurrent.futures import Future
 from typing import Callable, TypeVar, Any, Optional
@@ -62,11 +63,11 @@ class DBService:
         busy_timeout: int = 5000
     ):
         """
-        Initialize the DBService and open the SQLite connection in __init__.
+        Initialize the DBService and open the SQLite connection.
 
-        db_path: Path to SQLite file.
-        pragmas: PRAGMA settings (e.g. {'journal_mode': 'WAL'}).
-        busy_timeout: Milliseconds SQLite will wait when database is busy.
+        - db_path: Path to SQLite file.
+        - pragmas: PRAGMA settings (e.g. {'journal_mode': 'WAL'}).
+        - busy_timeout: Milliseconds to wait when DB is busy.
         """
         self._db_path = db_path
         self._pragmas = pragmas or {
@@ -74,29 +75,33 @@ class DBService:
             'synchronous': 'NORMAL'
         }
         self._busy_timeout = busy_timeout
-        # Queue holds tuples: (kind, payload, future, enqueue_time)
-        self._queue: "queue.Queue[tuple[str, Any, Future, float]]" = queue.Queue()
+
+        # Shutdown control
         self._shutdown_event = threading.Event()
+        self._shutdown_requested = False
+        self._last_processed = time.monotonic()
 
+        # Work queue: (kind, payload, future, enqueue_timestamp)
+        self._queue: "queue.Queue[tuple[str, Any, Future, float]]" = queue.Queue()
 
-        # Open connection now, allowing cross-thread use
+        # Open SQLite connection
         try:
             self._conn = sqlite3.connect(
                 self._db_path,
                 check_same_thread=False,
-                isolation_level=None  # autocommit off; manage transactions manually
+                isolation_level=None
             )
             self._configure_pragmas()
         except Exception:
             logger.exception("DBS INIT ERROR: Failed to open SQLite connection.")
             raise
 
-        # Start actor thread
+        # Start actor and watchdog threads
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        threading.Thread(target=self._watchdog, daemon=True).start()
 
     def _configure_pragmas(self) -> None:
-        """Apply PRAGMAs and busy timeout settings on the connection."""
         cursor = self._conn.cursor()
         for key, value in self._pragmas.items():
             cursor.execute(f"PRAGMA {key}={value};")
@@ -105,241 +110,161 @@ class DBService:
 
     @staticmethod
     def _normalize_sql(sql: str) -> str:
-        """Normalize SQL to a single line with trimmed whitespace."""
         return ' '.join(sql.split())
 
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> Any:
-        """
-        Execute a single SQL statement.
-        - SELECT returns list of rows;
-        - other DML returns number of affected rows.
-        """
+        if self._shutdown_event.is_set():
+            raise RuntimeError("DBService is shut down")
+
         enqueue_time = time.monotonic()
         norm_sql = self._normalize_sql(sql)
+        req_id = uuid.uuid4().hex
+        qsize = self._queue.qsize()
         logger.debug(
-            "DBS QUEUED EXECUTE: %s (%r)",
-            norm_sql, params
+            "DBS QUEUED EXECUTE | id=%s | qsize=%d | %s | %r",
+            req_id, qsize, norm_sql, params
         )
+
         future = Future()
-        self._queue.put(("single", (sql, params), future, enqueue_time))
-        result = future.result()
-        # Temporary debug breakpoint to inspect result type
-        # Remove after debugging
-        if "SELECT * FROM beers" in sql:
-            # import pdb; pdb.set_trace()  # Uncomment this line to enable breakpoint
-            pass 
-        return result
-
-    def run_in_transaction(self, fn: Callable[[sqlite3.Connection], R]) -> R:
-        """
-        Run arbitrary logic fn inside a single transaction, returning fn's result.
-        The entire operation is atomic: commit on success, rollback on error.
-        """
-        enqueue_time = time.monotonic()
-        
-        # Add defensive checks before enqueueing
-        if fn is None:
-            error_msg = "Cannot run transaction with None function"
-            logger.error(f"DBS ERROR: {error_msg}")
-            raise ValueError(error_msg)
-            
-        if not callable(fn):
-            error_msg = f"Transaction requires callable function, got {type(fn)}"
-            logger.error(f"DBS ERROR: {error_msg}")
-            raise TypeError(error_msg)
-            
-        fn_name = getattr(fn, '__name__', repr(fn))
-        logger.debug(
-            "DBS QUEUED TRANSACTION: %s",
-            fn_name
-        )
-        future: Future = Future()
-        self._queue.put(("tx", fn, future, enqueue_time))
-        return future.result()
-
-    def shutdown(self, wait: bool = True) -> None:
-        """
-        Signal the actor loop to exit, close connection, and clean up.
-        If wait is True, block until shutdown completes.
-        """
-        # If the shutdown event is already set, just wait for the thread to join if requested
-        if self._shutdown_event.is_set():
-            logger.debug("DBS SHUTDOWN already in progress, skipping")
-            if wait and self._thread.is_alive():
-                self._thread.join(timeout=5.0)  # Set a timeout to prevent infinite wait
-            return
-
-        # Set the shutdown event first, so even if queue.put fails or hangs,
-        # the actor thread will exit on its next iteration
-        self._shutdown_event.set()
+        # Payload for single: (sql, params, req_id)
+        self._queue.put(("single", (sql, params, req_id), future, enqueue_time))
 
         try:
-            enqueue_time = time.monotonic()
-            logger.debug("DBS QUEUED SHUTDOWN")
-            future = Future()
-            
-            # Try to put the shutdown message in the queue with a timeout
-            # to prevent hanging if the queue is full
+            return future.result(timeout=15)
+        except TimeoutError:
+            logger.error("DBS TIMEOUT EXECUTE | id=%s | %s", req_id, norm_sql)
+            raise TimeoutError(f"Database operation timed out: {norm_sql}")
+
+    def run_in_transaction(self, fn: Callable[[sqlite3.Connection], R]) -> R:
+        if self._shutdown_event.is_set():
+            raise RuntimeError("DBService is shut down")
+
+        if fn is None or not callable(fn):
+            msg = f"Invalid transaction function: {fn}"
+            logger.error("DBS ERROR: %s", msg)
+            raise TypeError(msg)
+
+        enqueue_time = time.monotonic()
+        fn_name = getattr(fn, '__name__', repr(fn))
+        tx_id = uuid.uuid4().hex
+        qsize = self._queue.qsize()
+        logger.debug(
+            "DBS QUEUED TRANSACTION | id=%s | qsize=%d | %s",
+            tx_id, qsize, fn_name
+        )
+
+        future: Future = Future()
+        # Payload for tx: (fn, tx_id)
+        self._queue.put(("tx", (fn, tx_id), future, enqueue_time))
+
+        try:
+            return future.result(timeout=20)
+        except TimeoutError:
+            logger.error("DBS TIMEOUT TRANSACTION | id=%s | %s", tx_id, fn_name)
+            raise TimeoutError(f"Database transaction timed out: {fn_name}")
+
+    def shutdown(self, wait: bool = True) -> None:
+        if self._shutdown_requested:
+            logger.debug("DBS SHUTDOWN already requested, skipping")
+            return
+        self._shutdown_requested = True
+
+        logger.debug("DBS SHUTDOWN requested, enqueuing shutdown message")
+        future = Future()
+        self._queue.put(("shutdown", None, future, time.monotonic()))
+
+        if wait:
             try:
-                self._queue.put(("shutdown", None, future, enqueue_time), timeout=1.0)
-                
-                if wait:
-                    # Wait for the result with a timeout to prevent indefinite hanging
-                    try:
-                        future.result(timeout=5.0)
-                    except TimeoutError:
-                        logger.warning("DBS SHUTDOWN timed out waiting for result")
-                    except Exception as e:
-                        logger.warning(f"DBS SHUTDOWN error waiting for result: {e}")
-                    
-                    # Ensure thread is joined with a timeout
-                    if self._thread.is_alive():
-                        self._thread.join(timeout=5.0)
-                        if self._thread.is_alive():
-                            logger.warning("DBS SHUTDOWN thread join timed out")
-            
-            except queue.Full:
-                logger.warning("DBS SHUTDOWN queue full, forced shutdown initialized")
-                # If we couldn't put the message in the queue, the shutdown_event is still set,
-                # so the actor thread should eventually exit
-                if wait and self._thread.is_alive():
-                    self._thread.join(timeout=5.0)
-            
-        except Exception as e:
-            logger.error(f"DBS SHUTDOWN error occurred: {e}")
-            # Ensure the shutdown event is set even if an exception occurs
-            self._shutdown_event.set()
+                future.result(timeout=5)
+            except Exception as e:
+                logger.warning("DBS SHUTDOWN WAIT ERROR: %s", e)
+
+        logger.debug("DBS SHUTDOWN complete")
 
     def _run(self) -> None:
-        """Actor loop: processes all DB requests serially in a single thread."""
-        while not self._shutdown_event.is_set():
+        while True:
             try:
-                # Add timeout to queue.get() so we can check shutdown event periodically
-                # even if no items are in the queue
-                try:
-                    kind, payload, future, enqueue_time = self._queue.get(timeout=1.0)
-                except queue.Empty:
-                    # No items in queue, check shutdown event again
-                    continue
-                
-                dequeue_time = time.monotonic()
-                wait_time = dequeue_time - enqueue_time
-                try:
-                    if kind == "single":
-                        sql, params = payload
-                        norm_sql = self._normalize_sql(sql)
-                        logger.debug(
-                            "DBS PROCESS EXECUTE: %s (%r) (waited %.3fs)",
-                            norm_sql, params, wait_time
-                        )
-                        start_time = time.monotonic()
-                        cur = self._conn.execute(sql, params)
-                        sql_upper = sql.strip().upper()
-                        if sql_upper.startswith("SELECT") or sql_upper.startswith("PRAGMA"):
-                            # For SELECT and PRAGMA, return fetchall results
-                            result = cur.fetchall()
-                        elif sql_upper.startswith("INSERT"):
-                            # For INSERT, return the lastrowid
-                            result = cur.lastrowid
-                            self._conn.commit()
-                        else:
-                            # For UPDATE, DELETE, etc. return the rowcount
-                            result = cur.rowcount
-                            self._conn.commit()
-                        duration = time.monotonic() - start_time
-                        logger.debug(
-                            "DBS COMPLETE EXECUTE: %s (%r) (took %.3fs) ",
-                            norm_sql, params, duration
-                        )
-                        future.set_result(result)
-
-                    elif kind == "tx":
-                        fn: Callable[[sqlite3.Connection], R] = payload
-                        fn_name = getattr(fn, '__name__', repr(fn))
-                        
-                        # Add defensive check for None function
-                        if fn is None:
-                            error_msg = "Transaction function is None, cannot execute"
-                            logger.error(f"DBS ERROR: {error_msg}")
-                            future.set_exception(ValueError(error_msg))
-                            continue
-                        
-                        # Add check for non-callable function
-                        if not callable(fn):
-                            error_msg = f"Transaction payload is not callable: {type(fn)}"
-                            logger.error(f"DBS ERROR: {error_msg}")
-                            future.set_exception(TypeError(error_msg))
-                            continue
-                            
-                        logger.debug(
-                            "DBS PROCESS TRANSACTION: %s (waited %.3fs)",
-                            fn_name, wait_time
-                        )
-                        start_time = time.monotonic()
-                        try:
-                            self._conn.execute("BEGIN;")
-                            outcome: R = fn(self._conn)
-                            self._conn.commit()
-                            duration = time.monotonic() - start_time
-                            logger.debug(
-                                "DBS COMPLETE TRANSACTION: %s (took %.3fs)",
-                                fn_name, duration
-                            )
-                            future.set_result(outcome)
-                        except Exception as e:
-                            self._conn.rollback()
-                            logger.debug(
-                                "DBS TRANSACTION FAILED: %s after %.3fs: %s",
-                                fn_name, time.monotonic() - start_time, e
-                            )
-                            future.set_exception(e)
-
-                    elif kind == "shutdown":
-                        logger.debug(
-                            "DBS PROCESS SHUTDOWN (waited %.3fs)",
-                            wait_time
-                        )
-                        self._shutdown_event.set()
-                        try:
-                            self._conn.close()
-                        except Exception:
-                            logger.exception(
-                                "DBS SHUTDOWN ERROR: Error closing SQLite connection."
-                            )
-                        future.set_result(None)
-
-                    else:
-                        future.set_exception(
-                            ValueError(f"DBS UNKNOWN REQUEST KIND: {kind}")
-                        )
-
-                except Exception as exc:
-                    logger.exception(
-                        "DBS ERROR HANDLING REQUEST '%s' after %.3fs.",
-                        kind, wait_time
-                    )
-                    try:
-                        future.set_exception(exc)
-                    except Exception:
-                        logger.exception(
-                            "DBS ERROR SETTING EXCEPTION FOR '%s'.",
-                            kind
-                        )
-                
-                # Mark the task as done in the queue
-                self._queue.task_done()
-            
-            except Exception as e:
-                logger.exception(f"DBS CRITICAL ERROR IN ACTOR LOOP: {e}")
-                # Don't crash the thread - continue to next iteration
-
-        # When shutting down and exiting the loop, make sure the connection is closed
-        if hasattr(self, '_conn') and self._conn:
-            try:
-                self._conn.close()
-                logger.debug("DBS closed database connection during shutdown")
+                kind, payload, future, enqueue_time = self._queue.get()
             except Exception:
-                logger.exception("DBS ERROR: Failed to close connection during shutdown")
+                continue
+
+            dequeue_time = time.monotonic()
+            wait_time = dequeue_time - enqueue_time
+
+            if kind == "shutdown":
+                logger.debug("DBS PROCESS SHUTDOWN | waited=%.3fs", wait_time)
+                try:
+                    self._conn.close()
+                except Exception:
+                    logger.exception("DBS ERROR closing connection")
+                future.set_result(None)
+                break
+
+            if kind == "single":
+                sql, params, req_id = payload
+                norm_sql = self._normalize_sql(sql)
+                logger.debug(
+                    "DBS PROCESS EXECUTE | id=%s | waited=%.3fs | %s | %r",
+                    req_id, wait_time, norm_sql, params
+                )
+                start = time.monotonic()
+                cur = self._conn.execute(sql, params)
+                sql_up = norm_sql.upper()
+                if sql_up.startswith(("SELECT", "PRAGMA")):
+                    result = cur.fetchall()
+                elif sql_up.startswith("INSERT"):
+                    result = cur.lastrowid
+                    self._conn.commit()
+                else:
+                    result = cur.rowcount
+                    self._conn.commit()
+                duration = time.monotonic() - start
+                log_fn = logger.warning if duration > 0.5 else logger.debug
+                log_fn("DBS COMPLETE EXECUTE | id=%s | duration=%.3fs", req_id, duration)
+                future.set_result(result)
+
+            elif kind == "tx":
+                fn, tx_id = payload
+                fn_name = getattr(fn, '__name__', repr(fn))
+                logger.debug(
+                    "DBS PROCESS TRANSACTION | id=%s | %s | waited=%.3fs",
+                    tx_id, fn_name, wait_time
+                )
+                start = time.monotonic()
+                try:
+                    self._conn.execute("BEGIN;")
+                    outcome = fn(self._conn)
+                    self._conn.commit()
+                    duration = time.monotonic() - start
+                    log_fn = logger.warning if duration > 0.5 else logger.debug
+                    log_fn(
+                        "DBS COMPLETE TRANSACTION | id=%s | %s | duration=%.3fs",
+                        tx_id, fn_name, duration
+                    )
+                    future.set_result(outcome)
+                except Exception as e:
+                    self._conn.rollback()
+                    logger.exception(
+                        "DBS TRANSACTION FAILED | id=%s | %s | error=%s",
+                        tx_id, fn_name, e
+                    )
+                    future.set_exception(e)
+
+            else:
+                future.set_exception(ValueError(f"DBS UNKNOWN REQUEST KIND: {kind}"))
+
+            self._queue.task_done()
+            self._last_processed = time.monotonic()
+
+        logger.debug("DBS actor loop exiting")
+        self._shutdown_event.set()
+
+    def _watchdog(self):
+        while not self._shutdown_event.is_set():
+            time.sleep(5)
+            delta = time.monotonic() - self._last_processed
+            if delta > 2.0:
+                logger.error("DBS WATCHDOG: no requests processed in %.1fs", delta)
 
 
 

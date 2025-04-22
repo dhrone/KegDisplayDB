@@ -516,15 +516,14 @@ class SyncedDatabase:
             beer_count = len(beers)
             
             if beer_count > 0:
-                with self.db_manager.transaction() as conn:
-                    # Clear all taps first to avoid foreign key issues
-                    self.db_manager.clear_tap()
-                    
-                    # Then clear all beers
-                    self.db_manager.clear_beer()
-                    
-                    # Log the change
-                    self.change_tracker.log_change("version", "CLEAR", 1)
+                # Clear all taps first to avoid foreign key issues
+                self.db_manager.clear_tap()
+                
+                # Then clear all beers
+                self.db_manager.clear_beer()
+                
+                # Log the change
+                self.change_tracker.log_change("version", "CLEAR", 1)
                 
                 # Send notification after transaction is committed
                 self.notify_update()
@@ -549,25 +548,24 @@ class SyncedDatabase:
             return False
             
         try:
-            with self.db_manager.transaction() as conn:
-                # Get current taps
-                existing_taps = self.get_all_taps()
-                current_count = len(existing_taps)
-                
-                # If decreasing, delete excess taps
-                if count < current_count:
-                    # Delete taps from highest number to lowest
-                    for i in range(current_count, count, -1):
-                        tap_id = i
-                        self.delete_tap(tap_id, notify=False)
-                
-                # If increasing, add new taps
-                elif count > current_count:
-                    # Add new taps with sequential IDs
-                    for i in range(current_count + 1, count + 1):
-                        tap_id = i
-                        self.add_tap(tap_id, None, notify=False)
-                
+            # Get current taps
+            existing_taps = self.get_all_taps()
+            current_count = len(existing_taps)
+            
+            # If decreasing, delete excess taps
+            if count < current_count:
+                # Delete taps from highest number to lowest
+                for i in range(current_count, count, -1):
+                    tap_id = i
+                    self.delete_tap(tap_id, notify=False)
+            
+            # If increasing, add new taps
+            elif count > current_count:
+                # Add new taps with sequential IDs
+                for i in range(current_count + 1, count + 1):
+                    tap_id = i
+                    self.add_tap(tap_id, None, notify=False)
+            
                 # Log the change
                 self.change_tracker.log_change("version", "TAP_COUNT", count)
             

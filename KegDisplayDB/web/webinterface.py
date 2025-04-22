@@ -78,8 +78,9 @@ DEFAULT_ARGS = {
     'ssl_cert': os.path.join(SSL_DIR, 'certs', 'kegdisplay.crt'),
     'ssl_key': os.path.join(SSL_DIR, 'private', 'kegdisplay.key'),
     'workers': 2,
-    'worker_class': 'sync',
-    'timeout': 30
+    'worker_class': 'gthread',
+    'timeout': 30,
+    'threads': 2
 }
 
 # Create a namespace object with default arguments
@@ -126,9 +127,6 @@ def parse_args(argv=None):
                         help='Path to SSL private key file (default: ~/.KegDisplayDB/ssl/private/kegdisplay.key)')
     parser.add_argument('--workers', type=int, default=DEFAULT_ARGS['workers'],
                         help='Number of Gunicorn worker processes (default: 2)')
-    parser.add_argument('--worker-class', type=str, default=DEFAULT_ARGS['worker_class'],
-                        choices=['sync', 'eventlet', 'gevent'],
-                        help='Gunicorn worker class (default: sync)')
     parser.add_argument('--timeout', type=int, default=DEFAULT_ARGS['timeout'],
                         help='Worker timeout in seconds (default: 30)')
     return parser.parse_args(argv)
@@ -570,6 +568,7 @@ def api_get_taps():
         
         # Get all taps using SyncedDatabase
         taps = synced_db.get_all_taps()
+        logger.info(f"Taps: {taps}")
         
         # Enhance with additional beer information
         for tap in taps:
@@ -721,6 +720,7 @@ def api_get_beers():
             return jsonify({"error": "Database synchronization service not available"}), 503
         
         beers = synced_db.get_all_beers()
+        logger.info(f"Beers: {beers}")
         return jsonify(beers)
     except Exception as e:
         logger.error(f"Error getting beers: {e}")
@@ -1029,8 +1029,9 @@ def start(passed_args=None):
     # Configure Gunicorn options optimized for Raspberry Pi Zero 2W
     options = {
         'bind': f"{args.host}:{args.port}",
-        'workers': args.workers,
-        'worker_class': args.worker_class,
+        'workers': 1,
+        'worker_class': 'gthread',
+        'threads': args.workers,
         'timeout': args.timeout,
         'worker_connections': 100,
         'max_requests': 1000,
@@ -1068,7 +1069,7 @@ def start(passed_args=None):
     
     # Start the Gunicorn server
     logger.info(f"Starting Gunicorn server on {args.host}:{args.port}")
-    logger.info(f"Worker configuration: {args.workers} workers, {args.worker_class} worker class")
+    logger.info(f"Worker configuration: {args.workers} workers")
     KegDisplayApplication(app, options).run()
 
 if __name__ == '__main__':

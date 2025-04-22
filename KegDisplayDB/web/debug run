@@ -1,0 +1,402 @@
+run python -m KegDisplayDB.web --log-level debug
+Password file path: /Users/rritchey/.KegDisplayDB/etc/passwd
+Template directory: /Users/rritchey/Development/KegDisplayDB/KegDisplayDB/web/templates
+Database path: /Users/rritchey/.KegDisplayDB/data/beer.db
+2025-04-22 08:00:13,861 - KegDisplay - INFO - Logging initialized at level DEBUG
+2025-04-22 08:00:13,862 - KegDisplay - INFO - Log file: /Users/rritchey/.KegDisplayDB/logs/kegdisplay-2025-04-22.log
+2025-04-22 08:00:13,862 - KegDisplay - INFO - Initializing SyncedDatabase with broadcast_port=5002, sync_port=5003
+2025-04-22 08:00:13,863 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: CREATE TABLE IF NOT EXISTS beers ( idBeer INTEGER PRIMARY KEY, Name tinytext NOT NULL, ABV float, IBU float, Color float, OriginalGravity float, FinalGravity float, Description TEXT, Brewed datetime, Kegged datetime, Tapped datetime, Notes TEXT ) (())
+2025-04-22 08:00:13,863 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: CREATE TABLE IF NOT EXISTS beers ( idBeer INTEGER PRIMARY KEY, Name tinytext NOT NULL, ABV float, IBU float, Color float, OriginalGravity float, FinalGravity float, Description TEXT, Brewed datetime, Kegged datetime, Tapped datetime, Notes TEXT ) (()) (waited 0.000s)
+2025-04-22 08:00:13,863 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: CREATE TABLE IF NOT EXISTS beers ( idBeer INTEGER PRIMARY KEY, Name tinytext NOT NULL, ABV float, IBU float, Color float, OriginalGravity float, FinalGravity float, Description TEXT, Brewed datetime, Kegged datetime, Tapped datetime, Notes TEXT ) (()) (took 0.000s) 
+2025-04-22 08:00:13,863 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: CREATE TABLE IF NOT EXISTS taps ( idTap INTEGER PRIMARY KEY, idBeer INTEGER ) (())
+2025-04-22 08:00:13,863 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: CREATE TABLE IF NOT EXISTS taps ( idTap INTEGER PRIMARY KEY, idBeer INTEGER ) (()) (waited 0.000s)
+2025-04-22 08:00:13,863 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: CREATE TABLE IF NOT EXISTS taps ( idTap INTEGER PRIMARY KEY, idBeer INTEGER ) (()) (took 0.000s) 
+2025-04-22 08:00:13,863 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: CREATE TABLE IF NOT EXISTS change_log ( id INTEGER PRIMARY KEY, table_name TEXT NOT NULL, operation TEXT NOT NULL, row_id INTEGER NOT NULL, timestamp TEXT NOT NULL, content TEXT, content_hash TEXT, logical_clock INTEGER DEFAULT 0, node_id TEXT ) (())
+2025-04-22 08:00:13,863 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: CREATE TABLE IF NOT EXISTS change_log ( id INTEGER PRIMARY KEY, table_name TEXT NOT NULL, operation TEXT NOT NULL, row_id INTEGER NOT NULL, timestamp TEXT NOT NULL, content TEXT, content_hash TEXT, logical_clock INTEGER DEFAULT 0, node_id TEXT ) (()) (waited 0.000s)
+2025-04-22 08:00:13,863 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: CREATE TABLE IF NOT EXISTS change_log ( id INTEGER PRIMARY KEY, table_name TEXT NOT NULL, operation TEXT NOT NULL, row_id INTEGER NOT NULL, timestamp TEXT NOT NULL, content TEXT, content_hash TEXT, logical_clock INTEGER DEFAULT 0, node_id TEXT ) (()) (took 0.000s) 
+2025-04-22 08:00:13,863 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: CREATE TABLE IF NOT EXISTS version ( id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, hash TEXT NOT NULL, logical_clock INTEGER DEFAULT 0, node_id TEXT ) (())
+2025-04-22 08:00:13,864 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: CREATE TABLE IF NOT EXISTS version ( id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, hash TEXT NOT NULL, logical_clock INTEGER DEFAULT 0, node_id TEXT ) (()) (waited 0.000s)
+2025-04-22 08:00:13,864 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: CREATE TABLE IF NOT EXISTS version ( id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, hash TEXT NOT NULL, logical_clock INTEGER DEFAULT 0, node_id TEXT ) (()) (took 0.000s) 
+2025-04-22 08:00:13,864 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: SELECT COUNT(*) FROM version WHERE id = 1 (())
+2025-04-22 08:00:13,864 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: SELECT COUNT(*) FROM version WHERE id = 1 (()) (waited 0.000s)
+2025-04-22 08:00:13,864 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: SELECT COUNT(*) FROM version WHERE id = 1 (()) (took 0.000s) 
+2025-04-22 08:00:13,864 - KegDisplay - INFO - Database tables initialized
+2025-04-22 08:00:13,864 - KegDisplay - DEBUG - DBS QUEUED TRANSACTION: init_transaction
+2025-04-22 08:00:13,864 - KegDisplay - DEBUG - DBS PROCESS TRANSACTION: init_transaction (waited 0.000s)
+2025-04-22 08:00:13,864 - KegDisplay - DEBUG - DBS COMPLETE TRANSACTION: init_transaction (took 0.000s)
+2025-04-22 08:00:13,864 - KegDisplay - INFO - Change tracking tables initialized with Lamport clock support
+2025-04-22 08:00:13,864 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: SELECT node_id FROM version WHERE id = 1 (())
+2025-04-22 08:00:13,864 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: SELECT node_id FROM version WHERE id = 1 (()) (waited 0.000s)
+2025-04-22 08:00:13,864 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: SELECT node_id FROM version WHERE id = 1 (()) (took 0.000s) 
+2025-04-22 08:00:13,864 - KegDisplay - INFO - Using existing node ID: 0df9bcd7-01ae-4300-983d-d7c164a8da2a
+2025-04-22 08:00:13,864 - KegDisplay - INFO - ChangeTracker initialized with node ID: 0df9bcd7-01ae-4300-983d-d7c164a8da2a
+2025-04-22 08:00:13,865 - KegDisplay - INFO - Found local IP: 10.5.1.54
+2025-04-22 08:00:13,926 - KegDisplay - DEBUG - Identified local IP addresses: 127.0.0.1, 127.0.1.1, 10.5.1.54, 10.5.1.100
+2025-04-22 08:00:13,926 - KegDisplay - INFO - Starting database synchronization system
+2025-04-22 08:00:13,926 - KegDisplay - INFO - Setting up network sockets
+2025-04-22 08:00:13,926 - KegDisplay - INFO - Binding broadcast socket to port 5002
+2025-04-22 08:00:13,926 - KegDisplay - INFO - Successfully bound broadcast socket to port 5002
+2025-04-22 08:00:13,926 - KegDisplay - INFO - Binding sync socket to port 5003
+2025-04-22 08:00:13,927 - KegDisplay - INFO - Successfully bound sync socket to port 5003
+2025-04-22 08:00:13,927 - KegDisplay - INFO - Starting broadcast listener on port 5002
+2025-04-22 08:00:13,927 - KegDisplay - INFO - Starting sync listener on port 5003
+2025-04-22 08:00:13,927 - KegDisplay - INFO - Network listeners started
+2025-04-22 08:00:13,927 - KegDisplay - INFO - Starting heartbeat sender thread
+2025-04-22 08:00:13,927 - KegDisplay - INFO - Starting peer cleanup
+2025-04-22 08:00:13,927 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: SELECT logical_clock FROM version WHERE id = 1 (())
+2025-04-22 08:00:13,927 - KegDisplay - INFO - Starting daily backup thread
+2025-04-22 08:00:13,927 - KegDisplay - INFO - ENTRY _initial_peer_discovery
+2025-04-22 08:00:13,927 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: SELECT logical_clock FROM version WHERE id = 1 (()) (waited 0.000s)
+2025-04-22 08:00:13,927 - KegDisplay - INFO - Next database backup scheduled at 2025-04-23 04:00:00
+2025-04-22 08:00:13,927 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: SELECT logical_clock FROM version WHERE id = 1 (())
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: SELECT logical_clock FROM version WHERE id = 1 (()) (took 0.000s) 
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: SELECT logical_clock FROM version WHERE id = 1 (()) (waited 0.000s)
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: SELECT * FROM beers (())
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: SELECT logical_clock FROM version WHERE id = 1 (()) (took 0.000s) 
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: SELECT * FROM beers (()) (waited 0.000s)
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: SELECT * FROM beers (())
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: SELECT * FROM beers (()) (took 0.000s) 
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: SELECT * FROM beers (()) (waited 0.000s)
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: PRAGMA table_info(beers) (())
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: SELECT * FROM beers (()) (took 0.000s) 
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: PRAGMA table_info(beers) (()) (waited 0.000s)
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: PRAGMA table_info(beers) (())
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: PRAGMA table_info(beers) (()) (took 0.000s) 
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: PRAGMA table_info(beers) (()) (waited 0.000s)
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: SELECT * FROM taps (())
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: PRAGMA table_info(beers) (()) (took 0.000s) 
+2025-04-22 08:00:13,928 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: SELECT * FROM taps (()) (waited 0.000s)
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: SELECT * FROM taps (())
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: SELECT * FROM taps (()) (took 0.000s) 
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: SELECT * FROM taps (()) (waited 0.000s)
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: PRAGMA table_info(taps) (())
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: SELECT * FROM taps (()) (took 0.000s) 
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: PRAGMA table_info(taps) (()) (waited 0.000s)
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: PRAGMA table_info(taps) (())
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: PRAGMA table_info(taps) (()) (took 0.000s) 
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: PRAGMA table_info(taps) (()) (waited 0.000s)
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: UPDATE version SET timestamp = ?, hash = ?, logical_clock = ?, node_id = ? WHERE id = 1 (('2025-04-22T12:00:13Z', 'd1fa375b7f545ae248521657a6edf382', 104, '0df9bcd7-01ae-4300-983d-d7c164a8da2a'))
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: PRAGMA table_info(taps) (()) (took 0.000s) 
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: UPDATE version SET timestamp = ?, hash = ?, logical_clock = ?, node_id = ? WHERE id = 1 (('2025-04-22T12:00:13Z', 'd1fa375b7f545ae248521657a6edf382', 104, '0df9bcd7-01ae-4300-983d-d7c164a8da2a')) (waited 0.000s)
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: UPDATE version SET timestamp = ?, hash = ?, logical_clock = ?, node_id = ? WHERE id = 1 (('2025-04-22T12:00:13Z', 'd1fa375b7f545ae248521657a6edf382', 104, '0df9bcd7-01ae-4300-983d-d7c164a8da2a'))
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: UPDATE version SET timestamp = ?, hash = ?, logical_clock = ?, node_id = ? WHERE id = 1 (('2025-04-22T12:00:13Z', 'd1fa375b7f545ae248521657a6edf382', 104, '0df9bcd7-01ae-4300-983d-d7c164a8da2a')) (took 0.000s) 
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: UPDATE version SET timestamp = ?, hash = ?, logical_clock = ?, node_id = ? WHERE id = 1 (('2025-04-22T12:00:13Z', 'd1fa375b7f545ae248521657a6edf382', 104, '0df9bcd7-01ae-4300-983d-d7c164a8da2a')) (waited 0.000s)
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - Incremented logical clock from 103 to 104
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: UPDATE version SET timestamp = ?, hash = ?, logical_clock = ?, node_id = ? WHERE id = 1 (('2025-04-22T12:00:13Z', 'd1fa375b7f545ae248521657a6edf382', 104, '0df9bcd7-01ae-4300-983d-d7c164a8da2a')) (took 0.000s) 
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1 LIMIT 1 (())
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1 LIMIT 1 (()) (waited 0.000s)
+2025-04-22 08:00:13,929 - KegDisplay - DEBUG - Incremented logical clock from 103 to 104
+2025-04-22 08:00:13,930 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1 LIMIT 1 (())
+2025-04-22 08:00:13,930 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1 LIMIT 1 (()) (took 0.000s) 
+2025-04-22 08:00:13,930 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1 LIMIT 1 (()) (waited 0.000s)
+2025-04-22 08:00:13,930 - KegDisplay - INFO - Broadcasting message (207 bytes): {"type": "heartbeat", "version": {"hash": "d1fa375...
+2025-04-22 08:00:13,930 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1 LIMIT 1 (()) (took 0.000s) 
+2025-04-22 08:00:13,930 - KegDisplay - INFO - Broadcasting message (207 bytes): {"type": "discovery", "version": {"hash": "d1fa375...
+2025-04-22 08:00:13,930 - KegDisplay - DEBUG - Broadcast message sent to port 5002
+2025-04-22 08:00:13,930 - KegDisplay - DEBUG - Ignoring broadcast from own IP 10.5.1.54
+2025-04-22 08:00:13,930 - KegDisplay - DEBUG - Broadcast message sent to port 5002
+2025-04-22 08:00:13,930 - KegDisplay - DEBUG - Sent heartbeat broadcast
+2025-04-22 08:00:13,930 - KegDisplay - DEBUG - Ignoring broadcast from own IP 10.5.1.54
+2025-04-22 08:00:13,930 - KegDisplay - INFO - Sent initial peer discovery broadcast
+2025-04-22 08:00:13,930 - KegDisplay - INFO - Waiting 5 seconds for peer responses...
+2025-04-22 08:00:18,935 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1 LIMIT 1 (())
+2025-04-22 08:00:18,935 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1 LIMIT 1 (()) (waited 0.001s)
+2025-04-22 08:00:18,936 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1 LIMIT 1 (()) (took 0.000s) 
+2025-04-22 08:00:18,936 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: SELECT COUNT(*) FROM beers (())
+2025-04-22 08:00:18,936 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: SELECT COUNT(*) FROM beers (()) (waited 0.000s)
+2025-04-22 08:00:18,936 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: SELECT COUNT(*) FROM beers (()) (took 0.000s) 
+2025-04-22 08:00:18,936 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: SELECT COUNT(*) FROM taps (())
+2025-04-22 08:00:18,936 - KegDisplay - DEBUG - DBS PROCESS EXECUTE: SELECT COUNT(*) FROM taps (()) (waited 0.000s)
+2025-04-22 08:00:18,936 - KegDisplay - DEBUG - DBS COMPLETE EXECUTE: SELECT COUNT(*) FROM taps (()) (took 0.000s) 
+2025-04-22 08:00:18,936 - KegDisplay - INFO - Found 0 peers during discovery
+2025-04-22 08:00:18,936 - KegDisplay - INFO - No peers with newer database version found
+2025-04-22 08:00:18,936 - KegDisplay - INFO - EXIT _initial_peer_discovery - total peers: 0, found latest peer: False, elapsed: 5.009s
+2025-04-22 08:00:18,936 - KegDisplay - INFO - Database synchronization system started
+2025-04-22 08:00:18,936 - KegDisplay - INFO - Initialized SyncedDatabase for web interface
+2025-04-22 08:00:18,936 - KegDisplay - INFO - Database synchronization active on ports 5002 (UDP) and 5003 (TCP)
+2025-04-22 08:00:18,936 - KegDisplay - INFO - Web interface configuration:
+2025-04-22 08:00:18,936 - KegDisplay - INFO -   Host: 0.0.0.0
+2025-04-22 08:00:18,936 - KegDisplay - INFO -   Web port: 8080
+2025-04-22 08:00:18,936 - KegDisplay - INFO -   Broadcast port: 5002
+2025-04-22 08:00:18,936 - KegDisplay - INFO -   Sync port: 5003
+2025-04-22 08:00:18,937 - KegDisplay - INFO -   Synchronization: Enabled
+2025-04-22 08:00:18,937 - KegDisplay - INFO -   Debug mode: Disabled
+2025-04-22 08:00:18,937 - KegDisplay - INFO - SSL enabled with certificate: /Users/rritchey/.KegDisplayDB/ssl/certs/kegdisplay.crt
+2025-04-22 08:00:18,937 - KegDisplay - INFO - Starting Gunicorn server on 0.0.0.0:8080
+2025-04-22 08:00:18,937 - KegDisplay - INFO - Worker configuration: 2 workers, sync worker class
+[2025-04-22 08:00:18 -0400] [91014] [DEBUG] Current configuration:
+  config: ./gunicorn.conf.py
+  wsgi_app: None
+  bind: ['0.0.0.0:8080']
+  backlog: 2048
+  workers: 2
+  worker_class: sync
+  threads: 1
+  worker_connections: 100
+  max_requests: 1000
+  max_requests_jitter: 50
+  timeout: 30
+  graceful_timeout: 30
+  keepalive: 2
+  limit_request_line: 4094
+  limit_request_fields: 100
+  limit_request_field_size: 8190
+  reload: False
+  reload_engine: auto
+  reload_extra_files: []
+  spew: False
+  check_config: False
+  print_config: False
+  preload_app: False
+  sendfile: None
+  reuse_port: False
+  chdir: /Users/rritchey/Development/KegDisplayDB
+  daemon: False
+  raw_env: []
+  pidfile: None
+  worker_tmp_dir: None
+  user: 501
+  group: 20
+  umask: 0
+  initgroups: False
+  tmp_upload_dir: None
+  secure_scheme_headers: {'X-FORWARDED-PROTOCOL': 'ssl', 'X-FORWARDED-PROTO': 'https', 'X-FORWARDED-SSL': 'on'}
+  forwarded_allow_ips: ['127.0.0.1', '::1']
+  accesslog: -
+  disable_redirect_access_to_syslog: False
+  access_log_format: %(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s"
+  errorlog: -
+  loglevel: debug
+  capture_output: True
+  logger_class: gunicorn.glogging.Logger
+  logconfig: None
+  logconfig_dict: {}
+  logconfig_json: None
+  syslog_addr: unix:///var/run/syslog
+  syslog: False
+  syslog_prefix: None
+  syslog_facility: user
+  enable_stdio_inheritance: True
+  statsd_host: None
+  dogstatsd_tags: 
+  statsd_prefix: 
+  proc_name: None
+  default_proc_name: gunicorn
+  pythonpath: None
+  paste: None
+  on_starting: <function OnStarting.on_starting at 0x107a944a0>
+  on_reload: <function OnReload.on_reload at 0x107a945e0>
+  when_ready: <function WhenReady.when_ready at 0x107a94720>
+  pre_fork: <function Prefork.pre_fork at 0x107a94900>
+  post_fork: <function Postfork.post_fork at 0x107a94a40>
+  post_worker_init: <function PostWorkerInit.post_worker_init at 0x107a94b80>
+  worker_int: <function WorkerInt.worker_int at 0x107a94cc0>
+  worker_abort: <function WorkerAbort.worker_abort at 0x107a94e00>
+  pre_exec: <function PreExec.pre_exec at 0x107a94f40>
+  pre_request: <function PreRequest.pre_request at 0x107a95080>
+  post_request: <function PostRequest.post_request at 0x107a95120>
+  child_exit: <function ChildExit.child_exit at 0x107a95260>
+  worker_exit: <function WorkerExit.worker_exit at 0x107a953a0>
+  nworkers_changed: <function NumWorkersChanged.nworkers_changed at 0x107a954e0>
+  on_exit: <function OnExit.on_exit at 0x107a95620>
+  ssl_context: <function NewSSLContext.ssl_context at 0x107a95800>
+  proxy_protocol: False
+  proxy_allow_ips: ['127.0.0.1', '::1']
+  keyfile: /Users/rritchey/.KegDisplayDB/ssl/private/kegdisplay.key
+  certfile: /Users/rritchey/.KegDisplayDB/ssl/certs/kegdisplay.crt
+  ssl_version: 2
+  cert_reqs: 0
+  ca_certs: None
+  suppress_ragged_eofs: True
+  do_handshake_on_connect: False
+  ciphers: None
+  raw_paste_global_conf: []
+  permit_obsolete_folding: False
+  strip_header_spaces: False
+  permit_unconventional_http_method: False
+  permit_unconventional_http_version: False
+  casefold_http_method: False
+  forwarder_headers: ['SCRIPT_NAME', 'PATH_INFO']
+  header_map: drop
+[2025-04-22 08:00:18 -0400] [91014] [INFO] Starting gunicorn 23.0.0
+[2025-04-22 08:00:18 -0400] [91014] [DEBUG] Arbiter booted
+[2025-04-22 08:00:18 -0400] [91014] [INFO] Listening at: https://0.0.0.0:8080 (91014)
+[2025-04-22 08:00:18 -0400] [91014] [INFO] Using worker: sync
+[2025-04-22 08:00:18 -0400] [91022] [INFO] Booting worker with pid: 91022
+[2025-04-22 08:00:19 -0400] [91023] [INFO] Booting worker with pid: 91023
+[2025-04-22 08:00:19 -0400] [91014] [DEBUG] 2 workers
+[2025-04-22 08:00:21 -0400] [91023] [DEBUG] Error processing SSL request.
+[2025-04-22 08:00:21 -0400] [91022] [DEBUG] Error processing SSL request.
+[2025-04-22 08:00:21 -0400] [91022] [WARNING] Invalid request from ip=127.0.0.1: [SSL: UNSUPPORTED_PROTOCOL] unsupported protocol (_ssl.c:2648)
+[2025-04-22 08:00:21 -0400] [91023] [WARNING] Invalid request from ip=127.0.0.1: [SSL: UNSUPPORTED_PROTOCOL] unsupported protocol (_ssl.c:2648)
+[2025-04-22 08:00:21 -0400] [91022] [DEBUG] Failed to send error message.
+[2025-04-22 08:00:21 -0400] [91023] [DEBUG] Failed to send error message.
+[2025-04-22 08:00:21 -0400] [91022] [DEBUG] GET /api/taps
+127.0.0.1 - - [22/Apr/2025:08:00:21 -0400] "GET /api/taps HTTP/1.1" 302 237 "https://localhost:8080/taps" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Safari/605.1.15"
+[2025-04-22 08:00:21 -0400] [91023] [DEBUG] GET /login
+Entering login route
+Template folder: /Users/rritchey/Development/KegDisplayDB/KegDisplayDB/web/templates
+127.0.0.1 - - [22/Apr/2025:08:00:21 -0400] "GET /login?next=%2Fapi%2Ftaps HTTP/1.1" 200 4774 "https://localhost:8080/taps" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Safari/605.1.15"
+[2025-04-22 08:00:22 -0400] [91023] [DEBUG] GET /taps
+127.0.0.1 - - [22/Apr/2025:08:00:22 -0400] "GET /taps HTTP/1.1" 302 225 "https://localhost:8080/login?next=%2Ftaps" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Safari/605.1.15"
+[2025-04-22 08:00:22 -0400] [91023] [DEBUG] GET /login
+Entering login route
+Template folder: /Users/rritchey/Development/KegDisplayDB/KegDisplayDB/web/templates
+127.0.0.1 - - [22/Apr/2025:08:00:22 -0400] "GET /login?next=%2Ftaps HTTP/1.1" 200 4774 "https://localhost:8080/login?next=%2Ftaps" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Safari/605.1.15"
+[2025-04-22 08:00:29 -0400] [91022] [DEBUG] POST /login
+Entering login route
+Template folder: /Users/rritchey/Development/KegDisplayDB/KegDisplayDB/web/templates
+Login attempt for user: beer
+Loading Users
+Found user: beer
+Users in passwd file: {'beer': '$2b$12$rJOglOfb6FzFgOTpEY8cpeMkqOdqPBOwnSOrOcwuFiI2jY0kex7BC'}
+Stored hash for beer: $2b$12$rJOglOfb6FzFgOTpEY8cpeMkqOdqPBOwnSOrOcwuFiI2jY0kex7BC
+Attempting to verify password
+Password verification result: True
+Login successful for user: beer
+127.0.0.1 - - [22/Apr/2025:08:00:30 -0400] "POST /login?next=%2Ftaps HTTP/1.1" 302 189 "https://localhost:8080/login?next=%2Ftaps" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Safari/605.1.15"
+[2025-04-22 08:00:30 -0400] [91022] [DEBUG] GET /
+Loading user with ID: beer
+Loading Users
+Found user: beer
+127.0.0.1 - - [22/Apr/2025:08:00:30 -0400] "GET / HTTP/1.1" 302 197 "https://localhost:8080/login?next=%2Ftaps" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Safari/605.1.15"
+[2025-04-22 08:00:30 -0400] [91023] [DEBUG] GET /taps
+Loading user with ID: beer
+Loading Users
+Found user: beer
+127.0.0.1 - - [22/Apr/2025:08:00:30 -0400] "GET /taps HTTP/1.1" 200 37315 "https://localhost:8080/login?next=%2Ftaps" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Safari/605.1.15"
+[2025-04-22 08:00:30 -0400] [91022] [DEBUG] GET /api/beers
+Loading user with ID: beer
+Loading Users
+Found user: beer
+2025-04-22 08:00:30,111 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: SELECT * FROM beers ORDER BY idBeer (())
+[2025-04-22 08:00:30 -0400] [91023] [DEBUG] GET /api/taps
+Loading user with ID: beer
+Loading Users
+Found user: beer
+2025-04-22 08:00:30,113 - KegDisplay - DEBUG - DBS QUEUED EXECUTE: SELECT t.*, b.Name as BeerName FROM taps t LEFT JOIN beers b ON t.idBeer = b.idBeer ORDER BY t.idTap (())
+^C[2025-04-22 08:00:46 -0400] [91014] [INFO] Handling signal: int
+[2025-04-22 08:00:46 -0400] [91022] [ERROR] Error handling request /api/beers
+Traceback (most recent call last):
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/gunicorn/workers/sync.py", line 134, in handle
+    self.handle_request(listener, req, client, addr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/gunicorn/workers/sync.py", line 177, in handle_request
+    respiter = self.wsgi(environ, resp.start_response)
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/flask/app.py", line 1536, in __call__
+    return self.wsgi_app(environ, start_response)
+           ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/flask/app.py", line 1511, in wsgi_app
+    response = self.full_dispatch_request()
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/flask/app.py", line 917, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/flask/app.py", line 902, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/flask_login/utils.py", line 290, in decorated_view
+    return current_app.ensure_sync(func)(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/Users/rritchey/Development/KegDisplayDB/KegDisplayDB/web/webinterface.py", line 724, in api_get_beers
+    beers = synced_db.get_all_beers()
+  File "/Users/rritchey/Development/KegDisplayDB/KegDisplayDB/db/__init__.py", line 277, in get_all_beers
+    return self.db_manager.get_all_beers()
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/Users/rritchey/Development/KegDisplayDB/KegDisplayDB/db/database.py", line 716, in get_all_beers
+    results = self.execute("SELECT * FROM beers ORDER BY idBeer")
+  File "/Users/rritchey/Development/KegDisplayDB/KegDisplayDB/db/database.py", line 395, in execute
+    return self.dbs.execute(sql, params)
+           ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/Users/rritchey/Development/KegDisplayDB/KegDisplayDB/db/database.py", line 125, in execute
+    result = future.result()
+  File "/opt/homebrew/Cellar/python@3.13/3.13.2/Frameworks/Python.framework/Versions/3.13/lib/python3.13/concurrent/futures/_base.py", line 451, in result
+    self._condition.wait(timeout)
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.13/3.13.2/Frameworks/Python.framework/Versions/3.13/lib/python3.13/threading.py", line 359, in wait
+    waiter.acquire()
+    ~~~~~~~~~~~~~~^^
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/gunicorn/workers/base.py", line 198, in handle_quit
+    time.sleep(0.1)
+    ~~~~~~~~~~^^^^^
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/gunicorn/workers/base.py", line 199, in handle_quit
+    sys.exit(0)
+    ~~~~~~~~^^^
+SystemExit: 0
+[2025-04-22 08:00:46 -0400] [91023] [ERROR] Error handling request /api/taps
+Traceback (most recent call last):
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/gunicorn/workers/sync.py", line 134, in handle
+    self.handle_request(listener, req, client, addr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/gunicorn/workers/sync.py", line 177, in handle_request
+    respiter = self.wsgi(environ, resp.start_response)
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/flask/app.py", line 1536, in __call__
+    return self.wsgi_app(environ, start_response)
+           ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/flask/app.py", line 1511, in wsgi_app
+    response = self.full_dispatch_request()
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/flask/app.py", line 917, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/flask/app.py", line 902, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/flask_login/utils.py", line 290, in decorated_view
+    return current_app.ensure_sync(func)(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/Users/rritchey/Development/KegDisplayDB/KegDisplayDB/web/webinterface.py", line 572, in api_get_taps
+    taps = synced_db.get_all_taps()
+  File "/Users/rritchey/Development/KegDisplayDB/KegDisplayDB/db/__init__.py", line 382, in get_all_taps
+    return self.db_manager.get_all_taps()
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/Users/rritchey/Development/KegDisplayDB/KegDisplayDB/db/database.py", line 865, in get_all_taps
+    results = self.execute(
+        "SELECT t.*, b.Name as BeerName FROM taps t "
+        "LEFT JOIN beers b ON t.idBeer = b.idBeer "
+        "ORDER BY t.idTap"
+    )
+  File "/Users/rritchey/Development/KegDisplayDB/KegDisplayDB/db/database.py", line 395, in execute
+    return self.dbs.execute(sql, params)
+           ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/Users/rritchey/Development/KegDisplayDB/KegDisplayDB/db/database.py", line 125, in execute
+    result = future.result()
+  File "/opt/homebrew/Cellar/python@3.13/3.13.2/Frameworks/Python.framework/Versions/3.13/lib/python3.13/concurrent/futures/_base.py", line 451, in result
+    self._condition.wait(timeout)
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.13/3.13.2/Frameworks/Python.framework/Versions/3.13/lib/python3.13/threading.py", line 359, in wait
+    waiter.acquire()
+    ~~~~~~~~~~~~~~^^
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/gunicorn/workers/base.py", line 198, in handle_quit
+    time.sleep(0.1)
+    ~~~~~~~~~~^^^^^
+  File "/Users/rritchey/Library/Caches/pypoetry/virtualenvs/kegdisplaydb-D5BDq4p2-py3.13/lib/python3.13/site-packages/gunicorn/workers/base.py", line 199, in handle_quit
+    sys.exit(0)
+    ~~~~~~~~^^^
+SystemExit: 0
+127.0.0.1 - - [22/Apr/2025:08:00:47 -0400] "GET /api/beers HTTP/1.1" 500 0 "-" "-"
+127.0.0.1 - - [22/Apr/2025:08:00:47 -0400] "GET /api/taps HTTP/1.1" 500 0 "-" "-"
+[2025-04-22 08:00:47 -0400] [91023] [INFO] Worker exiting (pid: 91023)
+[2025-04-22 08:00:47 -0400] [91022] [INFO] Worker exiting (pid: 91022)
+2025-04-22 08:00:47,235 - KegDisplay - INFO - Stopping database synchronization system
+2025-04-22 08:00:47,239 - KegDisplay - INFO - Stopping network manager
+2025-04-22 08:00:47,240 - KegDisplay - INFO - Stopping database synchronization system
+2025-04-22 08:00:47,241 - KegDisplay - INFO - Closing broadcast socket
+2025-04-22 08:00:47,246 - KegDisplay - INFO - Stopping network manager
+2025-04-22 08:00:47,246 - KegDisplay - WARNING - Error closing broadcast socket: [Errno 57] Socket is not connected
+2025-04-22 08:00:47,249 - KegDisplay - INFO - Closing broadcast socket
+2025-04-22 08:00:47,249 - KegDisplay - INFO - Closing sync socket
+2025-04-22 08:00:47,252 - KegDisplay - WARNING - Error closing broadcast socket: [Errno 57] Socket is not connected
+2025-04-22 08:00:47,254 - KegDisplay - WARNING - Error closing sync socket: [Errno 57] Socket is not connected
+2025-04-22 08:00:47,256 - KegDisplay - INFO - Network manager stopped
+2025-04-22 08:00:47,256 - KegDisplay - INFO - Closing sync socket
+2025-04-22 08:00:47,258 - KegDisplay - INFO - Database synchronization system stopped
+2025-04-22 08:00:47,261 - KegDisplay - WARNING - Error closing sync socket: [Errno 57] Socket is not connected
+2025-04-22 08:00:47,267 - KegDisplay - INFO - Network manager stopped
+2025-04-22 08:00:47,269 - KegDisplay - INFO - Database synchronization system stopped
+[2025-04-22 08:00:47 -0400] [91014] [INFO] Shutting down: Master
+2025-04-22 08:00:47,533 - KegDisplay - INFO - Stopping database synchronization system
+2025-04-22 08:00:47,534 - KegDisplay - INFO - Stopping network manager
+2025-04-22 08:00:47,534 - KegDisplay - INFO - Closing broadcast socket
+2025-04-22 08:00:47,534 - KegDisplay - WARNING - Error closing broadcast socket: [Errno 57] Socket is not connected
+2025-04-22 08:00:47,534 - KegDisplay - INFO - Closing sync socket
+2025-04-22 08:00:47,534 - KegDisplay - WARNING - Error closing sync socket: [Errno 57] Socket is not connected
+2025-04-22 08:00:49,542 - KegDisplay - INFO - Network manager stopped
+2025-04-22 08:00:52,554 - KegDisplay - INFO - Database synchronization system stopped
+kegdisplaydb-py3.13

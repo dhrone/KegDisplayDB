@@ -408,66 +408,66 @@ class DatabaseSynchronizer:
         
         try:
             # Get our current database version for comparison
-            with self.db_manager.transaction() as conn:
-                our_version = self.change_tracker.get_db_version()
-                
-                # Get logical clock values
-                peer_clock = peer_version.get("logical_clock", 0)
-                our_clock = our_version.get("logical_clock", 0)
-                
-                # Check if content hashes differ
-                content_differs = peer_version.get("hash") != our_version.get("hash")
-                
-                logger.info(f"Comparing logical clocks: Us {our_clock} / Them {peer_clock}")
-                
-                # Apply Lamport Clock rules from receiving_node.csv
-                if peer_clock > our_clock:
-                    # Receive broadcast; incomingClock > localClock
-                    # 1. localClock = max(localClock, incomingClock) + 1
-                    # 2. version_table.clock = localClock
-                    # 3. Initiate sync
-                    logger.info(f"Peer has higher logical clock ({peer_clock} > {our_clock}), updating our clock and initiating sync")
-                    self.change_tracker.update_logical_clock(peer_clock)
-                    should_sync = True
-                    
-                elif peer_clock == our_clock and content_differs:
-                    # Receive broadcast; incomingClock = localClock & state-hash differs
-                    # 1. localClock += 1
-                    # 2. version_table.clock = localClock
-                    # 3. Tie-break (compare node IDs):
-                    #    • If you lose, initiate sync
-                    #    • If you win, ignore
-                    logger.info(f"Equal logical clocks ({peer_clock}) with hash mismatch, incrementing our clock and using tie-breaker")
-                    self.change_tracker.increment_logical_clock()
-                    
-                    # Tie-breaking using node IDs
-                    if self.change_tracker.is_newer_version(peer_version, our_version):
-                        logger.info(f"Peer wins tie-breaking, initiating sync")
-                        should_sync = True
-                    else:
-                        logger.info(f"We win tie-breaking, not syncing")
-                    
-                elif peer_clock == our_clock and not content_differs:
-                    # Receive broadcast; incomingClock = localClock & state-hash equals
-                    # 1. localClock += 1
-                    # 2. version_table.clock = localClock
-                    # 3. No further action (you're in sync)
-                    logger.info(f"Equal logical clocks ({peer_clock}) with matching hash, incrementing our clock (already in sync)")
-                    self.change_tracker.increment_logical_clock()
-                    
-                elif peer_clock < our_clock:
-                    # Receive broadcast; incomingClock < localClock
-                    # 1. localClock += 1
-                    # 2. version_table.clock = localClock
-                    # 3. Ignore (you're ahead)
-                    logger.info(f"Our logical clock is higher ({our_clock} > {peer_clock}), incrementing our clock (we're ahead)")
-                    self.change_tracker.increment_logical_clock()
-                    
-                # Special case: if our database is empty but peer has data, sync regardless of clocks
-                elif self.change_tracker.is_database_empty() and not peer_version.get("hash") == "0":
-                    logger.info(f"We have empty database but peer has data, initiating sync")
-                    should_sync = True
+
+            our_version = self.change_tracker.get_db_version()
             
+            # Get logical clock values
+            peer_clock = peer_version.get("logical_clock", 0)
+            our_clock = our_version.get("logical_clock", 0)
+            
+            # Check if content hashes differ
+            content_differs = peer_version.get("hash") != our_version.get("hash")
+            
+            logger.info(f"Comparing logical clocks: Us {our_clock} / Them {peer_clock}")
+            
+            # Apply Lamport Clock rules from receiving_node.csv
+            if peer_clock > our_clock:
+                # Receive broadcast; incomingClock > localClock
+                # 1. localClock = max(localClock, incomingClock) + 1
+                # 2. version_table.clock = localClock
+                # 3. Initiate sync
+                logger.info(f"Peer has higher logical clock ({peer_clock} > {our_clock}), updating our clock and initiating sync")
+                self.change_tracker.update_logical_clock(peer_clock)
+                should_sync = True
+                
+            elif peer_clock == our_clock and content_differs:
+                # Receive broadcast; incomingClock = localClock & state-hash differs
+                # 1. localClock += 1
+                # 2. version_table.clock = localClock
+                # 3. Tie-break (compare node IDs):
+                #    • If you lose, initiate sync
+                #    • If you win, ignore
+                logger.info(f"Equal logical clocks ({peer_clock}) with hash mismatch, incrementing our clock and using tie-breaker")
+                self.change_tracker.increment_logical_clock()
+                
+                # Tie-breaking using node IDs
+                if self.change_tracker.is_newer_version(peer_version, our_version):
+                    logger.info(f"Peer wins tie-breaking, initiating sync")
+                    should_sync = True
+                else:
+                    logger.info(f"We win tie-breaking, not syncing")
+                
+            elif peer_clock == our_clock and not content_differs:
+                # Receive broadcast; incomingClock = localClock & state-hash equals
+                # 1. localClock += 1
+                # 2. version_table.clock = localClock
+                # 3. No further action (you're in sync)
+                logger.info(f"Equal logical clocks ({peer_clock}) with matching hash, incrementing our clock (already in sync)")
+                self.change_tracker.increment_logical_clock()
+                
+            elif peer_clock < our_clock:
+                # Receive broadcast; incomingClock < localClock
+                # 1. localClock += 1
+                # 2. version_table.clock = localClock
+                # 3. Ignore (you're ahead)
+                logger.info(f"Our logical clock is higher ({our_clock} > {peer_clock}), incrementing our clock (we're ahead)")
+                self.change_tracker.increment_logical_clock()
+                
+            # Special case: if our database is empty but peer has data, sync regardless of clocks
+            elif self.change_tracker.is_database_empty() and not peer_version.get("hash") == "0":
+                logger.info(f"We have empty database but peer has data, initiating sync")
+                should_sync = True
+        
             # Network operations moved outside transaction block
             if should_sync:
                 self._request_sync(peer_ip, peer_sync_port)
