@@ -2,10 +2,20 @@ import os
 import argparse
 import logging
 import bcrypt
+import sys
+import time
+import subprocess
+import requests
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from .db_client import DbClient
 from ..utils.log_config import configure_logging
+
+# Try to import gunicorn's BaseApplication
+try:
+    from gunicorn.app.base import BaseApplication
+except ImportError:
+    BaseApplication = None
 
 # Setup Flask app
 BASE_DIR = os.path.dirname(__file__)
@@ -376,8 +386,10 @@ class KegDisplayApplication(BaseApplication):
         super().__init__()
     
     def load_config(self):
-        for key, value in self.options.items():
-            self.cfg.set(key, value)
+        config = {key: value for key, value in self.options.items()
+                 if key in self.cfg.settings and value is not None}
+        for key, value in config.items():
+            self.cfg.set(key.lower(), value)
     
     def load(self):
         return self.application
@@ -428,8 +440,8 @@ def main():
         'max_requests_jitter': 50,
         'keepalive': 2,
         'graceful_timeout': 30,
-        'access-logfile': '-',
-        'error-logfile': '-',
+        'accesslog': '-',
+        'errorlog': '-',
         'loglevel': args.log_level.lower(),
         'capture_output': True,
         'enable_stdio_inheritance': True,
