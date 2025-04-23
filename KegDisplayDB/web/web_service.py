@@ -6,6 +6,7 @@ from flask import Flask, render_template, request, redirect, url_for, flash, jso
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from .db_client import DbClient
 from ..utils.log_config import configure_logging
+from datetime import datetime, UTC
 
 # Setup Flask app
 BASE_DIR = os.path.dirname(__file__)
@@ -263,6 +264,311 @@ def api_import_status():
         return jsonify(status)
     except Exception as e:
         logger.error(f"Error fetching import status: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/system/status', methods=['GET'])
+@login_required
+def api_system_status():
+    try:
+        # Get basic system information
+        status = {
+            "status": "ok",
+            "timestamp": datetime.now(UTC).isoformat(),
+            "services": {
+                "web_service": "running",
+                "sync_service": "connected" if db_client else "disconnected"
+            },
+            "database": {
+                "beer_count": len(db_client.get_beers()),
+                "tap_count": len(db_client.get_taps())
+            }
+        }
+        return jsonify(status)
+    except Exception as e:
+        logger.error(f"Error getting system status: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/beers/search', methods=['GET'])
+@login_required
+def api_search_beers():
+    try:
+        query = request.args.get('q', '').lower()
+        beers = db_client.get_beers()
+        
+        # Filter beers based on search query
+        filtered_beers = []
+        for beer in beers:
+            # Search in name and description
+            if query in beer.get('Name', '').lower() or query in beer.get('Description', '').lower():
+                filtered_beers.append(beer)
+        
+        return jsonify({
+            "count": len(filtered_beers),
+            "results": filtered_beers
+        })
+    except Exception as e:
+        logger.error(f"Error searching beers: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/taps/status', methods=['GET'])
+@login_required
+def api_taps_status():
+    try:
+        taps = db_client.get_taps()
+        beers = db_client.get_beers()
+        
+        # Create a map of beer_id to beer details
+        beer_map = {beer['idBeer']: beer for beer in beers}
+        
+        # Enhance tap information with beer details
+        enhanced_taps = []
+        for tap in taps:
+            tap_info = tap.copy()
+            beer_id = tap.get('idBeer')
+            if beer_id and beer_id in beer_map:
+                tap_info['beer'] = beer_map[beer_id]
+            else:
+                tap_info['beer'] = None
+            enhanced_taps.append(tap_info)
+        
+        return jsonify({
+            "count": len(enhanced_taps),
+            "taps": enhanced_taps
+        })
+    except Exception as e:
+        logger.error(f"Error getting tap status: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/stats', methods=['GET'])
+@login_required
+def api_stats():
+    try:
+        beers = db_client.get_beers()
+        taps = db_client.get_taps()
+        
+        # Calculate basic statistics
+        stats = {
+            "beers": {
+                "total": len(beers),
+                "by_abv": {
+                    "average": sum(float(b.get('ABV', 0)) for b in beers) / len(beers) if beers else 0,
+                    "min": min(float(b.get('ABV', 0)) for b in beers) if beers else 0,
+                    "max": max(float(b.get('ABV', 0)) for b in beers) if beers else 0
+                }
+            },
+            "taps": {
+                "total": len(taps),
+                "occupied": sum(1 for t in taps if t.get('idBeer') is not None),
+                "empty": sum(1 for t in taps if t.get('idBeer') is None)
+            }
+        }
+        
+        return jsonify(stats)
+    except Exception as e:
+        logger.error(f"Error getting statistics: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/beers/id', methods=['GET'])
+@login_required
+def api_beer_by_id():
+    try:
+        beer_id = request.args.get('q')
+        if beer_id == '*':
+            beers = db_client.get_beers()
+            return jsonify({"count": len(beers), "beers": beers})
+        try:
+            beer_id = int(beer_id)
+            beer = db_client.get_beer(beer_id)
+            if beer:
+                return jsonify(beer)
+            return jsonify({"error": "Beer not found"}), 404
+        except ValueError:
+            return jsonify({"error": "Invalid beer ID"}), 400
+    except Exception as e:
+        logger.error(f"Error getting beer by ID: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/beers/name', methods=['GET'])
+@login_required
+def api_beer_by_name():
+    try:
+        query = request.args.get('q', '').lower()
+        beers = db_client.get_beers()
+        
+        if query == '*':
+            return jsonify({"count": len(beers), "beers": beers})
+        
+        filtered_beers = []
+        for beer in beers:
+            name = beer.get('Name', '').lower()
+            if query.endswith('*'):
+                if name.startswith(query[:-1]):
+                    filtered_beers.append(beer)
+            elif query.startswith('*'):
+                if name.endswith(query[1:]):
+                    filtered_beers.append(beer)
+            elif query in name:
+                filtered_beers.append(beer)
+        
+        return jsonify({"count": len(filtered_beers), "beers": filtered_beers})
+    except Exception as e:
+        logger.error(f"Error searching beers by name: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/beers/search', methods=['GET'])
+@login_required
+def api_beer_search():
+    try:
+        query = request.args.get('q', '').lower()
+        beers = db_client.get_beers()
+        
+        if query == '*':
+            return jsonify({"count": len(beers), "beers": beers})
+        
+        filtered_beers = []
+        for beer in beers:
+            # Search in all string fields
+            for value in beer.values():
+                if isinstance(value, (str, int, float)):
+                    if query in str(value).lower():
+                        filtered_beers.append(beer)
+                        break
+        
+        return jsonify({"count": len(filtered_beers), "beers": filtered_beers})
+    except Exception as e:
+        logger.error(f"Error searching beers: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/beers/len', methods=['GET'])
+@login_required
+def api_beer_count():
+    try:
+        beers = db_client.get_beers()
+        return jsonify({"count": len(beers)})
+    except Exception as e:
+        logger.error(f"Error getting beer count: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/beers/last', methods=['GET'])
+@login_required
+def api_last_beers():
+    try:
+        count = request.args.get('q', '1')
+        try:
+            count = int(count)
+            beers = db_client.get_beers()
+            # Sort by idBeer in descending order and take the last 'count' records
+            sorted_beers = sorted(beers, key=lambda x: x.get('idBeer', 0), reverse=True)
+            return jsonify({"count": min(count, len(sorted_beers)), "beers": sorted_beers[:count]})
+        except ValueError:
+            return jsonify({"error": "Invalid count parameter"}), 400
+    except Exception as e:
+        logger.error(f"Error getting last beers: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/beers/tap', methods=['GET'])
+@login_required
+def api_beer_tap():
+    try:
+        beer_id = request.args.get('q')
+        try:
+            beer_id = int(beer_id)
+            taps = db_client.get_taps()
+            for tap in taps:
+                if tap.get('idBeer') == beer_id:
+                    return jsonify({"tap_id": tap.get('idTap')})
+            return jsonify({"tap_id": None})
+        except ValueError:
+            return jsonify({"error": "Invalid beer ID"}), 400
+    except Exception as e:
+        logger.error(f"Error finding beer tap: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/clock/current', methods=['GET'])
+@login_required
+def api_current_clock():
+    try:
+        # Assuming the clock value is stored in the database
+        # You'll need to implement the actual clock retrieval logic
+        return jsonify({"clock": 0})  # Placeholder
+    except Exception as e:
+        logger.error(f"Error getting current clock: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/version', methods=['GET'])
+@login_required
+def api_version():
+    try:
+        # Assuming version information is stored in the database
+        # You'll need to implement the actual version retrieval logic
+        return jsonify({"version": "1.0.0"})  # Placeholder
+    except Exception as e:
+        logger.error(f"Error getting version: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/taps/id', methods=['GET'])
+@login_required
+def api_tap_beer():
+    try:
+        tap_id = request.args.get('q')
+        try:
+            tap_id = int(tap_id)
+            tap = db_client.get_tap(tap_id)
+            if tap:
+                return jsonify({"beer_id": tap.get('idBeer')})
+            return jsonify({"error": "Tap not found"}), 404
+        except ValueError:
+            return jsonify({"error": "Invalid tap ID"}), 400
+    except Exception as e:
+        logger.error(f"Error getting tap beer: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/taps/beer', methods=['GET'])
+@login_required
+def api_beer_tap_number():
+    try:
+        beer_id = request.args.get('q')
+        try:
+            beer_id = int(beer_id)
+            taps = db_client.get_taps()
+            for tap in taps:
+                if tap.get('idBeer') == beer_id:
+                    return jsonify({"tap_number": tap.get('idTap')})
+            return jsonify({"tap_number": None})
+        except ValueError:
+            return jsonify({"error": "Invalid beer ID"}), 400
+    except Exception as e:
+        logger.error(f"Error finding beer tap number: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/change/last', methods=['GET'])
+@login_required
+def api_last_changes():
+    try:
+        count = request.args.get('q', '1')
+        try:
+            count = int(count)
+            # You'll need to implement the actual change record retrieval logic
+            return jsonify({"count": 0, "changes": []})  # Placeholder
+        except ValueError:
+            return jsonify({"error": "Invalid count parameter"}), 400
+    except Exception as e:
+        logger.error(f"Error getting last changes: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/change/since', methods=['GET'])
+@login_required
+def api_changes_since():
+    try:
+        clock = request.args.get('q')
+        try:
+            clock = int(clock)
+            # You'll need to implement the actual change record retrieval logic
+            return jsonify({"count": 0, "changes": []})  # Placeholder
+        except ValueError:
+            return jsonify({"error": "Invalid clock parameter"}), 400
+    except Exception as e:
+        logger.error(f"Error getting changes since clock: {e}")
         return jsonify({"error": str(e)}), 500
 
 # Entrypoint

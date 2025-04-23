@@ -920,6 +920,18 @@ class DatabaseManager:
                     applied_changes = 0
                     failed_changes = 0
                     batch_highest_clock = batch_clock
+
+                    def do_update_version(conn, timestamp, hash, logical_clock, node_id):
+                        # Update version table with new logical clock and timestamp
+                        self.execute(
+                            """
+                            BEGIN TRANSACTION;
+                            UPDATE version SET timestamp = ?, hash = ?, logical_clock = ?, node_id = ?
+                            WHERE id = 1;
+                            COMMIT;
+                            """,
+                            (timestamp, hash, logical_clock, node_id)
+                        )
                     
                     # Process each change in the batch
                     for change_index, change in enumerate(batch):
@@ -939,6 +951,8 @@ class DatabaseManager:
                             content_hash = change[5]
                             logical_clock = change[6]
                             node_id = change[7]
+
+                            error_message = f"Error applying {operation} change to {table_name}.{row_id}"
                             
                             # Check if this change is already in our change_log
                             cursor = conn.execute(
@@ -972,24 +986,37 @@ class DatabaseManager:
                             logger.debug(f"Applying change: {operation} to {table_name}.{row_id} (logical clock: {logical_clock}, our new clock: {new_clock})")
                             
                             # Apply the change based on operation type
-                            if operation == 'INSERT' or operation == 'UPDATE':
+                            if operation in ['INSERT', 'UPDATE', 'DELETE', 'CLEAR']:
                                 try:
                                     # Parse the content as JSON and build the SQL
                                     row_data = json.loads(content)
+
+                                    conn.execute('BEGIN TRANSACTION;')
                                     
                                     if operation == 'INSERT':
                                         # Build INSERT statement
                                         columns = ', '.join(row_data.keys())
                                         placeholders = ', '.join(['?'] * len(row_data))
-                                        sql = f"INSERT OR REPLACE INTO {table_name} ({columns}) VALUES ({placeholders})"
+                                        sql = f"INSERT OR REPLACE INTO {table_name} ({columns}) VALUES ({placeholders});"
                                         conn.execute(sql, list(row_data.values()))
                                         
                                     elif operation == 'UPDATE':
                                         # Build UPDATE statement
                                         set_clause = ', '.join([f"{col} = ?" for col in row_data.keys()])
-                                        sql = f"UPDATE {table_name} SET {set_clause} WHERE rowid = ?"
+                                        sql = f"UPDATE {table_name} SET {set_clause} WHERE rowid = ?;"
                                         params = list(row_data.values()) + [row_id]
                                         conn.execute(sql, params)
+
+                                    elif operation == 'DELETE':
+                                        # Build DELETE statement
+                                        sql = f"DELETE FROM {table_name} WHERE rowid = ?;"
+                                        conn.execute(sql, (row_id,))
+
+                                    elif operation == 'CLEAR':
+                                        # Build CLEAR statement
+                                        error_message = f"Error applying CLEAR to database"
+                                        sql = f"DELETE FROM beers; UPDATE taps SET idBeer = NULL;"
+                                        conn.execute(sql)
                                     
                                     # Log the change in our change_log table with OUR new clock value
                                     conn.execute(
@@ -1000,32 +1027,15 @@ class DatabaseManager:
                                         """,
                                         (table_name, operation, row_id, timestamp, content, content_hash, new_clock, node_id)
                                     )
+
+                                    conn.execute('COMMIT;')
+
                                     applied_changes += 1
                                     
                                 except Exception as e:
-                                    logger.error(f"Error applying {operation} change to {table_name}.{row_id}: {e}")
+                                    logger.error(f"{error_message}: {e}")
                                     failed_changes += 1
                                     
-                            elif operation == 'DELETE':
-                                try:
-                                    # Execute DELETE statement
-                                    sql = f"DELETE FROM {table_name} WHERE rowid = ?"
-                                    conn.execute(sql, (row_id,))
-                                    
-                                    # Log the change in our change_log table with OUR new clock value
-                                    conn.execute(
-                                        """
-                                        INSERT INTO change_log 
-                                        (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
-                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                                        """,
-                                        (table_name, operation, row_id, timestamp, content, content_hash, new_clock, node_id)
-                                    )
-                                    applied_changes += 1
-                                    
-                                except Exception as e:
-                                    logger.error(f"Error applying DELETE change to {table_name}.{row_id}: {e}")
-                                    failed_changes += 1
                             else:
                                 logger.warning(f"Unknown operation '{operation}' in change at index {change_index}")
                                 failed_changes += 1
