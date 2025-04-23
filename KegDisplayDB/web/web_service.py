@@ -6,7 +6,6 @@ from flask import Flask, render_template, request, redirect, url_for, flash, jso
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from .db_client import DbClient
 from ..utils.log_config import configure_logging
-from datetime import datetime, UTC
 
 # Setup Flask app
 BASE_DIR = os.path.dirname(__file__)
@@ -23,6 +22,25 @@ login_manager.login_view = 'login'
 # Default RPC endpoint for Sync service
 default_rpc_url = os.getenv('KEGDISPLAY_RPC_URL', 'http://127.0.0.1:5001')
 db_client = None
+sync_service_running = False
+
+# Define paths and directories
+USER_HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(USER_HOME, ".KegDisplayDB")
+DATA_DIR = os.path.join(CONFIG_DIR, "data")
+ETC_DIR = os.path.join(CONFIG_DIR, "etc")
+SSL_DIR = os.path.join(CONFIG_DIR, "ssl")
+
+# Create required directories if they don't exist
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(ETC_DIR, exist_ok=True)
+os.makedirs(SSL_DIR, exist_ok=True)
+
+# Define paths to database and config files
+DB_PATH = os.path.join(DATA_DIR, 'beer.db')
+PASSWD_PATH = os.path.join(ETC_DIR, 'passwd')
+DEFAULT_SSL_CERT = os.path.join(SSL_DIR, 'certs', 'kegdisplay.crt')
+DEFAULT_SSL_KEY = os.path.join(SSL_DIR, 'private', 'kegdisplay.key')
 
 # User model and loader
 class User(UserMixin):
@@ -139,9 +157,9 @@ def api_update_beer(beer_id):
         success = db_client.update_beer(beer_id, data)
         if success:
             return jsonify({"success": True})
-        return jsonify({"error": "Failed to update beer"}), 500
+        return jsonify({"error": "Failed to update beer"}), 500        
     except Exception as e:
-        logger.error(f"Error updating beer {beer_id}: {e}")
+        logger.error(f"Error updating beer {beer_id}: {e}")     
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/beers/<int:beer_id>', methods=['DELETE'])
@@ -266,312 +284,103 @@ def api_import_status():
         logger.error(f"Error fetching import status: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/system/status', methods=['GET'])
-@login_required
-def api_system_status():
+def generate_self_signed_certificate(cert_path, key_path):
+    """
+    Generate a self-signed SSL certificate and key if they don't exist
+    
+    Args:
+        cert_path: Path where the certificate will be saved
+        key_path: Path where the private key will be saved
+    
+    Returns:
+        bool: True if certificate was generated, False if error occurred
+    """
+    # Create directories if they don't exist
+    cert_dir = os.path.dirname(cert_path)
+    key_dir = os.path.dirname(key_path)
+    os.makedirs(cert_dir, exist_ok=True) 
+    os.makedirs(key_dir, exist_ok=True)
+    
     try:
-        # Get basic system information
-        status = {
-            "status": "ok",
-            "timestamp": datetime.now(UTC).isoformat(),
-            "services": {
-                "web_service": "running",
-                "sync_service": "connected" if db_client else "disconnected"
-            },
-            "database": {
-                "beer_count": len(db_client.get_beers()),
-                "tap_count": len(db_client.get_taps())
-            }
-        }
-        return jsonify(status)
+        # Generate private key and certificate
+        logger.info(f"Generating self-signed SSL certificate: {cert_path}")
+        subprocess.run([
+            'openssl', 'req', '-x509', '-newkey', 'rsa:2048', 
+            '-keyout', key_path, 
+            '-out', cert_path,
+            '-days', '365',
+            '-nodes',  # No passphrase
+            '-subj', '/CN=kegdisplay.local'
+        ], check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        
+        # Set proper permissions on the key file
+        os.chmod(key_path, 0o600)
+        logger.info(f"Self-signed certificate generated successfully")
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to generate SSL certificate: {e.stderr.decode('utf-8')}")
+        return False
     except Exception as e:
-        logger.error(f"Error getting system status: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error generating SSL certificate: {str(e)}")
+        return False
 
-@app.route('/api/beers/search', methods=['GET'])
-@login_required
-def api_search_beers():
+def check_sync_service():
+    """Check if the sync service is running and accessible"""
+    global sync_service_running
     try:
-        query = request.args.get('q', '').lower()
-        beers = db_client.get_beers()
+        response = requests.get(f"{default_rpc_url}/rpc/beers", timeout=2)
+        sync_service_running = response.status_code == 200
+        return sync_service_running
+    except requests.exceptions.RequestException:
+        sync_service_running = False
+        return False
+
+def start_sync_service():
+    """Start the sync service if it's not running"""
+    if check_sync_service():
+        return True
         
-        # Filter beers based on search query
-        filtered_beers = []
-        for beer in beers:
-            # Search in name and description
-            if query in beer.get('Name', '').lower() or query in beer.get('Description', '').lower():
-                filtered_beers.append(beer)
+    logger.info("Sync service not running, attempting to start it...")
+    try:
+        # Start sync service in a separate process
+        subprocess.Popen(["poetry", "run", "sync"])
         
-        return jsonify({
-            "count": len(filtered_beers),
-            "results": filtered_beers
-        })
+        # Wait for service to start (up to 10 seconds)
+        for _ in range(10):
+            if check_sync_service():
+                logger.info("Sync service started successfully")
+                return True
+            time.sleep(1)
+            
+        logger.error("Failed to start sync service")
+        return False
     except Exception as e:
-        logger.error(f"Error searching beers: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error starting sync service: {e}")
+        return False
 
-@app.route('/api/taps/status', methods=['GET'])
-@login_required
-def api_taps_status():
-    try:
-        taps = db_client.get_taps()
-        beers = db_client.get_beers()
-        
-        # Create a map of beer_id to beer details
-        beer_map = {beer['idBeer']: beer for beer in beers}
-        
-        # Enhance tap information with beer details
-        enhanced_taps = []
-        for tap in taps:
-            tap_info = tap.copy()
-            beer_id = tap.get('idBeer')
-            if beer_id and beer_id in beer_map:
-                tap_info['beer'] = beer_map[beer_id]
+@app.before_request
+def check_backend():
+    """Check if sync service is running before each request"""
+    if request.endpoint and request.endpoint != 'login':
+        if not check_sync_service() and not start_sync_service():
+            if request.endpoint.startswith('api_'):
+                return jsonify({"error": "Database service is not available"}), 503
             else:
-                tap_info['beer'] = None
-            enhanced_taps.append(tap_info)
-        
-        return jsonify({
-            "count": len(enhanced_taps),
-            "taps": enhanced_taps
-        })
-    except Exception as e:
-        logger.error(f"Error getting tap status: {e}")
-        return jsonify({"error": str(e)}), 500
+                flash("Database service is not available. Please try again later.")
+                return redirect(url_for('login'))
 
-@app.route('/api/stats', methods=['GET'])
-@login_required
-def api_stats():
-    try:
-        beers = db_client.get_beers()
-        taps = db_client.get_taps()
-        
-        # Calculate basic statistics
-        stats = {
-            "beers": {
-                "total": len(beers),
-                "by_abv": {
-                    "average": sum(float(b.get('ABV', 0)) for b in beers) / len(beers) if beers else 0,
-                    "min": min(float(b.get('ABV', 0)) for b in beers) if beers else 0,
-                    "max": max(float(b.get('ABV', 0)) for b in beers) if beers else 0
-                }
-            },
-            "taps": {
-                "total": len(taps),
-                "occupied": sum(1 for t in taps if t.get('idBeer') is not None),
-                "empty": sum(1 for t in taps if t.get('idBeer') is None)
-            }
-        }
-        
-        return jsonify(stats)
-    except Exception as e:
-        logger.error(f"Error getting statistics: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/beers/id', methods=['GET'])
-@login_required
-def api_beer_by_id():
-    try:
-        beer_id = request.args.get('q')
-        if beer_id == '*':
-            beers = db_client.get_beers()
-            return jsonify({"count": len(beers), "beers": beers})
-        try:
-            beer_id = int(beer_id)
-            beer = db_client.get_beer(beer_id)
-            if beer:
-                return jsonify(beer)
-            return jsonify({"error": "Beer not found"}), 404
-        except ValueError:
-            return jsonify({"error": "Invalid beer ID"}), 400
-    except Exception as e:
-        logger.error(f"Error getting beer by ID: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/beers/name', methods=['GET'])
-@login_required
-def api_beer_by_name():
-    try:
-        query = request.args.get('q', '').lower()
-        beers = db_client.get_beers()
-        
-        if query == '*':
-            return jsonify({"count": len(beers), "beers": beers})
-        
-        filtered_beers = []
-        for beer in beers:
-            name = beer.get('Name', '').lower()
-            if query.endswith('*'):
-                if name.startswith(query[:-1]):
-                    filtered_beers.append(beer)
-            elif query.startswith('*'):
-                if name.endswith(query[1:]):
-                    filtered_beers.append(beer)
-            elif query in name:
-                filtered_beers.append(beer)
-        
-        return jsonify({"count": len(filtered_beers), "beers": filtered_beers})
-    except Exception as e:
-        logger.error(f"Error searching beers by name: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/beers/search', methods=['GET'])
-@login_required
-def api_beer_search():
-    try:
-        query = request.args.get('q', '').lower()
-        beers = db_client.get_beers()
-        
-        if query == '*':
-            return jsonify({"count": len(beers), "beers": beers})
-        
-        filtered_beers = []
-        for beer in beers:
-            # Search in all string fields
-            for value in beer.values():
-                if isinstance(value, (str, int, float)):
-                    if query in str(value).lower():
-                        filtered_beers.append(beer)
-                        break
-        
-        return jsonify({"count": len(filtered_beers), "beers": filtered_beers})
-    except Exception as e:
-        logger.error(f"Error searching beers: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/beers/len', methods=['GET'])
-@login_required
-def api_beer_count():
-    try:
-        beers = db_client.get_beers()
-        return jsonify({"count": len(beers)})
-    except Exception as e:
-        logger.error(f"Error getting beer count: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/beers/last', methods=['GET'])
-@login_required
-def api_last_beers():
-    try:
-        count = request.args.get('q', '1')
-        try:
-            count = int(count)
-            beers = db_client.get_beers()
-            # Sort by idBeer in descending order and take the last 'count' records
-            sorted_beers = sorted(beers, key=lambda x: x.get('idBeer', 0), reverse=True)
-            return jsonify({"count": min(count, len(sorted_beers)), "beers": sorted_beers[:count]})
-        except ValueError:
-            return jsonify({"error": "Invalid count parameter"}), 400
-    except Exception as e:
-        logger.error(f"Error getting last beers: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/beers/tap', methods=['GET'])
-@login_required
-def api_beer_tap():
-    try:
-        beer_id = request.args.get('q')
-        try:
-            beer_id = int(beer_id)
-            taps = db_client.get_taps()
-            for tap in taps:
-                if tap.get('idBeer') == beer_id:
-                    return jsonify({"tap_id": tap.get('idTap')})
-            return jsonify({"tap_id": None})
-        except ValueError:
-            return jsonify({"error": "Invalid beer ID"}), 400
-    except Exception as e:
-        logger.error(f"Error finding beer tap: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/clock/current', methods=['GET'])
-@login_required
-def api_current_clock():
-    try:
-        # Assuming the clock value is stored in the database
-        # You'll need to implement the actual clock retrieval logic
-        return jsonify({"clock": 0})  # Placeholder
-    except Exception as e:
-        logger.error(f"Error getting current clock: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/version', methods=['GET'])
-@login_required
-def api_version():
-    try:
-        # Assuming version information is stored in the database
-        # You'll need to implement the actual version retrieval logic
-        return jsonify({"version": "1.0.0"})  # Placeholder
-    except Exception as e:
-        logger.error(f"Error getting version: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/taps/id', methods=['GET'])
-@login_required
-def api_tap_beer():
-    try:
-        tap_id = request.args.get('q')
-        try:
-            tap_id = int(tap_id)
-            tap = db_client.get_tap(tap_id)
-            if tap:
-                return jsonify({"beer_id": tap.get('idBeer')})
-            return jsonify({"error": "Tap not found"}), 404
-        except ValueError:
-            return jsonify({"error": "Invalid tap ID"}), 400
-    except Exception as e:
-        logger.error(f"Error getting tap beer: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/taps/beer', methods=['GET'])
-@login_required
-def api_beer_tap_number():
-    try:
-        beer_id = request.args.get('q')
-        try:
-            beer_id = int(beer_id)
-            taps = db_client.get_taps()
-            for tap in taps:
-                if tap.get('idBeer') == beer_id:
-                    return jsonify({"tap_number": tap.get('idTap')})
-            return jsonify({"tap_number": None})
-        except ValueError:
-            return jsonify({"error": "Invalid beer ID"}), 400
-    except Exception as e:
-        logger.error(f"Error finding beer tap number: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/change/last', methods=['GET'])
-@login_required
-def api_last_changes():
-    try:
-        count = request.args.get('q', '1')
-        try:
-            count = int(count)
-            # You'll need to implement the actual change record retrieval logic
-            return jsonify({"count": 0, "changes": []})  # Placeholder
-        except ValueError:
-            return jsonify({"error": "Invalid count parameter"}), 400
-    except Exception as e:
-        logger.error(f"Error getting last changes: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/change/since', methods=['GET'])
-@login_required
-def api_changes_since():
-    try:
-        clock = request.args.get('q')
-        try:
-            clock = int(clock)
-            # You'll need to implement the actual change record retrieval logic
-            return jsonify({"count": 0, "changes": []})  # Placeholder
-        except ValueError:
-            return jsonify({"error": "Invalid clock parameter"}), 400
-    except Exception as e:
-        logger.error(f"Error getting changes since clock: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# Entrypoint
+class KegDisplayApplication(BaseApplication):
+    def __init__(self, app, options=None):
+        self.options = options or {}
+        self.application = app
+        super().__init__()
+    
+    def load_config(self):
+        for key, value in self.options.items():
+            self.cfg.set(key, value)
+    
+    def load(self):
+        return self.application
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Web service API")
@@ -580,16 +389,78 @@ def parse_args():
     parser.add_argument("--rpc-url", default=default_rpc_url, help="Sync RPC service URL")
     parser.add_argument("--debug", action="store_true", help="Run in debug mode")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR","CRITICAL"], help="Set logging level")
+    parser.add_argument("--ssl-cert", type=str, default=DEFAULT_SSL_CERT, help="Path to SSL certificate file")
+    parser.add_argument("--ssl-key", type=str, default=DEFAULT_SSL_KEY, help="Path to SSL private key file")
+    parser.add_argument("--workers", type=int, default=2, help="Number of Gunicorn worker processes")
+    parser.add_argument("--timeout", type=int, default=30, help="Worker timeout in seconds")
     return parser.parse_args()
-
 
 def main():
     global db_client
     args = parse_args()
     configure_logging(log_level=args.log_level)
     logger.setLevel(getattr(logging, args.log_level))
+    
+    # Initialize db_client but don't require sync service to be running
     db_client = DbClient(args.rpc_url)
-    app.run(host=args.host, port=args.port, debug=args.debug)
+    
+    # Check if Gunicorn is available
+    if BaseApplication is None:
+        logger.error("Gunicorn is not installed. Please install it with: pip install gunicorn")
+        sys.exit(1)
+
+    # Display configuration
+    logger.info(f"Web service configuration:")
+    logger.info(f"  Host: {args.host}")
+    logger.info(f"  Web port: {args.port}")
+    logger.info(f"  RPC URL: {args.rpc_url}")
+    logger.info(f"  Debug mode: {'Enabled' if args.debug else 'Disabled'}")
+
+    # Configure Gunicorn options
+    options = {
+        'bind': f"{args.host}:{args.port}",
+        'workers': args.workers,
+        'worker_class': 'gthread',
+        'threads': args.workers,
+        'timeout': args.timeout,
+        'worker_connections': 100,
+        'max_requests': 1000,
+        'max_requests_jitter': 50,
+        'keepalive': 2,
+        'graceful_timeout': 30,
+        'access-logfile': '-',
+        'error-logfile': '-',
+        'loglevel': args.log_level.lower(),
+        'capture_output': True,
+        'enable_stdio_inheritance': True,
+        'daemon': False,
+        'pidfile': None,
+        'umask': 0,
+        'user': None,
+        'group': None,
+        'tmp_upload_dir': None,
+        'reload': args.debug,
+    }
+
+    # Add SSL configuration if certificates are provided
+    if args.ssl_cert and args.ssl_key:
+        # Check if certificate and key files exist, generate them if not
+        if not os.path.exists(args.ssl_cert) or not os.path.exists(args.ssl_key):
+            logger.info("SSL certificate or key not found, generating self-signed certificate")
+            if generate_self_signed_certificate(args.ssl_cert, args.ssl_key):
+                logger.info("SSL certificate and key generated successfully")
+            else:
+                logger.error("Failed to generate SSL certificate and key")
+                sys.exit(1)
+        
+        options['certfile'] = args.ssl_cert
+        options['keyfile'] = args.ssl_key
+        logger.info(f"SSL enabled with certificate: {args.ssl_cert}")
+
+    # Start the Gunicorn server
+    logger.info(f"Starting Gunicorn server on {args.host}:{args.port}")
+    logger.info(f"Worker configuration: {args.workers} workers")
+    KegDisplayApplication(app, options).run()
 
 if __name__ == "__main__":
     main() 
