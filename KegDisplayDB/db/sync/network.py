@@ -132,12 +132,18 @@ class NetworkManager:
             self.setup_sockets()
         
         try:
-            timestamp, hash, logical_clock, node_id = self.change_tracker.get_current_version()
-            try:
-                logger.info(f"Broadcasting message {node_id}:{hash[-10:]}:{logical_clock}")
-            except Exception as e:
-                logger.info(f"Broadcasting message failed {node_id}:{hash[-10:]}:{logical_clock}: {e}")
+            # Log version information if change_tracker is available
+            if self.change_tracker is not None:
+                try:
+                    version = self.change_tracker.get_db_version()
+                    node_id = version.get('node_id', 'unknown')
+                    hash_val = version.get('hash', '0')
+                    logical_clock = version.get('logical_clock', 0)
+                    logger.info(f"Broadcasting message {node_id}:{hash_val[-10:] if len(hash_val) > 10 else hash_val}:{logical_clock}")
+                except Exception as e:
+                    logger.warning(f"Error getting version info for broadcast: {e}")
             
+            # Send the message regardless of whether we have version info
             self.broadcast_socket.sendto(message, ('<broadcast>', self.broadcast_port))
             logger.debug(f"Broadcast message sent to port {self.broadcast_port}")
         except Exception as e:
