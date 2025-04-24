@@ -1010,8 +1010,6 @@ class DatabaseManager:
                                     # Parse the content as JSON and build the SQL
                                     row_data = json.loads(content)
 
-                                    conn.execute('BEGIN TRANSACTION;')
-                                    
                                     if operation == 'INSERT':
                                         # Build INSERT statement
                                         columns = ', '.join(row_data.keys())
@@ -1048,8 +1046,6 @@ class DatabaseManager:
                                         """,
                                         (table_name, operation, row_id, timestamp, content, content_hash, new_clock, node_id)
                                     )
-
-                                    conn.execute('COMMIT;')
 
                                     applied_changes += 1
                                     
