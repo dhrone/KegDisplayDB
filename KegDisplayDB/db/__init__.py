@@ -14,6 +14,7 @@ import time
 import sqlite3
 import threading
 import socket
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,11 @@ class SyncedDatabase:
     def close(self):
         """Close database connections and cleanup resources"""
         try:
+            # Check if Python is shutting down (sys.meta_path is None during shutdown)
+            if not hasattr(sys, "meta_path") or sys.meta_path is None:
+                logger.debug("Python is shutting down, skipping cleanup operations")
+                return
+                
             # Stop the synchronizer if it exists
             if not self.test_mode and hasattr(self, 'synchronizer') and self.synchronizer:
                 self.synchronizer.stop()

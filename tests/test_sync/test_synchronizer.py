@@ -106,6 +106,9 @@ class TestDatabaseSynchronizer(unittest.TestCase):
     
     def test_start(self):
         """Test starting the synchronization system."""
+        # Mock _initial_peer_discovery to avoid the 5-second sleep
+        self.synchronizer._initial_peer_discovery = mock.MagicMock()
+        
         # Call the method
         self.synchronizer.start()
         
@@ -121,6 +124,9 @@ class TestDatabaseSynchronizer(unittest.TestCase):
         # Check thread daemon status
         for thread in self.synchronizer.threads:
             self.assertTrue(thread.daemon)
+        
+        # Check if initial peer discovery was called
+        self.synchronizer._initial_peer_discovery.assert_called_once()
         
         # Clean up
         self.synchronizer.stop()
