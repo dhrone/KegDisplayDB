@@ -17,7 +17,7 @@ class NetworkManager:
     Handles socket setup, network discovery, and connection management.
     """
     
-    def __init__(self, broadcast_port=5002, sync_port=5003):
+    def __init__(self, broadcast_port=5002, sync_port=5003, change_tracker=None):
         """Initialize the network manager
         
         Args:
@@ -26,6 +26,7 @@ class NetworkManager:
         """
         self.broadcast_port = broadcast_port
         self.sync_port = sync_port
+        self.change_tracker = change_tracker
         self.broadcast_socket = None
         self.sync_socket = None
         self.local_ips = self._get_all_local_ips()
@@ -131,12 +132,11 @@ class NetworkManager:
             self.setup_sockets()
         
         try:
-            # Try to decode the first part of the message for logging
+            timestamp, hash, logical_clock, node_id = self.change_tracker.get_current_version()
             try:
-                msg_preview = message[:50].decode('utf-8', errors='replace')
-                logger.info(f"Broadcasting message ({len(message)} bytes): {msg_preview}...")
+                logger.info(f"Broadcasting message {node_id}:{hash[-10:]}:{logical_clock}")
             except Exception as e:
-                logger.info(f"Broadcasting message ({len(message)} bytes), preview decode failed: {e}")
+                logger.info(f"Broadcasting message failed {node_id}:{hash[-10:]}:{logical_clock}: {e}")
             
             self.broadcast_socket.sendto(message, ('<broadcast>', self.broadcast_port))
             logger.debug(f"Broadcast message sent to port {self.broadcast_port}")

@@ -42,7 +42,7 @@ class SyncedDatabase:
         self.test_peers = []
         
         if not test_mode:
-            self.network = NetworkManager(broadcast_port, sync_port)
+            self.network = NetworkManager(broadcast_port, sync_port, self.change_tracker)
             self.synchronizer = DatabaseSynchronizer(
                 self.db_manager, 
                 self.change_tracker, 
@@ -165,10 +165,10 @@ class SyncedDatabase:
             beer_id = self.db_manager.add_beer(name, abv, ibu, color, og, fg, 
                                                 description, brewed, kegged, tapped, notes)
                                       
-            self.change_tracker.log_change("beers", "INSERT", beer_id)
+            clock = self.change_tracker.log_change("beers", "INSERT", beer_id)
             
             if notify:
-                self.notify_update()
+                self.notify_update(clock)
             
             return beer_id
         
@@ -205,10 +205,10 @@ class SyncedDatabase:
                                                   kegged, tapped, notes)
                                                     
             if success:
-                self.change_tracker.log_change("beers", "UPDATE", beer_id)
+                clock = self.change_tracker.log_change("beers", "UPDATE", beer_id)
                 
                 if notify:
-                    self.notify_update()
+                    self.notify_update(clock)
                     
             return success
         except Exception as e:
@@ -233,17 +233,17 @@ class SyncedDatabase:
             # Delete the beer
             success = self.db_manager.delete_beer(beer_id)
             if success:
-                self.change_tracker.log_change("beers", "DELETE", beer_id)
+                clock = self.change_tracker.log_change("beers", "DELETE", beer_id)
 
                 # Update any taps that had this beer to have None
                 if tap_ids:
                     for tap_id in tap_ids:
                         update_success = self.db_manager.update_tap(tap_id, None)
                         if update_success:
-                            self.change_tracker.log_change("taps", "UPDATE", tap_id)
+                            self.change_tracker.log_change("taps", "UPDATE", tap_id, increment_clock=False)
                 
                 if notify:
-                    self.notify_update()
+                    self.notify_update(clock)
                         
                 return success
         except Exception as e:
@@ -296,10 +296,10 @@ class SyncedDatabase:
         try:
             tap_id = self.db_manager.add_tap(tap_id, beer_id)
             if tap_id:
-                self.change_tracker.log_change("taps", "INSERT", tap_id)
+                clock = self.change_tracker.log_change("taps", "INSERT", tap_id)
                 
                 if notify:
-                    self.notify_update()
+                    self.notify_update(clock)
                     
             return tap_id
         except Exception as e:
@@ -321,10 +321,10 @@ class SyncedDatabase:
         try:
             success = self.db_manager.update_tap(tap_id, beer_id)
             if success:
-                self.change_tracker.log_change("taps", "UPDATE", tap_id)
+                clock = self.change_tracker.log_change("taps", "UPDATE", tap_id)
                 
                 if notify:
-                    self.notify_update()
+                    self.notify_update(clock)
                     
             return success
         except Exception as e:
@@ -345,10 +345,10 @@ class SyncedDatabase:
         try:
             success = self.db_manager.delete_tap(tap_id)
             if success:
-                self.change_tracker.log_change("taps", "DELETE", tap_id)
+                clock = self.change_tracker.log_change("taps", "DELETE", tap_id)
                 
                 if notify:
-                    self.notify_update()
+                    self.notify_update(clock)
                     
             return success
         except Exception as e:
@@ -445,12 +445,14 @@ class SyncedDatabase:
         
         # Start a transaction for the entire import
         try:
-            # Clear all existing beers
-            cleared = self.db_manager.clear_beer()
-            if not cleared:
-                logger.error("Failed to clear beer table")
-                return (0, ["Failed to clear beer table"])
-            
+            # Clear all existing beer related data
+            try:
+                self.db_manager.execute("BEGIN TRANSACTION; DELETE FROM beers; DELETE FROM taps; COMMIT;")
+            except Exception as e:
+                logger.error(f"Error clearing beer related data: {e}")
+                return (0, ["Failed to clear beer related data"])
+    
+            clock = self.change_tracker.log_change("version", "CLEAR", 1)
             # Process beers in batches
             for batch_start in range(0, len(sorted_beers), BATCH_SIZE):
                 batch_end = min(batch_start + BATCH_SIZE, len(sorted_beers))
@@ -476,7 +478,7 @@ class SyncedDatabase:
                             tapped=beer_data.get('Tapped'),
                             notes=beer_data.get('Notes')
                         )
-                        self.change_tracker.log_change("beers", "INSERT", beer_id)
+                        self.change_tracker.log_change("beers", "INSERT", beer_id, increment_clock=False)
                         
                         if beer_id:
                             batch_success_count += 1
@@ -489,9 +491,8 @@ class SyncedDatabase:
                 # Update total success count
                 success_count += batch_success_count
                 
-                # If we have successful imports, log the change
-                if success_count > 0:
-                    self.notify_update()
+            # Even if no records were added, we still need to notify peers about the clear
+            self.notify_update(clock)
             
             logger.info(f"Successfully imported {success_count} beers")
             
@@ -523,10 +524,10 @@ class SyncedDatabase:
                 self.db_manager.clear_beer()
                 
                 # Log the change
-                self.change_tracker.log_change("version", "CLEAR", 1)
+                clock = self.change_tracker.log_change("version", "CLEAR", 1)
                 
                 # Send notification after transaction is committed
-                self.notify_update()
+                self.notify_update(clock)
                 return beer_count
                 
             return beer_count
@@ -551,26 +552,32 @@ class SyncedDatabase:
             # Get current taps
             existing_taps = self.get_all_taps()
             current_count = len(existing_taps)
-            
+            clock = None
+            increment_clock = True
             # If decreasing, delete excess taps
             if count < current_count:
-                # Delete taps from highest number to lowest
+                # Delete
+                #  taps from highest number to lowest
                 for i in range(current_count, count, -1):
                     tap_id = i
-                    self.delete_tap(tap_id, notify=False)
+                    success = self.db_manager.delete_tap(tap_id)
+                    if success:
+                        clock = self.change_tracker.log_change("taps", "DELETE", tap_id, increment_clock=increment_clock) if not clock else clock
+                        increment_clock = False
+
             
             # If increasing, add new taps
             elif count > current_count:
                 # Add new taps with sequential IDs
                 for i in range(current_count + 1, count + 1):
                     tap_id = i
-                    self.add_tap(tap_id, None, notify=False)
-            
-                # Log the change
-                self.change_tracker.log_change("version", "TAP_COUNT", count)
+                    success = self.db_manager.add_tap(tap_id, beer_id)
+                    if success:
+                        clock = self.change_tracker.log_change("taps", "INSERT", tap_id, increment_clock=increment_clock) if not clock else clock
+                        increment_clock = False
             
             # Send a single notification after all changes
-            self.notify_update()
+            self.notify_update(clock)
             return True
             
         except Exception as e:

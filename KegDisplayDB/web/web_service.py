@@ -345,38 +345,16 @@ def check_sync_service():
         sync_service_running = False
         return False
 
-def start_sync_service():
-    """Start the sync service if it's not running"""
-    if check_sync_service():
-        return True
-        
-    logger.info("Sync service not running, attempting to start it...")
-    try:
-        # Start sync service in a separate process
-        subprocess.Popen(["poetry", "run", "sync"])
-        
-        # Wait for service to start (up to 10 seconds)
-        for _ in range(10):
-            if check_sync_service():
-                logger.info("Sync service started successfully")
-                return True
-            time.sleep(1)
-            
-        logger.error("Failed to start sync service")
-        return False
-    except Exception as e:
-        logger.error(f"Error starting sync service: {e}")
-        return False
-
 @app.before_request
 def check_backend():
     """Check if sync service is running before each request"""
     if request.endpoint and request.endpoint != 'login':
-        if not check_sync_service() and not start_sync_service():
+        if not check_sync_service():
+            logger.warning("Sync service is not available")
             if request.endpoint.startswith('api_'):
-                return jsonify({"error": "Database service is not available"}), 503
+                return jsonify({"error": "Database sync service is not available. Talk to your administrator to resolve this issue."}), 503
             else:
-                flash("Database service is not available. Please try again later.")
+                flash("Database sync service is not available. Talk to your administrator to resolve this issue.")
                 return redirect(url_for('login'))
 
 class KegDisplayApplication(BaseApplication):
@@ -403,13 +381,21 @@ def parse_args():
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR","CRITICAL"], help="Set logging level")
     parser.add_argument("--ssl-cert", type=str, default=DEFAULT_SSL_CERT, help="Path to SSL certificate file")
     parser.add_argument("--ssl-key", type=str, default=DEFAULT_SSL_KEY, help="Path to SSL private key file")
+    parser.add_argument("--use-ssl", action="store_true", default=False, help="Enable SSL/TLS")
     parser.add_argument("--workers", type=int, default=2, help="Number of Gunicorn worker processes")
     parser.add_argument("--timeout", type=int, default=30, help="Worker timeout in seconds")
     return parser.parse_args()
 
-def main():
+def main(use_ssl=None, port=None):
     global db_client
     args = parse_args()
+    
+    # Override arguments if provided directly
+    if use_ssl is not None:
+        args.use_ssl = use_ssl
+    if port is not None:
+        args.port = port
+    
     configure_logging(log_level=args.log_level)
     logger.setLevel(getattr(logging, args.log_level))
     
@@ -426,7 +412,14 @@ def main():
     logger.info(f"  Host: {args.host}")
     logger.info(f"  Web port: {args.port}")
     logger.info(f"  RPC URL: {args.rpc_url}")
+    logger.info(f"  SSL: {'Enabled' if args.use_ssl else 'Disabled'}")
     logger.info(f"  Debug mode: {'Enabled' if args.debug else 'Disabled'}")
+    
+    # Check if sync service is available
+    if check_sync_service():
+        logger.info("Sync service is available")
+    else:
+        logger.warning("Sync service is not available. Please start it manually.")
 
     # Configure Gunicorn options
     options = {
@@ -454,8 +447,8 @@ def main():
         'reload': args.debug,
     }
 
-    # Add SSL configuration if certificates are provided
-    if args.ssl_cert and args.ssl_key:
+    # Add SSL configuration if enabled
+    if args.use_ssl:
         # Check if certificate and key files exist, generate them if not
         if not os.path.exists(args.ssl_cert) or not os.path.exists(args.ssl_key):
             logger.info("SSL certificate or key not found, generating self-signed certificate")
@@ -473,6 +466,14 @@ def main():
     logger.info(f"Starting Gunicorn server on {args.host}:{args.port}")
     logger.info(f"Worker configuration: {args.workers} workers")
     KegDisplayApplication(app, options).run()
+
+def main_ssl():
+    """Start the web service with SSL on port 8443"""
+    main(use_ssl=True, port=8443)
+
+def main_nossl():
+    """Start the web service without SSL on port 8080"""
+    main(use_ssl=False, port=8080)
 
 if __name__ == "__main__":
     main() 

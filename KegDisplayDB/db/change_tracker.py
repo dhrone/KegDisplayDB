@@ -111,6 +111,37 @@ class ChangeTracker:
             logger.warning(f"Using temporary node ID: {temp_id}")
             return temp_id
     
+    def get_logical_clock(self):
+        """Get the logical clock value
+        
+        Returns:
+            int: Logical clock value
+        """
+
+        return self.db_manager.execute("SELECT logical_clock FROM version WHERE id = 1")[0]
+
+    def get_current_clock(self):
+        """Get the current logical clock value
+        
+        Returns:
+            int: Current logical clock value
+        """
+        # Get current logical clock value or zero if no row exists
+        current_clock_row = self.db_manager.execute("SELECT logical_clock FROM version WHERE id = 1")
+        current_clock_row = current_clock_row[0] if current_clock_row else (-1,)
+        return current_clock_row[0]
+    
+    def get_current_version(self):
+        """Get the current version
+        
+        Returns:
+            dict: Current version information
+        """
+        version_row = self.db_manager.execute("SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1")
+        version_row = version_row[0] if version_row else ('', '', -1, 'None')
+
+        return version_row
+
     def increment_logical_clock(self, received_clock=None):
         """Increment the logical clock
         
@@ -122,26 +153,17 @@ class ChangeTracker:
             int: New logical clock value
         """
         try:
+            current_clock = self.get_current_clock()
 
-            # Get current logical clock value
-            current_clock_row = self.db_manager.execute("SELECT logical_clock FROM version WHERE id = 1")[0]
-
-            # Determine the new clock value based on whether a row exists
-            if current_clock_row is None:
-                current_clock = 0
-                new_clock = received_clock + 1 if received_clock else 1
-            else:
-                current_clock = current_clock_row[0] if current_clock_row[0] is not None else 0
-                # Lamport clock rule: local_clock = max(local_clock, received_clock) + 1
-                new_clock = max(current_clock, received_clock if received_clock else 0) + 1            
-
+            # Lamport clock rule: local_clock = max(local_clock, received_clock) + 1
+            new_clock = max(current_clock, received_clock if received_clock else 0) + 1            
 
             # Calculate a fresh content hash
             tables = ['beers', 'taps']
             content_hash = self.db_manager._calculate_db_hash(tables)
             timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             
-            if current_clock_row is None:
+            if current_clock <0:
                 # Insert new version record if none exists
                 self.db_manager.execute(
                     "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
@@ -161,6 +183,7 @@ class ChangeTracker:
                     (timestamp, content_hash, new_clock, self.node_id)
                 )
             
+                self.logical_clock = new_clock
                 logger.debug(f"Incremented logical clock from {current_clock} to {new_clock}")
                 return new_clock
 
@@ -211,7 +234,7 @@ class ChangeTracker:
             self.initialize_tracking()
             self.node_id = self.initialize_node_id()
     
-    def log_change(self, table_name, operation, row_id):
+    def log_change(self, table_name, operation, row_id, increment_clock=True):
         """Log a database change with Lamport logical clock
         
         Args:
@@ -229,9 +252,11 @@ class ChangeTracker:
         try:
             # Use transaction to ensure atomicity of the entire operation
            
-            
+            if increment_clock:
             # Increment logical clock for this operation
-            new_clock = self.increment_logical_clock()
+                new_clock = self.increment_logical_clock()
+            else:
+                new_clock = self.get_current_clock()
             
             # Get content for the row
             content = self._get_row_content(table_name, row_id)
@@ -267,6 +292,7 @@ class ChangeTracker:
                 )
         
             logger.debug(f"Logged {operation} operation on {table_name} for row {row_id} with logical clock {new_clock}")
+            return new_clock
             
         except Exception as e:
             logger.error(f"Error logging change: {e}")
