@@ -157,13 +157,14 @@ class DatabaseSynchronizer:
         """
         start_time = time.time()
 
+        # Extract peer information
+        peer_ip = addr[0]
+        
         # Skip messages from our own IPs
         if peer_ip in self.network.local_ips:
             elapsed = time.time() - start_time
             return
         
-        # Extract peer information
-        peer_ip = addr[0]
         peer_version = message.get('version')
         peer_sync_port = message.get('sync_port', self.network.sync_port)
         should_sync = False
@@ -186,6 +187,11 @@ class DatabaseSynchronizer:
             last_clock = last_version.get("logical_clock", 0)
         else:
             last_clock = 0
+
+        # Get our current database version for comparison
+        our_version = self.change_tracker.get_db_version()
+        our_clock = our_version.get("logical_clock", 0)
+        content_differs = peer_version.get("hash") != our_version.get("hash")
 
         # Update peer information in our peer list
         with self.lock:    
@@ -216,7 +222,7 @@ class DatabaseSynchronizer:
                 if self.change_tracker.is_newer_version(peer_version, our_version):
 
                     # if peer wins tie-breaking, clear the database and initiate a full sync
-                    logger.info(f"Equal logical clocks ({pCLK}) with hash mismatch.  Peer wins tie-breaking, initiating full dataset sync")
+                    logger.info(f"Equal logical clocks ({pCLK}) with hash mismatch. Peer wins tie-breaking, initiating full dataset sync")
 
                     self.db_manager.clear_tap()
                     self.db_manager.clear_beer()

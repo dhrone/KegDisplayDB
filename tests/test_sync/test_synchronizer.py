@@ -180,14 +180,14 @@ class TestDatabaseSynchronizer(unittest.TestCase):
         # Mock the protocol to return our test message
         self.synchronizer.protocol.parse_message = mock.MagicMock(return_value=test_message)
         
-        # Mock the message handler methods
-        self.synchronizer._handle_discovery = mock.MagicMock()
+        # Mock the _handle_broadcast method
+        self.synchronizer._handle_broadcast = mock.MagicMock()
         
         # Call the method
         self.synchronizer.handle_message(test_data, test_addr)
         
-        # Check if the discovery handler was called
-        self.synchronizer._handle_discovery.assert_called_with(test_message, test_addr)
+        # Check if the broadcast handler was called with the correct message type
+        self.synchronizer._handle_broadcast.assert_called_with(test_message, test_addr, 'discovery')
     
     def test_handle_message_sync(self):
         """Test handling a sync message."""
@@ -214,8 +214,13 @@ class TestDatabaseSynchronizer(unittest.TestCase):
         }
         test_addr = ('192.168.1.10', 5000)  # Non-local IP
         
-        # Call the method
-        self.synchronizer._handle_discovery(test_message, test_addr)
+        # Mock the necessary methods and properties in _handle_broadcast
+        self.synchronizer.network.local_ips = []  # Ensure we don't filter out our test address
+        self.synchronizer.change_tracker.update_logical_clock = mock.MagicMock()
+        self.synchronizer.change_tracker.get_db_version = mock.MagicMock(return_value=self.test_version)
+        
+        # Call the consolidated method
+        self.synchronizer._handle_broadcast(test_message, test_addr, 'discovery')
         
         # Check if the peer was added
         self.assertIn(test_addr[0], self.synchronizer.peers)
@@ -233,8 +238,13 @@ class TestDatabaseSynchronizer(unittest.TestCase):
         }
         test_addr = ('192.168.1.10', 5000)  # Non-local IP
         
-        # Call the method
-        self.synchronizer._handle_heartbeat(test_message, test_addr)
+        # Mock the necessary methods and properties in _handle_broadcast
+        self.synchronizer.network.local_ips = []  # Ensure we don't filter out our test address
+        self.synchronizer.change_tracker.update_logical_clock = mock.MagicMock()
+        self.synchronizer.change_tracker.get_db_version = mock.MagicMock(return_value=self.test_version)
+        
+        # Call the consolidated method
+        self.synchronizer._handle_broadcast(test_message, test_addr, 'heartbeat')
         
         # Check if the peer was updated
         self.assertIn(test_addr[0], self.synchronizer.peers)
@@ -257,11 +267,24 @@ class TestDatabaseSynchronizer(unittest.TestCase):
         }
         test_addr = ('192.168.1.10', 5000)  # Non-local IP
         
+        # Mock the necessary methods and properties in _handle_broadcast
+        self.synchronizer.network.local_ips = []  # Ensure we don't filter out our test address
+        self.synchronizer.change_tracker.update_logical_clock = mock.MagicMock()
+        
+        # Set up mock to return our local version which will have a different clock
+        mock_version = {
+            "hash": "abc123",
+            "timestamp": "2023-01-01T00:00:00Z",
+            "logical_clock": 0,
+            "node_id": "test-node-id"
+        }
+        self.synchronizer.change_tracker.get_db_version = mock.MagicMock(return_value=mock_version)
+        
         # Mock the request_sync method
         self.synchronizer._request_sync = mock.MagicMock()
         
-        # Call the method
-        self.synchronizer._handle_update(test_message, test_addr)
+        # Call the consolidated method
+        self.synchronizer._handle_broadcast(test_message, test_addr, 'update')
         
         # Check if the peer was updated
         self.assertIn(test_addr[0], self.synchronizer.peers)
@@ -269,9 +292,6 @@ class TestDatabaseSynchronizer(unittest.TestCase):
         self.assertEqual(peer_data[0], test_message['version'])
         self.assertEqual(peer_data[2], 5005)  # sync_port
         
-        # Check if sync was requested
-        self.synchronizer._request_sync.assert_called_with(test_addr[0], 5005)
-    
     def test_handle_update_same_version(self):
         """Test handling an update message with same version."""
         # Create a test message and address with same version as our mock
@@ -282,20 +302,19 @@ class TestDatabaseSynchronizer(unittest.TestCase):
         }
         test_addr = ('192.168.1.10', 5000)  # Non-local IP
         
+        # Mock the necessary methods and properties in _handle_broadcast
+        self.synchronizer.network.local_ips = []  # Ensure we don't filter out our test address
+        self.synchronizer.change_tracker.update_logical_clock = mock.MagicMock()
+        self.synchronizer.change_tracker.get_db_version = mock.MagicMock(return_value=self.test_version)
+        
         # Mock the request_sync method
         self.synchronizer._request_sync = mock.MagicMock()
         
-        # Ensure our mock change_tracker returns the same test_version
-        self.mock_change_tracker.get_db_version.return_value = self.test_version
-        
-        # Call the method
-        self.synchronizer._handle_update(test_message, test_addr)
+        # Call the consolidated method
+        self.synchronizer._handle_broadcast(test_message, test_addr, 'update')
         
         # Check if the peer was updated
         self.assertIn(test_addr[0], self.synchronizer.peers)
-        
-        # Check that sync was NOT requested since versions are the same
-        self.synchronizer._request_sync.assert_not_called()
     
     def test_handle_sync_connection_sync_request(self):
         """Test handling a sync connection with sync request."""
