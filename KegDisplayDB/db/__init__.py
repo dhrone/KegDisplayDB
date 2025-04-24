@@ -82,7 +82,7 @@ class SyncedDatabase:
             self.test_peers.append(peer)
             peer.test_peers.append(self)
     
-    def notify_update(self):
+    def notify_update(self, clock=None):
         """Notify other instances that a change has been made"""
         try:
             if self.test_mode:
@@ -92,7 +92,7 @@ class SyncedDatabase:
                         if peer != self and hasattr(peer, 'synchronizer') and peer.synchronizer:
                             # Only sync with peer if both have synchronizers
                             if hasattr(self, 'synchronizer') and self.synchronizer:
-                                self.synchronizer._sync_with_peer(peer)
+                                self.synchronizer._sync_with_peer(peer, clock)
                     except Exception as e:
                         logger.error(f"Error syncing with test peer: {e}")
             else:
@@ -102,6 +102,7 @@ class SyncedDatabase:
                         # Give a short timeout for network operations
                         notify_thread = threading.Thread(
                             target=self._notify_update_with_timeout,
+                            kwargs={'clock': clock},
                             daemon=True
                         )
                         notify_thread.start()
@@ -116,11 +117,11 @@ class SyncedDatabase:
         except Exception as e:
             logger.error(f"Error in notify_update: {e}")
     
-    def _notify_update_with_timeout(self):
+    def _notify_update_with_timeout(self, clock=None):
         """Execute the notification with timeout protection"""
         try:
             # Use synchronizer to broadcast update
-            self.synchronizer.notify_update()
+            self.synchronizer.notify_update(clock)
         except socket.error as e:
             logger.error(f"Network error during notification: {e}")
         except Exception as e:

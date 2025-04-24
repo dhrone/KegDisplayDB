@@ -95,11 +95,14 @@ class DatabaseSynchronizer:
         
         logger.info("Database synchronization system stopped")
     
-    def notify_update(self):
+    def notify_update(self, clock=None):
         """Notify other instances that a change has been made"""
         try:
             # Increment logical clock for this control message
-            self.change_tracker.increment_logical_clock()
+            if clock is None:
+                self.change_tracker.increment_logical_clock()
+            else:
+                self.change_tracker.update_logical_clock(clock)
             
             # Get current database version
             version = self.change_tracker.get_db_version()
