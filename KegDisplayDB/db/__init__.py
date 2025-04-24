@@ -507,7 +507,7 @@ class SyncedDatabase:
     
     def clear_all_beers(self):
         """
-        Remove all beers from the database
+        Remove all data from the database.  This includes all beers, taps, and change log.
         
         Returns:
             Number of beers cleared
@@ -523,12 +523,14 @@ class SyncedDatabase:
                 
                 # Then clear all beers
                 self.db_manager.clear_beer()
+
+                # Clear the change log
+                self.db_manager.clear_change_log()
                 
                 # Log the change
                 clock = self.change_tracker.log_change("version", "CLEAR", 1)
                 
-                # Send notification after transaction is committed
-                self.notify_update(clock)
+ 
                 return beer_count
                 
             return beer_count

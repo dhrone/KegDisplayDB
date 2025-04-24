@@ -831,7 +831,21 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error retrieving taps with beer {beer_id}: {e}")
             return []
-    
+
+    def clear_change_log(self):
+        """Delete all records from the change_log table
+        
+        Returns:
+            success: True if the operation was successful
+        """
+        try:
+            self.execute("DELETE FROM change_log")
+            logger.debug(f"Cleared all records from change_log table")
+            return True
+        except Exception as e:
+            logger.error(f"Error clearing change_log table: {e}")
+            raise 
+
     def clear_beer(self):
         """Delete all records from the beers table
         
@@ -958,15 +972,20 @@ class DatabaseManager:
                             cursor = conn.execute(
                                 """
                                 SELECT COUNT(*) FROM change_log 
-                                WHERE table_name = ? AND operation = ? AND row_id = ? AND logical_clock = ? AND node_id = ?
+                                WHERE table_name = ? AND operation = ? AND row_id = ? 
+                                  AND ((logical_clock = ? AND node_id = ?) OR 
+                                       (logical_clock > ? AND content_hash = ?))
                                 """,
-                                (table_name, operation, row_id, logical_clock, node_id)
+                                (table_name, operation, row_id, logical_clock, node_id, 
+                                 logical_clock, content_hash)
                             )
                             existing_change = cursor.fetchone()
                             
                             if existing_change and existing_change[0] > 0:
                                 # Skip changes we've already processed
-                                logger.debug(f"Skipping already applied change: {operation} on {table_name}.{row_id}")
+                                logger.debug(f"Skipping duplicate change: {operation} on {table_name}.{row_id} with clock {logical_clock} from node {node_id}")
+                                # Count as successful to track statistics properly
+                                applied_changes += 1
                                 continue
                                 
                             # Verify content hash (security check)
@@ -1019,6 +1038,8 @@ class DatabaseManager:
                                         conn.execute(sql)
                                     
                                     # Log the change in our change_log table with OUR new clock value
+                                    # but preserve the ORIGINAL node_id to maintain provenance
+                                    logger.debug(f"Preserving original node_id {node_id} when recording change in local log")
                                     conn.execute(
                                         """
                                         INSERT INTO change_log 
@@ -1231,9 +1252,12 @@ class DatabaseManager:
             logger.error(f"Error importing database: {e}")
             return False
     
-    def _create_backup_before_import(self):
+    def _create_backup_before_import(self, error_backup=False):
         """Create a backup before importing a database
         
+        Args:
+            error_backup: Whether to create an error backup
+            
         Returns:
             success: Whether the backup was successful
         """
@@ -1246,20 +1270,22 @@ class DatabaseManager:
             # Get the directory and base name for the database
             db_dir = os.path.dirname(self.db_path)
             db_name = os.path.basename(self.db_path)
+
+            backup_name = f"{db_name}.{i}.err.bak" if error_backup else f"{db_name}.{i}.bak"
             
             # Use a simple rotating backup scheme (max 5 backups)
             max_backups = 5
             
             # Find an available backup slot (1-5)
             for i in range(1, max_backups + 1):
-                backup_path = os.path.join(db_dir, f"{db_name}.{i}.bak")
+                backup_path = os.path.join(db_dir, backup_name)
                 if not os.path.exists(backup_path):
                     break
             else:
                 # If all slots are taken, use the oldest backup
                 backup_files = []
                 for i in range(1, max_backups + 1):
-                    path = os.path.join(db_dir, f"{db_name}.{i}.bak")
+                    path = os.path.join(db_dir, backup_name)
                     if os.path.exists(path):
                         backup_files.append((path, os.path.getmtime(path)))
                 
@@ -1268,7 +1294,8 @@ class DatabaseManager:
                 if backup_files:
                     backup_path = backup_files[0][0]
                 else:
-                    backup_path = os.path.join(db_dir, f"{db_name}.1.bak")
+                    i = 1
+                    backup_path = os.path.join(db_dir, backup_name)
             
             # Create the backup
             shutil.copy2(self.db_path, backup_path)

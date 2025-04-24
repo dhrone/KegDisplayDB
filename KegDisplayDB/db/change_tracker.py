@@ -205,7 +205,13 @@ class ChangeTracker:
         """
         return self.increment_logical_clock(received_clock)
     
-
+    def clear_logical_clock(self):
+        """Clear the logical clock
+        
+        Returns:
+            success: True if the operation was successful
+        """
+        return self.db_manager.execute("UPDATE version SET logical_clock = 0 WHERE id = 1")
     
     def ensure_valid_session(self):
         """Ensure we have a valid tracking session"""
@@ -234,13 +240,14 @@ class ChangeTracker:
             self.initialize_tracking()
             self.node_id = self.initialize_node_id()
     
-    def log_change(self, table_name, operation, row_id, increment_clock=True):
+    def log_change(self, table_name, operation, row_id, increment_clock=True, record_node_id=None):
         """Log a database change with Lamport logical clock
         
         Args:
             table_name: Name of the table that changed
             operation: Operation type (INSERT, UPDATE, DELETE)
             row_id: ID of the row that changed
+            record_node_id: Node ID of the node that recorded the change
             conn: Optional database connection to use within an existing transaction
             
         Note:
@@ -262,6 +269,13 @@ class ChangeTracker:
             content = self._get_row_content(table_name, row_id)
             content_hash = hashlib.md5(content.encode()).hexdigest()
             timestamp = datetime.now(UTC).isoformat()
+
+            # If no node ID is provided, use our own node ID
+            if record_node_id is None:
+                record_node_id = self.node_id
+                logger.debug(f"Using local node ID for change log: {record_node_id}")
+            else:
+                logger.debug(f"Using provided node ID for change log: {record_node_id}")
             
             # Log the change with logical clock and node ID
             self.db_manager.execute(
@@ -270,7 +284,7 @@ class ChangeTracker:
                 (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (table_name, operation, row_id, timestamp, content, content_hash, new_clock, self.node_id)
+                (table_name, operation, row_id, timestamp, content, content_hash, new_clock, record_node_id)
             )
             
             # Calculate a fresh database content hash
@@ -299,34 +313,43 @@ class ChangeTracker:
             raise
     
 
-    def get_changes_since_clock(self, last_clock, node_id=None, batch_size=1000):
+    def get_changes_since_clock(self, last_clock, peer_node_id=None, batch_size=1000):
         """Get all changes since a given logical clock value
         
         Args:
             last_clock: Logical clock value to get changes since
-            node_id: Node ID for tie-breaking (optional)
+            peer_node_id: Node ID for tie-breaking (optional)
             batch_size: Maximum number of changes to return
-            conn: Optional database connection to use within an existing transaction
             
         Returns:
             changes: List of changes
         """
 
         try:
-            # Get all changes with higher logical clock
-            higher_clock_changes = self.db_manager.execute(
-                '''
+            # Get all changes with higher logical clock, excluding those from the peer node
+            # (they already have their own changes)
+            query_params = [last_clock]
+            higher_clock_query = '''
                 SELECT table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id
                 FROM change_log
                 WHERE logical_clock > ?
-                ORDER BY logical_clock
-                ''',
-                (last_clock,)
-            )
+            '''
+            
+            if peer_node_id:
+                higher_clock_query += ' AND node_id != ?'
+                query_params.append(peer_node_id)
+                
+            higher_clock_query += ' ORDER BY logical_clock, node_id'
+            
+            higher_clock_changes = self.db_manager.execute(
+                higher_clock_query,
+                tuple(query_params)
+            ) or []
             
             # Get changes with equal clock but from different nodes
-            # (only if node_id is provided)
-            if node_id:
+            # (only if peer_node_id is provided)
+            equal_clock_changes = []
+            if peer_node_id:
                 equal_clock_changes = self.db_manager.execute(
                     '''
                     SELECT table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id
@@ -334,14 +357,18 @@ class ChangeTracker:
                     WHERE logical_clock = ? AND node_id != ?
                     ORDER BY node_id
                     ''',
-                    (last_clock, node_id)
-                )
+                    (last_clock, peer_node_id)
+                ) or []
                 
-                # Combine and sort the changes
-                all_changes = higher_clock_changes + equal_clock_changes
-                all_changes.sort(key=lambda x: (x[6], x[7]))  # Sort by logical_clock, then node_id
-            else:
-                all_changes = higher_clock_changes or []
+            # Combine and sort the changes
+            all_changes = higher_clock_changes + equal_clock_changes
+            all_changes.sort(key=lambda x: (x[6], x[7]))  # Sort by logical_clock, then node_id
+            
+            # Log details about the number of changes found
+            if all_changes:
+                logger.info(f"Found {len(higher_clock_changes)} changes with higher clock value than {last_clock}")
+                if equal_clock_changes:
+                    logger.info(f"Found {len(equal_clock_changes)} changes with equal clock value from different nodes")
             
             # Limit to batch_size
             if len(all_changes) > batch_size:
@@ -505,7 +532,8 @@ class ChangeTracker:
         
         # Arbitrary but consistent tie-breaking: lexicographically higher node ID wins
         is_newer = node_id1 > node_id2
-        logger.debug(f"Tie-breaking with node IDs: {node_id1} vs {node_id2}, result: {is_newer}")
+        winner = node_id1 if is_newer else node_id2
+        logger.debug(f"Tie-breaking with node IDs: {node_id1} vs {node_id2}, result: {winner}")
         return is_newer 
 
     def _calculate_content_hash(self):

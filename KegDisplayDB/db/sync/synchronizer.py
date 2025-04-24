@@ -142,14 +142,104 @@ class DatabaseSynchronizer:
         # Handle message based on type
         message_type = message.get('type')
         
-        if message_type == 'discovery':
-            self._handle_discovery(message, addr)
-        elif message_type == 'heartbeat':
-            self._handle_heartbeat(message, addr)
-        elif message_type == 'update':
-            self._handle_update(message, addr)
+        if message_type in ['discovery', 'heartbeat', 'update']:
+            self._handle_broadcast(message, addr, message_type)
         else:
             logger.warning(f"Received unknown message type '{message_type}' from {addr[0]}")
+    
+    def _handle_broadcast(self, message, addr, message_type):
+        """Consolidated handler for all broadcast messages.
+        
+        Args:
+            message: Parsed message
+            addr: Address the message came from
+            message_type: Type of message ('discovery', 'heartbeat', or 'update')
+        """
+        start_time = time.time()
+
+        # Skip messages from our own IPs
+        if peer_ip in self.network.local_ips:
+            elapsed = time.time() - start_time
+            return
+        
+        # Extract peer information
+        peer_ip = addr[0]
+        peer_version = message.get('version')
+        peer_sync_port = message.get('sync_port', self.network.sync_port)
+        should_sync = False
+
+        logger.info(f"ENTRY _handle_{message_type} from {addr[0]}")      
+
+        # Log message details for debugging
+        pCLK = peer_version.get("logical_clock", 0)
+        pTS = peer_version.get("timestamp", 0)[-10:]
+        pNODE = peer_version.get("node_id", 0)[-12:]
+        logger.info(f"Received{message_type} broadcast from {peer_ip}:{peer_sync_port} {pCLK}:{pTS}:{pNODE}")
+        
+        # Update our logical clock based on peer's version using lamport clock rules
+        self.change_tracker.update_logical_clock(pCLK)
+
+        # Get the last version and clock for this peer
+        last_version = None
+        if peer_ip in self.peers:
+            last_version = self.peers[peer_ip][0]
+            last_clock = last_version.get("logical_clock", 0)
+        else:
+            last_clock = 0
+
+        # Update peer information in our peer list
+        with self.lock:    
+            self.peers[peer_ip] = (peer_version, time.time(), peer_sync_port)
+            
+        if last_version != peer_version:
+            logger.info(f"Updated peer {peer_ip} version to {pCLK}:{pTS}:{pNODE}")
+        
+        try:  
+            # Apply Lamport Clock rules
+
+            # If the peer has a higher logical clock, update our records and initiate sync
+            if pCLK > last_clock:
+                logger.info(f"Peer has higher logical clock ({pCLK} > {last_clock}) than their last transmission. Updating our records and initiating sync")
+                should_sync = True
+                
+            # If the peer has a lower logical clock, do nothing
+            elif pCLK < our_clock:
+                logger.info(f"Our logical clock is higher ({our_clock} > {pCLK}), No action required")
+
+            # If the peer has a lower logical clock, do nothing
+            elif pCLK == our_clock and not content_differs:
+                logger.info(f"Equal logical clocks ({pCLK}) with matching hash. No action required.")
+            
+            # if the peer is equal but has a different hash, run tie-breaking
+            else:
+                
+                if self.change_tracker.is_newer_version(peer_version, our_version):
+
+                    # if peer wins tie-breaking, clear the database and initiate a full sync
+                    logger.info(f"Equal logical clocks ({pCLK}) with hash mismatch.  Peer wins tie-breaking, initiating full dataset sync")
+
+                    self.db_manager.clear_tap()
+                    self.db_manager.clear_beer()
+                    self.db_manager.clear_change_log()
+                    self.peers.clear()
+                    last_clock = 0
+                    should_sync = True
+                    self.peers[peer_ip] = (peer_version, time.time(), peer_sync_port)
+
+                else:
+                    logger.info(f"We win tie-breaking, not syncing")
+        
+            # Network operations moved outside transaction block
+            if should_sync:
+                self._request_sync(peer_ip, peer_sync_port, last_clock)
+            
+            elapsed = time.time() - start_time
+            logger.info(f"EXIT _handle_{message_type} from {addr[0]}, should_sync={should_sync} - elapsed: {elapsed:.3f}s")
+            
+        except Exception as e:
+            elapsed = time.time() - start_time
+            logger.error(f"Error handling {message_type} message: {e} - elapsed: {elapsed:.3f}s")
+            logger.info(f"EXIT _handle_{message_type} from {addr[0]} with error - elapsed: {elapsed:.3f}s")
     
     def _handle_sync_connection(self, client_socket, addr):
         """Handle incoming sync connections
@@ -185,123 +275,16 @@ class DatabaseSynchronizer:
         except Exception as e:
             logger.error(f"Error handling sync connection: {e}")
             client_socket.close()
-    
-    def _handle_discovery(self, message, addr):
-        """Handle discovery messages
-        
-        Args:
-            message: Parsed message
-            addr: Address the message came from
-        """
-        start_time = time.time()
-        logger.info(f"ENTRY _handle_discovery from {addr[0]}")
-        
-        peer_ip = addr[0]
-        
-        # Skip messages from our own IPs
-        if peer_ip in self.network.local_ips:
-            elapsed = time.time() - start_time
-            logger.info(f"EXIT _handle_discovery (own IP, skipped) - elapsed: {elapsed:.3f}s")
-            return
-        
-        # Extract peer information
-        peer_version = message.get('version')
-        peer_sync_port = message.get('sync_port', self.network.sync_port)
-        should_sync = False
-        
-        try:
-            # Get our current database version for comparison
 
-            our_version = self.change_tracker.get_db_version()
-            
-            # Get logical clock values
-            peer_clock = peer_version.get("logical_clock", 0)
-            our_clock = our_version.get("logical_clock", 0)
-            
-            # Check if content hashes differ
-            content_differs = peer_version.get("hash") != our_version.get("hash")
-            
-            # Update peer information in our peer list
-            with self.lock:
-                old_version = None
-                if peer_ip in self.peers:
-                    old_version = self.peers[peer_ip][0]
-                
-                self.peers[peer_ip] = (peer_version, time.time(), peer_sync_port)
-                
-                if old_version != peer_version:
-                    logger.info(f"Discovered peer {peer_ip} with version {peer_version}")
-                
-                # Apply Lamport Clock rules from receiving_node.csv
-                if peer_clock > our_clock:
-                    # Receive broadcast; incomingClock > localClock
-                    # 1. localClock = max(localClock, incomingClock) + 1
-                    # 2. version_table.clock = localClock
-                    # 3. Initiate sync
-                    logger.debug(f"Peer has higher logical clock ({peer_clock} > {our_clock}), updating our clock and initiating sync")
-                    self.change_tracker.update_logical_clock(peer_clock)
-                    should_sync = True
-                    
-                elif peer_clock == our_clock and content_differs:
-                    # Receive broadcast; incomingClock = localClock & state-hash differs
-                    # 1. localClock += 1
-                    # 2. version_table.clock = localClock
-                    # 3. Tie-break (compare node IDs):
-                    #    • If you lose, initiate sync
-                    #    • If you win, ignore
-                    logger.debug(f"Equal logical clocks ({peer_clock}) with hash mismatch, incrementing our clock and using tie-breaker")
-                    self.change_tracker.increment_logical_clock()
-                    
-                    # Tie-breaking using node IDs
-                    if self.change_tracker.is_newer_version(peer_version, our_version):
-                        logger.info(f"Peer wins tie-breaking, initiating sync")
-                        should_sync = True
-                    else:
-                        logger.debug(f"We win tie-breaking, not syncing")
-                    
-                elif peer_clock < our_clock:
-                    # Receive broadcast; incomingClock < localClock
-                    # 1. localClock += 1
-                    # 2. version_table.clock = localClock
-                    # 3. Ignore (you're ahead)
-                    logger.debug(f"Our logical clock is higher ({our_clock} > {peer_clock}), incrementing our clock (we're ahead)")
-                    self.change_tracker.increment_logical_clock()
-                    
-                # Special case: if our database is empty but peer has data, sync regardless of clocks
-                elif self.change_tracker.is_database_empty() and not peer_version.get("hash") == "0":
-                    logger.debug(f"We have empty database but peer has data, initiating sync")
-                    should_sync = True
-            
-            # Network operations moved outside transaction block
-            if should_sync:
-                self._request_sync(peer_ip, peer_sync_port)
-                
-            elapsed = time.time() - start_time
-            logger.info(f"EXIT _handle_discovery from {addr[0]}, should_sync={should_sync} - elapsed: {elapsed:.3f}s")
-                
-        except Exception as e:
-            elapsed = time.time() - start_time
-            logger.error(f"Error handling discovery message: {e} - elapsed: {elapsed:.3f}s")
-            logger.info(f"EXIT _handle_discovery from {addr[0]} with error - elapsed: {elapsed:.3f}s")
-    
-    def _handle_heartbeat(self, message, addr):
-        """Handle heartbeat messages
+    def _handle_received_clock_comparison(self, message, addr):
+        """Handle received clock comparison messages
         
         Args:
             message: Parsed message
             addr: Address the message came from
         """
-        start_time = time.time()
-        logger.info(f"ENTRY _handle_heartbeat from {addr[0]}")
-        
         peer_ip = addr[0]
-        
-        # Skip messages from our own IPs
-        if peer_ip in self.network.local_ips:
-            elapsed = time.time() - start_time
-            logger.info(f"EXIT _handle_heartbeat (own IP, skipped) - elapsed: {elapsed:.3f}s")
-            return
-        
+     
         # Extract peer information
         peer_version = message.get('version')
         peer_sync_port = message.get('sync_port', self.network.sync_port)
@@ -326,158 +309,17 @@ class DatabaseSynchronizer:
                 
                 self.peers[peer_ip] = (peer_version, time.time(), peer_sync_port)
                 
-                if old_version != peer_version:
-                    logger.debug(f"Updated peer {peer_ip} version to {peer_version}")
-            
-            # Apply Lamport Clock rules from receiving_node.csv
-            if peer_clock > our_clock:
-                # Receive broadcast; incomingClock > localClock
-                # 1. localClock = max(localClock, incomingClock) + 1
-                # 2. version_table.clock = localClock
-                # 3. Initiate sync
-                logger.info(f"Peer has higher logical clock ({peer_clock} > {our_clock}), updating our clock and initiating sync")
-                self.change_tracker.update_logical_clock(peer_clock)
-                should_sync = True
-                
-            elif peer_clock == our_clock and content_differs:
-                # Receive broadcast; incomingClock = localClock & state-hash differs
-                # 1. localClock += 1
-                # 2. version_table.clock = localClock
-                # 3. Tie-break (compare node IDs):
-                #    • If you lose, initiate sync
-                #    • If you win, ignore
-                logger.info(f"Equal logical clocks ({peer_clock}) with hash mismatch, incrementing our clock and using tie-breaker")
-                self.change_tracker.increment_logical_clock()
-                
-                # Tie-breaking using node IDs
-                if self.change_tracker.is_newer_version(peer_version, our_version):
-                    logger.info(f"Peer wins tie-breaking, initiating sync")
-                    should_sync = True
-                else:
-                    logger.info(f"We win tie-breaking, not syncing")
-                
-            elif peer_clock < our_clock:
-                # Receive broadcast; incomingClock < localClock
-                # 1. localClock += 1
-                # 2. version_table.clock = localClock
-                # 3. Ignore (you're ahead)
-                logger.info(f"Our logical clock is higher ({our_clock} > {peer_clock}), incrementing our clock (we're ahead)")
-                self.change_tracker.increment_logical_clock()
-                
-            # Special case: if our database is empty but peer has data, sync regardless of clocks
-            elif self.change_tracker.is_database_empty() and not peer_version.get("hash") == "0":
-                logger.info(f"We have empty database but peer has data, initiating sync")
-                should_sync = True
-        
-            # Network operations moved outside transaction block
-            if should_sync:
-                self._request_sync(peer_ip, peer_sync_port)
-            
-            elapsed = time.time() - start_time
-            logger.info(f"EXIT _handle_heartbeat from {addr[0]}, should_sync={should_sync} - elapsed: {elapsed:.3f}s")
-                
-        except Exception as e:
-            elapsed = time.time() - start_time
-            logger.error(f"Error handling heartbeat message: {e} - elapsed: {elapsed:.3f}s")
-            logger.info(f"EXIT _handle_heartbeat from {addr[0]} with error - elapsed: {elapsed:.3f}s")
-    
-    def _handle_update(self, message, addr):
-        """Handle update notification messages
-        
-        Args:
-            message: Parsed message
-            addr: Address the message came from
-        """
-        peer_ip = addr[0]
-        
-        # Skip messages from our own IPs
-        if peer_ip in self.network.local_ips:
-            return
-        
-        # Extract peer information
-        peer_version = message.get('version')
-        peer_sync_port = message.get('sync_port', self.network.sync_port)
-        should_sync = False
-        
-        # Log message details for debugging
-        CLK = peer_version.get("logical_clock", 0)
-        TS = peer_version.get("timestamp", 0)[-10:]
-        NODE = peer_version.get("node_id", 0)[-12:]
-        logger.info(f"UPDATE {peer_ip}:{peer_sync_port} CLK {CLK} {TS} {NODE}")
-        
-        # Update peer information in our peer list (do this before any early returns)
-        with self.lock:
-            self.peers[peer_ip] = (peer_version, time.time(), peer_sync_port)
-        
-        try:
-            # Get our current database version for comparison
+            if old_version != peer_version:
+                logger.info(f"Received message from {peer_ip} with version {peer_version}")
 
-            our_version = self.change_tracker.get_db_version()
-            
-            # Get logical clock values
-            peer_clock = peer_version.get("logical_clock", 0)
-            our_clock = our_version.get("logical_clock", 0)
-            
-            # Check if content hashes differ
-            content_differs = peer_version.get("hash") != our_version.get("hash")
-            
-            logger.info(f"Comparing logical clocks: Us {our_clock} / Them {peer_clock}")
-            
-            # Apply Lamport Clock rules from receiving_node.csv
-            if peer_clock > our_clock:
-                # Receive broadcast; incomingClock > localClock
-                # 1. localClock = max(localClock, incomingClock) + 1
-                # 2. version_table.clock = localClock
-                # 3. Initiate sync
-                logger.info(f"Peer has higher logical clock ({peer_clock} > {our_clock}), updating our clock and initiating sync")
-                self.change_tracker.update_logical_clock(peer_clock)
-                should_sync = True
-                
-            elif peer_clock == our_clock and content_differs:
-                # Receive broadcast; incomingClock = localClock & state-hash differs
-                # 1. localClock += 1
-                # 2. version_table.clock = localClock
-                # 3. Tie-break (compare node IDs):
-                #    • If you lose, initiate sync
-                #    • If you win, ignore
-                logger.info(f"Equal logical clocks ({peer_clock}) with hash mismatch, incrementing our clock and using tie-breaker")
-                self.change_tracker.increment_logical_clock()
-                
-                # Tie-breaking using node IDs
-                if self.change_tracker.is_newer_version(peer_version, our_version):
-                    logger.info(f"Peer wins tie-breaking, initiating sync")
-                    should_sync = True
-                else:
-                    logger.info(f"We win tie-breaking, not syncing")
-                
-            elif peer_clock == our_clock and not content_differs:
-                # Receive broadcast; incomingClock = localClock & state-hash equals
-                # 1. localClock += 1
-                # 2. version_table.clock = localClock
-                # 3. No further action (you're in sync)
-                logger.info(f"Equal logical clocks ({peer_clock}) with matching hash, incrementing our clock (already in sync)")
-                self.change_tracker.increment_logical_clock()
-                
-            elif peer_clock < our_clock:
-                # Receive broadcast; incomingClock < localClock
-                # 1. localClock += 1
-                # 2. version_table.clock = localClock
-                # 3. Ignore (you're ahead)
-                logger.info(f"Our logical clock is higher ({our_clock} > {peer_clock}), incrementing our clock (we're ahead)")
-                self.change_tracker.increment_logical_clock()
-                
-            # Special case: if our database is empty but peer has data, sync regardless of clocks
-            elif self.change_tracker.is_database_empty() and not peer_version.get("hash") == "0":
-                logger.info(f"We have empty database but peer has data, initiating sync")
-                should_sync = True
-        
-            # Network operations moved outside transaction block
-            if should_sync:
-                self._request_sync(peer_ip, peer_sync_port)
-                
+            # Update our logical clock based on peer's version using lamport clock rules
+            self.change_tracker.update_logical_clock(peer_clock)
+
+            return (peer_clock, our_clock, content_differs)
         except Exception as e:
-            logger.error(f"Error handling update message: {e}")
-    
+            logger.error(f"Error handling received clock comparison message: {e}")
+            raise
+
     def _handle_sync_request(self, client_socket, message, addr):
         """Handle sync request from peer
         
@@ -490,65 +332,60 @@ class DatabaseSynchronizer:
         peer_ip = addr[0]
         logger.info(f"ENTRY _handle_sync_request from {peer_ip}")
         
-        # Get the client's logical clock value and node ID
-        last_clock = message.get('last_clock', 0)
-        peer_node_id = message.get('node_id')
-        logger.info(f"Getting changes since logical clock {last_clock} for {peer_ip}")
-        
-        # Get our current database version for logging
-        our_version = self.change_tracker.get_db_version()
-        logger.debug(f"Our database version: logical_clock={our_version.get('logical_clock', 0)}, node_id={our_version.get('node_id')}")
-        
-        # Get peer's logical clock for comparison
-        peer_version = message.get('version', {})
-        peer_clock = peer_version.get('logical_clock', 0)
-        
-        # NOTE: Following Lamport Clock specification, we do NOT increment the logical clock 
-        # when handling sync requests (reads). The clock is only incremented for:
-        # 1. Local database updates
-        # 2. Sending control messages
-        
-        # Get a count of all changes in our change log
-        total_changes = 0
-        changes = []
         try:
-
-            total_changes = self.db_manager.execute(
-                "SELECT COUNT(*) FROM change_log",
-            )[0][0]
-            logger.debug(f"Total changes in change_log: {total_changes}")
+            # Get the client's logical clock value and node ID
+            last_clock = message.get('last_clock', 0)
+            peer_node_id = message.get('node_id')
+            logger.info(f"Getting changes since logical clock {last_clock} for {peer_ip}")
             
-            # Get the highest logical clock for comparison
-            highest_clock = self.db_manager.execute(
-                "SELECT MAX(logical_clock) FROM change_log",
-            )[0][0]
-            if highest_clock:
-                logger.debug(f"Highest logical clock in change_log: {highest_clock}")
-                
-                # Use the method that filters by logical clock
-                changes = self.change_tracker.get_changes_since_clock(last_clock, peer_node_id)
-        except Exception as e:
-            logger.error(f"Error getting change log stats: {e}")
+            # Get our current database version for logging
+            our_version = self.change_tracker.get_db_version()
+            logger.debug(f"Our database version: logical_clock={our_version.get('logical_clock', 0)}, node_id={our_version.get('node_id')}")
+            
+            # Get peer's logical clock for comparison
+            peer_version = message.get('version', {})
+            peer_clock = peer_version.get('logical_clock', 0)
+            
+            # Get changes
             changes = []
-        
-        changes_time = time.time() - start_time
-        logger.debug(f"Time to get changes: {changes_time:.3f}s")
-        
-        if changes:
-            logger.info(f"Found {len(changes)} changes to send to {peer_ip}")
-            
-            # Log some details about the changes
-            for i, change in enumerate(changes):
-                if i < 5:  # Log details of first 5 changes only
-                    if len(change) >= 7:  # Should have logical_clock at index 6
-                        table_name, operation, row_id, timestamp, content, content_hash, logical_clock = change[0:7]
-                        logger.debug(f"Change {i+1}: {operation} on {table_name} row {row_id} at logical clock {logical_clock}")
-                    else:
-                        table_name, operation, row_id, timestamp = change[0:4]
-                        logger.debug(f"Change {i+1}: {operation} on {table_name} row {row_id} at {timestamp}")
-            
             try:
-
+                # Use the method that filters by logical clock
+                logger.info(f"Getting changes since logical clock {last_clock} for peer with node_id {peer_node_id}")
+                changes = self.change_tracker.get_changes_since_clock(last_clock, peer_node_id)
+            except Exception as e:
+                logger.error(f"Error getting change log stats: {e}")
+                changes = []
+            
+            changes_time = time.time() - start_time
+            logger.debug(f"Time to get changes: {changes_time:.3f}s")
+            
+            if changes:
+                logger.info(f"Found {len(changes)} changes to send to {peer_ip} (node_id: {peer_node_id})")
+                
+                # Log details of first few changes and count by operation type
+                operation_counts = {}
+                for i, change in enumerate(changes):
+                    if i < 5:
+                        if len(change) >= 8:  # Make sure we have node_id
+                            table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id = change[0:8]
+                            logger.debug(f"Change {i+1}: {operation} on {table_name} row {row_id} at logical clock {logical_clock} from node {node_id}")
+                        elif len(change) >= 7:
+                            table_name, operation, row_id, timestamp, content, content_hash, logical_clock = change[0:7]
+                            logger.debug(f"Change {i+1}: {operation} on {table_name} row {row_id} at logical clock {logical_clock}")
+                        else:
+                            table_name, operation, row_id, timestamp = change[0:4]
+                            logger.debug(f"Change {i+1}: {operation} on {table_name} row {row_id} at {timestamp}")
+                    
+                    # Count operations for summary log
+                    if len(change) >= 2:
+                        op = change[1]
+                        operation_counts[op] = operation_counts.get(op, 0) + 1
+                
+                # Log operation summary
+                op_summary = ", ".join([f"{op}: {count}" for op, count in operation_counts.items()])
+                logger.info(f"Operation summary: {op_summary}")
+                
+                # Get the latest version
                 latest_version = self.change_tracker.get_db_version()
                 
                 # Send response with changes
@@ -562,57 +399,30 @@ class DatabaseSynchronizer:
                 data = client_socket.recv(self.buffer_size)
                 if data != self.protocol.create_ack_message():
                     logger.warning(f"Invalid acknowledgment from {peer_ip}")
-                    client_socket.close()
-                    elapsed = time.time() - start_time
-                    logger.info(f"EXIT _handle_sync_request from {peer_ip} - invalid acknowledgment - elapsed: {elapsed:.3f}s")
                     return
                 
-                # Send the changes in chunks
+                # Send changes
                 send_start = time.time()
                 changes_data = self.protocol.serialize_changes(changes)
                 self._send_data_chunked(client_socket, changes_data)
                 send_time = time.time() - send_start
                 logger.debug(f"Time to send changes: {send_time:.3f}s")
                 
-                # Wait for acknowledgment
+                # Wait for final acknowledgment
                 data = client_socket.recv(self.buffer_size)
                 if data != self.protocol.create_ack_message():
-                    logger.warning(f"Invalid acknowledgment from {peer_ip}")
-                    client_socket.close()
-                    elapsed = time.time() - start_time
-                    logger.info(f"EXIT _handle_sync_request from {peer_ip} - invalid final acknowledgment - elapsed: {elapsed:.3f}s")
+                    logger.warning(f"Invalid final acknowledgment from {peer_ip}")
                     return
                 
                 logger.info(f"Sent changes to {peer_ip}")
                 
-                # Update our logical clock based on peer's version ONLY after successful transfer
-                if 'logical_clock' in peer_version:
-                    try:
-                        self.change_tracker.update_logical_clock(peer_clock)
-                        logger.debug(f"Updated our logical clock after successful sync with peer's clock: {peer_clock}")
-                    except Exception as e:
-                        logger.error(f"Error updating logical clock: {e}")
-                
                 elapsed = time.time() - start_time
                 logger.info(f"EXIT _handle_sync_request from {peer_ip} - sent {len(changes)} changes - elapsed: {elapsed:.3f}s")
                 
-            except socket.timeout:
-                elapsed = time.time() - start_time
-                logger.error(f"Socket timeout while sending changes to {peer_ip} - elapsed: {elapsed:.3f}s")
-                client_socket.close()
-                logger.info(f"EXIT _handle_sync_request from {peer_ip} - socket timeout - elapsed: {elapsed:.3f}s")
-                return
-            except Exception as e:
-                elapsed = time.time() - start_time
-                logger.error(f"Error sending changes to {peer_ip}: {e} - elapsed: {elapsed:.3f}s")
-                client_socket.close()
-                logger.info(f"EXIT _handle_sync_request from {peer_ip} with error - elapsed: {elapsed:.3f}s")
-                return
-        else:
-            logger.info(f"No changes to send to {peer_ip}")
-            logger.debug(f"Client asked for changes since logical clock {last_clock}, but no changes were found with newer clock values")
-            
-            try:
+            else:
+                logger.info(f"No changes to send to {peer_ip}")
+                logger.debug(f"Client asked for changes since logical clock {last_clock}, but no changes were found with newer clock values")
+                
                 # Get the latest version
                 latest_version = self.change_tracker.get_db_version()
                 
@@ -621,25 +431,23 @@ class DatabaseSynchronizer:
                     False
                 )
                 client_socket.send(response)
-                
-                # Even if no changes, we successfully completed the sync, so update the clock
-                if 'logical_clock' in peer_version:
-                    try:
-                        self.change_tracker.update_logical_clock(peer_clock)
-                        logger.debug(f"Updated our logical clock after successful sync (no changes) with peer's clock: {peer_clock}")
-                    except Exception as e:
-                        logger.error(f"Error updating logical clock: {e}")
                         
                 elapsed = time.time() - start_time
                 logger.info(f"EXIT _handle_sync_request from {peer_ip} - no changes to send - elapsed: {elapsed:.3f}s")
-            except Exception as e:
-                elapsed = time.time() - start_time
-                logger.error(f"Error sending response: {e} - elapsed: {elapsed:.3f}s")
+                
+        except socket.timeout as e:
+            elapsed = time.time() - start_time
+            logger.error(f"Socket timeout while handling request from {peer_ip}: {e} - elapsed: {elapsed:.3f}s")
+        except Exception as e:
+            elapsed = time.time() - start_time
+            logger.error(f"Error handling sync request from {peer_ip}: {e} - elapsed: {elapsed:.3f}s")
+        finally:
+            # Always close the socket, regardless of what happened
+            try:
                 client_socket.close()
-                logger.info(f"EXIT _handle_sync_request from {peer_ip} with error - elapsed: {elapsed:.3f}s")
-                return
-        
-        client_socket.close()
+                logger.debug(f"Closed socket connection with {peer_ip}")
+            except Exception as e:
+                logger.warning(f"Error closing socket connection with {peer_ip}: {e}")
     
     def _handle_full_db_request(self, client_socket, message, addr):
         """Handle full database request from peer
@@ -1112,12 +920,13 @@ class DatabaseSynchronizer:
             logger.error(f"Error receiving database file: {e}")
             return 0
     
-    def _request_sync(self, peer_ip, peer_sync_port):
+    def _request_sync(self, peer_ip, peer_sync_port, last_clock):
         """Request synchronization with a peer
         
         Args:
             peer_ip: IP address of the peer
             peer_sync_port: Sync port of the peer
+            last_clock: Last logical clock from peer
         """
         logger.info(f"Requesting sync with {peer_ip}:{peer_sync_port}")
         
@@ -1153,7 +962,6 @@ class DatabaseSynchronizer:
                 
             s.settimeout(self.socket_timeout)
             
-            # Try logical clock-based sync first
             try:
                 # Create and send sync request with logical clock
                 request = self.protocol.create_sync_request(
