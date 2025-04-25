@@ -355,7 +355,7 @@ class ChangeTracker:
                     SELECT table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id
                     FROM change_log
                     WHERE logical_clock = ? AND node_id != ?
-                    ORDER BY node_id
+                    ORDER BY logical_clock, node_id
                     ''',
                     (last_clock, peer_node_id)
                 ) or []

@@ -9,6 +9,13 @@ import csv
 import threading
 import uuid
 from datetime import datetime, UTC
+import sys
+
+# Try to import gunicorn's BaseApplication
+try:
+    from gunicorn.app.base import BaseApplication
+except ImportError:
+    BaseApplication = None
 
 # Initialize Flask app and logger
 app = Flask(__name__)
@@ -41,6 +48,9 @@ def parse_args():
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind")
     parser.add_argument("--port", type=int, default=5001, help="Port to listen on")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR","CRITICAL"], help="Logging level")
+    parser.add_argument("--workers", type=int, default=1, help="Number of Gunicorn worker processes")
+    parser.add_argument("--timeout", type=int, default=30, help="Worker timeout in seconds")
+    parser.add_argument("--threads", type=int, default=1, help="Number of threads per worker")
     return parser.parse_args()
 
 # Global state for the sync service
@@ -321,6 +331,21 @@ def rpc_import_status():
     }
     return jsonify(resp)
 
+class KegDisplaySyncApplication(BaseApplication):
+    def __init__(self, app, options=None):
+        self.options = options or {}
+        self.application = app
+        super().__init__()
+    
+    def load_config(self):
+        config = {key: value for key, value in self.options.items()
+                 if key in self.cfg.settings and value is not None}
+        for key, value in config.items():
+            self.cfg.set(key.lower(), value)
+    
+    def load(self):
+        return self.application
+
 # Main entrypoint
 def main():
     global args, synced_db
@@ -330,7 +355,43 @@ def main():
     args.db_path = os.path.expanduser(args.db_path)
     synced_db = SyncedDatabase(db_path=args.db_path, broadcast_port=args.broadcast_port, sync_port=args.sync_port, test_mode=False)
     logger.info(f"Sync service running on {args.host}:{args.port}")
+    
+    # Force use of Flask development server
+    logger.info("Using Flask development server (no Gunicorn)")
     app.run(host=args.host, port=args.port, threaded=False)
+
+    # Commented out Gunicorn code
+    """
+    # Check if Gunicorn is available
+    if BaseApplication is None:
+        logger.warning("Gunicorn is not installed. Falling back to Flask development server.")
+        app.run(host=args.host, port=args.port, threaded=False)
+    else:
+        # Configure Gunicorn options
+        options = {
+            'bind': f"{args.host}:{args.port}",
+            'workers': args.workers,
+            'worker_class': 'gthread',
+            'threads': args.threads,
+            'timeout': args.timeout,
+            'worker_connections': 100,
+            'max_requests': 1000,
+            'max_requests_jitter': 50,
+            'keepalive': 2,
+            'graceful_timeout': 30,
+            'accesslog': '-',
+            'errorlog': '-',
+            'loglevel': args.log_level.lower(),
+            'capture_output': True,
+            'enable_stdio_inheritance': True,
+            'daemon': False,
+            'pidfile': None,
+        }
+        
+        # Start the Gunicorn server
+        logger.info(f"Starting Gunicorn server for sync service on {args.host}:{args.port}")
+        KegDisplaySyncApplication(app, options).run()
+    """
 
 if __name__ == "__main__":
     main() 

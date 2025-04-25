@@ -580,7 +580,7 @@ class SyncedDatabase:
                 # Add new taps with sequential IDs
                 for i in range(current_count + 1, count + 1):
                     tap_id = i
-                    success = self.db_manager.add_tap(tap_id, beer_id)
+                    success = self.db_manager.add_tap(tap_id, None)
                     if success:
                         clock = self.change_tracker.log_change("taps", "INSERT", tap_id, increment_clock=increment_clock) if not clock else clock
                         increment_clock = False
