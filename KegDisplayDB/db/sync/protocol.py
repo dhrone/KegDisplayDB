@@ -109,6 +109,23 @@ class SyncProtocol:
         return json.dumps(message).encode()
     
     @staticmethod
+    def create_error_message(error_msg: str) -> bytes:
+        """
+        Create an error message that peers can parse.
+
+        Args:
+            error_msg: Human-readable description of what went wrong.
+
+        Returns:
+            bytes: JSON-encoded error packet.
+        """
+        message = {
+            "type": "error",
+            "message": error_msg
+        }
+        return json.dumps(message).encode()
+
+    @staticmethod
     def create_full_db_request(version, sync_port):
         """Create a full database request message
         

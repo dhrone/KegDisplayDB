@@ -18,6 +18,7 @@ import traceback
 import socket
 import re
 import concurrent.futures
+import sys
 
 from concurrent.futures import Future
 from typing import Callable, TypeVar, Any, Optional
@@ -164,6 +165,11 @@ class DBService:
             raise TimeoutError(f"Database transaction timed out: {fn_name}")
 
     def shutdown(self, wait: bool = True) -> None:
+        # Check if Python is shutting down (sys.meta_path is None during shutdown)
+        if not hasattr(sys, "meta_path") or sys.meta_path is None:
+            # During shutdown, avoid logging which may cause errors
+            return
+            
         if self._shutdown_requested:
             logger.debug("DBS SHUTDOWN already requested, skipping")
             return
@@ -207,21 +213,29 @@ class DBService:
                     "DBS PROCESS EXECUTE | id=%s | waited=%.3fs | %s | %r",
                     req_id, wait_time, norm_sql, params
                 )
-                start = time.monotonic()
-                cur = self._conn.execute(sql, params)
-                sql_up = norm_sql.upper()
-                if sql_up.startswith(("SELECT", "PRAGMA")):
-                    result = cur.fetchall()
-                elif sql_up.startswith("INSERT"):
-                    result = cur.lastrowid
+                try:
+                    start = time.monotonic()
+                    self._conn.execute("BEGIN TRANSACTION;")
+                    if self._multiple_statements(sql):
+                        cur = self._conn.executescript(sql)
+                    else:
+                        cur = self._conn.execute(sql, params)
+                    sql_up = norm_sql.upper()
+                    if sql_up.startswith(("SELECT", "PRAGMA")):
+                        result = cur.fetchall()
+                    elif sql_up.startswith("INSERT"):
+                        result = cur.lastrowid
+                    else:
+                        result = cur.rowcount
                     self._conn.commit()
-                else:
-                    result = cur.rowcount
-                    self._conn.commit()
-                duration = time.monotonic() - start
-                log_fn = logger.warning if duration > 0.5 else logger.debug
-                log_fn("DBS COMPLETE EXECUTE | id=%s | duration=%.3fs", req_id, duration)
-                future.set_result(result)
+                    duration = time.monotonic() - start
+                    log_fn = logger.warning if duration > 0.5 else logger.debug
+                    log_fn("DBS COMPLETE EXECUTE | id=%s | duration=%.3fs", req_id, duration)
+                    future.set_result(result)
+                except Exception as e:
+                    self._conn.rollback()
+                    logger.exception("DBS ERROR executing: %s", sql)
+                    future.set_exception(e)
 
             elif kind == "tx":
                 fn, tx_id = payload
@@ -232,7 +246,7 @@ class DBService:
                 )
                 start = time.monotonic()
                 try:
-                    self._conn.execute("BEGIN;")
+                    self._conn.execute("BEGIN TRANSACTION;")
                     outcome = fn(self._conn)
                     self._conn.commit()
                     duration = time.monotonic() - start
@@ -268,6 +282,62 @@ class DBService:
             if delta > 2.0:
                 logger.error("DBS WATCHDOG: no requests processed in %.1fs", delta)
 
+    def _multiple_statements(self, sql: str) -> bool:
+        """
+        Check if the SQL string contains multiple statements, handling string literals properly.
+        
+        Args:
+            sql: SQL statement to check
+            
+        Returns:
+            bool: True if the SQL contains multiple statements
+        """
+        if not sql or not isinstance(sql, str):
+            return False
+        
+        # Remove SQL comments first
+        # Single-line comments (-- comment)
+        sql = re.sub(r'--.*?(\n|$)', ' ', sql)
+        # Multi-line comments (/* comment */)
+        sql = re.sub(r'/\*.*?\*/', ' ', sql, flags=re.DOTALL)
+        
+        # Parse the SQL to handle string literals correctly
+        i = 0
+        in_single_quote = False
+        in_double_quote = False
+        semicolons_outside_quotes = 0
+        
+        while i < len(sql):
+            char = sql[i]
+            
+            # Handle quotes (toggle quote state)
+            if char == "'" and not in_double_quote:
+                # Check for escaped single quote
+                if i > 0 and sql[i-1] != '\\':
+                    in_single_quote = not in_single_quote
+            elif char == '"' and not in_single_quote:
+                # Check for escaped double quote
+                if i > 0 and sql[i-1] != '\\':
+                    in_double_quote = not in_double_quote
+            
+            # Count semicolons only when outside of quotes
+            elif char == ';' and not in_single_quote and not in_double_quote:
+                semicolons_outside_quotes += 1
+                
+                # Once we find a semicolon followed by a non-whitespace character, 
+                # we can confirm it's multiple statements
+                j = i + 1
+                while j < len(sql) and sql[j].isspace():
+                    j += 1
+                    
+                if j < len(sql):
+                    # Found non-whitespace after semicolon, this is another statement
+                    return True
+            
+            i += 1
+        
+        # If we get here, either no semicolons or only trailing semicolons
+        return False
 
 
 class DatabaseManager:
@@ -297,6 +367,17 @@ class DatabaseManager:
         """Cleanup method to ensure DBService is properly shut down"""
         if hasattr(self, 'dbs') and self.dbs is not None:
             try:
+                # Check if Python is shutting down
+                if not hasattr(sys, "meta_path") or sys.meta_path is None:
+                    # During shutdown, just perform cleanup without logging
+                    if hasattr(self, 'dbs') and self.dbs is not None:
+                        try:
+                            self.dbs.shutdown(wait=False)
+                        except:
+                            pass
+                        self.dbs = None
+                    return
+                    
                 logger.debug(f"DatabaseManager.__del__ shutting down DBService for {self.db_path}")
                 self.dbs.shutdown(wait=False)  # Use non-blocking shutdown in __del__
             except Exception as e:
@@ -939,10 +1020,8 @@ class DatabaseManager:
                         # Update version table with new logical clock and timestamp
                         self.execute(
                             """
-                            BEGIN TRANSACTION;
                             UPDATE version SET timestamp = ?, hash = ?, logical_clock = ?, node_id = ?
                             WHERE id = 1;
-                            COMMIT;
                             """,
                             (timestamp, hash, logical_clock, node_id)
                         )

@@ -30,6 +30,8 @@ class ChangeTracker:
         self.db_manager = db_manager
         self.initialize_tracking()
         self.node_id = self.initialize_node_id()
+        # For cache invalidation notifications
+        self.version_cache_callbacks = []
         logger.info(f"ChangeTracker initialized with node ID: {self.node_id}")
     
     def initialize_tracking(self):
@@ -142,6 +144,23 @@ class ChangeTracker:
 
         return version_row
 
+    def register_cache_callback(self, callback):
+        """Register a callback function to be called when version changes
+        
+        Args:
+            callback: Function to call when version changes
+        """
+        if callback not in self.version_cache_callbacks:
+            self.version_cache_callbacks.append(callback)
+            
+    def notify_version_change(self):
+        """Notify all registered callbacks about a version change"""
+        for callback in self.version_cache_callbacks:
+            try:
+                callback()
+            except Exception as e:
+                logger.error(f"Error in version cache callback: {e}")
+    
     def increment_logical_clock(self, received_clock=None):
         """Increment the logical clock
         
@@ -185,6 +204,10 @@ class ChangeTracker:
             
                 self.logical_clock = new_clock
                 logger.debug(f"Incremented logical clock from {current_clock} to {new_clock}")
+                
+                # Notify any registered cache callbacks
+                self.notify_version_change()
+                
                 return new_clock
 
                 
@@ -306,6 +329,12 @@ class ChangeTracker:
                 )
         
             logger.debug(f"Logged {operation} operation on {table_name} for row {row_id} with logical clock {new_clock}")
+            
+            # Notify any registered cache callbacks if increment_clock is False
+            # (when true, it happens in increment_logical_clock)
+            if not increment_clock:
+                self.notify_version_change()
+                
             return new_clock
             
         except Exception as e:

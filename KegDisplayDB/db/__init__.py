@@ -14,6 +14,7 @@ import time
 import sqlite3
 import threading
 import socket
+import queue
 import sys
 
 logger = logging.getLogger(__name__)
@@ -25,62 +26,78 @@ class SyncedDatabase:
     synchronization components.
     """
     
-    def __init__(self, db_path, broadcast_port=5002, sync_port=5003, test_mode=False):
-        """Initialize a SyncedDatabase instance
-        
-        Args:
-            db_path: Path to the SQLite database
-            broadcast_port: Port for UDP broadcast messages
-            sync_port: Port for TCP sync connections
-            test_mode: Whether to operate in test mode (bypassing actual network operations)
-        """
-        # Using a minimal connection pool size of 1 to prevent SQLite database locking issues.
-        # SQLite has limitations when multiple connections try to write simultaneously,
-        # and larger connection pools can lead to "database is locked" errors.
-        self.db_manager = DatabaseManager(db_path, pool_size=1)  # Reduced pool size to minimize lock contention
+    def __init__(self, db_path, broadcast_port=5002, sync_port=5003,
+                 test_mode=False, notify_queue_size=100):
+        # Core components
+        self.db_manager = DatabaseManager(db_path, pool_size=1)
         self.change_tracker = ChangeTracker(self.db_manager)
         self.test_mode = test_mode
         self.test_peers = []
-        
-        if not test_mode:
+        if not self.test_mode:
             self.network = NetworkManager(broadcast_port, sync_port, self.change_tracker)
             self.synchronizer = DatabaseSynchronizer(
-                self.db_manager, 
-                self.change_tracker, 
-                self.network
+                self.db_manager, self.change_tracker, self.network
             )
-            self.synchronizer.start()
         else:
-            # Initialize synchronizer with mock network for test mode
-            # The actual NetworkManager will be mocked in tests
+            self.network = None
             self.synchronizer = None
-    
-    def __del__(self):
-        """Cleanup resources when the instance is being garbage collected"""
-        self.close()
+
+        # Notification queue with throttling
+        self._notify_queue = queue.Queue(maxsize=notify_queue_size)
+        self._notify_stop = threading.Event()
+        self._notify_worker = threading.Thread(
+            target=self._notify_worker_loop,
+            name='NotifyWorker',
+            daemon=True
+        )
+        self._notify_worker.start()
+
+    def _notify_worker_loop(self):
+        while not self._notify_stop.is_set():
+            try:
+                peer, clock = self._notify_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            try:
+                if peer:
+                    self.synchronizer.sync_now(peer=peer, clock=clock)
+                else:
+                    self.synchronizer.sync_now(clock=clock)
+            except Exception as e:
+                logger.error(f"Notify worker error: {e}")
+            finally:
+                self._notify_queue.task_done()
+
+
         
+    def start(self):
+        if not self.test_mode and self.synchronizer:
+            self.synchronizer.start()
+
     def close(self):
-        """Close database connections and cleanup resources"""
+        # Stop notify worker
+        self._notify_stop.set()
+        self._notify_worker.join(timeout=2)
+        # Stop synchronizer
+        if self.synchronizer:
+            self.synchronizer.stop()
+            self.synchronizer = None
+        # Shutdown DBService
         try:
-            # Check if Python is shutting down (sys.meta_path is None during shutdown)
-            if not hasattr(sys, "meta_path") or sys.meta_path is None:
-                logger.debug("Python is shutting down, skipping cleanup operations")
-                return
-                
-            # Stop the synchronizer if it exists
-            if not self.test_mode and hasattr(self, 'synchronizer') and self.synchronizer:
-                self.synchronizer.stop()
-                self.synchronizer = None
-                
-            # Close database manager if it exists
-            if hasattr(self, 'db_manager') and self.db_manager:
-                # Remove reference to allow garbage collection
-                db_manager = self.db_manager
-                self.db_manager = None
-                
-                # Let garbage collector handle the rest
+            if hasattr(self.db_manager, 'dbs') and self.db_manager.dbs:
+                self.db_manager.dbs.shutdown(wait=True)
         except Exception as e:
-            logger.error(f"Error in SyncedDatabase.close(): {e}")
+            logger.error(f"Error shutting down DBService: {e}")
+        finally:
+            self.db_manager = None
+            self.network = None
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
     
     def add_test_peer(self, peer):
         """Add a peer for test mode synchronization"""
@@ -88,40 +105,33 @@ class SyncedDatabase:
             self.test_peers.append(peer)
             peer.test_peers.append(self)
     
+    # ---- Notification API ----
     def notify_update(self, clock=None):
-        """Notify other instances that a change has been made"""
+        """Enqueue a sync notification or perform direct sync in test mode."""
+        if self.test_mode:
+            for peer_db in self.test_peers:
+                if peer_db is not self and peer_db.synchronizer:
+                    peer_db.synchronizer.sync_now(peer=peer_db.synchronizer, clock=clock)
+            return
+        # Production: enqueue, drop if queue full
         try:
-            if self.test_mode:
-                # In test mode, directly sync with test peers
-                for peer in self.test_peers:
-                    try:
-                        if peer != self and hasattr(peer, 'synchronizer') and peer.synchronizer:
-                            # Only sync with peer if both have synchronizers
-                            if hasattr(self, 'synchronizer') and self.synchronizer:
-                                self.synchronizer._sync_with_peer(peer, clock)
-                    except Exception as e:
-                        logger.error(f"Error syncing with test peer: {e}")
-            else:
-                # Use synchronizer to broadcast update if available
-                if hasattr(self, 'synchronizer') and self.synchronizer:
-                    try:
-                        # Give a short timeout for network operations
-                        notify_thread = threading.Thread(
-                            target=self._notify_update_with_timeout,
-                            kwargs={'clock': clock},
-                            daemon=True
-                        )
-                        notify_thread.start()
-                        notify_thread.join(timeout=2.0)  # Wait up to 2 seconds
-                        
-                        # Log success
-                        logger.info("Update notification broadcast complete or timed out")
-                    except Exception as e:
-                        logger.error(f"Error starting notification thread: {e}")
-                else:
-                    logger.warning("Notification skipped: no synchronizer available")
-        except Exception as e:
-            logger.error(f"Error in notify_update: {e}")
+            self._notify_queue.put((None, clock), block=False)
+        except queue.Full:
+            logger.warning("Notify queue full; dropping update notification")
+
+    def sync_now(self, peer=None, clock=None):
+        """Public sync API: unify production broadcast and test-mode peer sync.
+
+        Args:
+            peer: Optional peer DatabaseSynchronizer (for direct sync in tests)
+            clock: Optional logical clock value to use (forwarded to notify)
+        """
+        if peer is not None:
+            # Test-mode path: sync directly with this peer's state
+            self._sync_with_peer(peer)
+        else:
+            # Production path: broadcast to all peers
+            self.notify_update(clock)
     
     def _notify_update_with_timeout(self, clock=None):
         """Execute the notification with timeout protection"""
@@ -144,118 +154,39 @@ class SyncedDatabase:
     
     # ---- Beer Management Methods ----
     
-    def add_beer(self, name, abv=None, ibu=None, color=None, og=None, fg=None, 
-                description=None, brewed=None, kegged=None, tapped=None, notes=None, notify=True):
-        """
-        Add a new beer to the database
-        
-        Args:
-            name: Beer name (required)
-            abv: Alcohol by volume (optional)
-            ibu: International bitterness units (optional)
-            color: Beer color (optional)
-            og: Original gravity (optional)
-            fg: Final gravity (optional)
-            description: Beer description (optional)
-            brewed: Date brewed (optional)
-            kegged: Date kegged (optional)
-            tapped: Date tapped (optional)
-            notes: Additional notes (optional)
-            notify: Whether to notify peers about this change (default: True)
-            conn: Database connection to use (optional)
-            
-        Returns:
-            beer_id: ID of the added beer
-        """
+    def add_beer(self, name, abv=None, ibu=None, color=None, og=None, fg=None,
+                 description=None, brewed=None, kegged=None, tapped=None,
+                 notes=None, notify=True):
+        beer_id = self.db_manager.add_beer(
+            name, abv, ibu, color, og, fg,
+            description, brewed, kegged, tapped, notes
+        )
+        clock = self.change_tracker.log_change("beers", "INSERT", beer_id)
+        if notify:
+            self.notify_update(clock)
+        return beer_id
 
-        try:
-            beer_id = self.db_manager.add_beer(name, abv, ibu, color, og, fg, 
-                                                description, brewed, kegged, tapped, notes)
-                                      
-            clock = self.change_tracker.log_change("beers", "INSERT", beer_id)
-            
-            if notify:
-                self.notify_update(clock)
-            
-            return beer_id
-        
-        except Exception as e:
-            logger.error(f"Error adding beer: {e}")
-            return None
-    
-    def update_beer(self, beer_id, name=None, abv=None, ibu=None, color=None, og=None, fg=None,
-                   description=None, brewed=None, kegged=None, tapped=None, notes=None, notify=True):
-        """
-        Update an existing beer in the database
-        
-        Args:
-            beer_id: ID of the beer to update
-            name: Beer name (optional)
-            abv: Alcohol by volume (optional)
-            ibu: International bitterness units (optional)
-            color: Beer color (optional)
-            og: Original gravity (optional)
-            fg: Final gravity (optional)
-            description: Beer description (optional)
-            brewed: Date brewed (optional)
-            kegged: Date kegged (optional)
-            tapped: Date tapped (optional)
-            notes: Additional notes (optional)
-            notify: Whether to notify peers about this change (default: True)
-            
-        Returns:
-            bool: Success or failure
-        """
-        try:
-            success = self.db_manager.update_beer(beer_id, name, abv, ibu, color, 
-                                                  og, fg, description, brewed, 
-                                                  kegged, tapped, notes)
-                                                    
-            if success:
-                clock = self.change_tracker.log_change("beers", "UPDATE", beer_id)
-                
-                if notify:
-                    self.notify_update(clock)
-                    
-            return success
-        except Exception as e:
-            logger.error(f"Error updating beer {beer_id}: {e}")
+    def update_beer(self, beer_id, **kwargs):
+        success = self.db_manager.update_beer(beer_id, **kwargs)
+        if not success:
             return False
-    
+        clock = self.change_tracker.log_change("beers", "UPDATE", beer_id)
+        if kwargs.get('notify', True):
+            self.notify_update(clock)
+        return True
+
     def delete_beer(self, beer_id, notify=True):
-        """
-        Delete a beer from the database
-        
-        Args:
-            beer_id: ID of the beer to delete
-            notify: Whether to notify peers about this change (default: True)
-            
-        Returns:
-            bool: Success or failure
-        """
-        try:
-            # Get taps with this beer before deleting (so we can update them)
-            tap_ids = self.db_manager.get_tap_with_beer(beer_id)
-            
-            # Delete the beer
-            success = self.db_manager.delete_beer(beer_id)
-            if success:
-                clock = self.change_tracker.log_change("beers", "DELETE", beer_id)
-
-                # Update any taps that had this beer to have None
-                if tap_ids:
-                    for tap_id in tap_ids:
-                        update_success = self.db_manager.update_tap(tap_id, None)
-                        if update_success:
-                            self.change_tracker.log_change("taps", "UPDATE", tap_id, increment_clock=False)
-                
-                if notify:
-                    self.notify_update(clock)
-                        
-                return success
-        except Exception as e:
-            logger.error(f"Error deleting beer {beer_id}: {e}")
+        tap_ids = self.db_manager.get_tap_with_beer(beer_id)
+        success = self.db_manager.delete_beer(beer_id)
+        if not success:
             return False
+        clock = self.change_tracker.log_change("beers", "DELETE", beer_id)
+        for t in tap_ids:
+            self.db_manager.update_tap(t, None)
+            self.change_tracker.log_change("taps", "UPDATE", t, increment_clock=False)
+        if notify:
+            self.notify_update(clock)
+        return True
     
     def get_beer(self, beer_id):
         """
@@ -289,78 +220,29 @@ class SyncedDatabase:
     # ---- Tap Management Methods ----
     
     def add_tap(self, tap_id=None, beer_id=None, notify=True):
-        """
-        Add a new tap to the database
-        
-        Args:
-            tap_id: Optional tap ID (auto-assigned if not provided)
-            beer_id: Optional beer ID to assign to this tap
-            notify: Whether to notify peers about this change (default: True)
-            
-        Returns:
-            int: ID of the new tap or None if failed
-        """
-        try:
-            tap_id = self.db_manager.add_tap(tap_id, beer_id)
-            if tap_id:
-                clock = self.change_tracker.log_change("taps", "INSERT", tap_id)
-                
-                if notify:
-                    self.notify_update(clock)
-                    
-            return tap_id
-        except Exception as e:
-            logger.error(f"Error adding tap: {e}")
-            return None
-    
+        new_tap = self.db_manager.add_tap(tap_id, beer_id)
+        clock = self.change_tracker.log_change("taps", "INSERT", new_tap)
+        if notify:
+            self.notify_update(clock)
+        return new_tap
+
     def update_tap(self, tap_id, beer_id, notify=True):
-        """
-        Update a tap's beer assignment
-        
-        Args:
-            tap_id: ID of the tap to update
-            beer_id: ID of beer to assign (or None to clear)
-            notify: Whether to notify peers about this change (default: True)
-            
-        Returns:
-            bool: Success or failure
-        """
-        try:
-            success = self.db_manager.update_tap(tap_id, beer_id)
-            if success:
-                clock = self.change_tracker.log_change("taps", "UPDATE", tap_id)
-                
-                if notify:
-                    self.notify_update(clock)
-                    
-            return success
-        except Exception as e:
-            logger.error(f"Error updating tap {tap_id}: {e}")
+        success = self.db_manager.update_tap(tap_id, beer_id)
+        if not success:
             return False
-    
+        clock = self.change_tracker.log_change("taps", "UPDATE", tap_id)
+        if notify:
+            self.notify_update(clock)
+        return True
+
     def delete_tap(self, tap_id, notify=True):
-        """
-        Delete a tap from the database
-        
-        Args:
-            tap_id: ID of the tap to delete
-            notify: Whether to notify peers about this change (default: True)
-            
-        Returns:
-            bool: Success or failure
-        """
-        try:
-            success = self.db_manager.delete_tap(tap_id)
-            if success:
-                clock = self.change_tracker.log_change("taps", "DELETE", tap_id)
-                
-                if notify:
-                    self.notify_update(clock)
-                    
-            return success
-        except Exception as e:
-            logger.error(f"Error deleting tap {tap_id}: {e}")
+        success = self.db_manager.delete_tap(tap_id)
+        if not success:
             return False
+        clock = self.change_tracker.log_change("taps", "DELETE", tap_id)
+        if notify:
+            self.notify_update(clock)
+        return True
     
     def get_tap(self, tap_id):
         """
@@ -454,7 +336,7 @@ class SyncedDatabase:
         try:
             # Clear all existing beer related data
             try:
-                self.db_manager.execute("BEGIN TRANSACTION; DELETE FROM beers; DELETE FROM taps; COMMIT;")
+                self.db_manager.execute("DELETE FROM beers; DELETE FROM taps")
             except Exception as e:
                 logger.error(f"Error clearing beer related data: {e}")
                 return (0, ["Failed to clear beer related data"])

@@ -8,6 +8,7 @@ import logging
 import threading
 import time
 import json
+import sys
 
 logger = logging.getLogger("KegDisplay")
 
@@ -91,6 +92,11 @@ class NetworkManager:
     
     def stop(self):
         """Stop the network manager and close sockets"""
+        # Check if Python is shutting down
+        if not hasattr(sys, "meta_path") or sys.meta_path is None:
+            # During shutdown, avoid logging which may cause errors
+            return
+            
         logger.info("Stopping network manager")
         self.running = False
         
