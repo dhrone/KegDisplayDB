@@ -1251,9 +1251,11 @@ class DatabaseManager:
             
             # Define the import function that will run in a transaction
             def perform_import(conn):
+                temp_db_attached = False
                 try:
                     # Attach the temporary database
                     conn.execute(f"ATTACH DATABASE '{abs_temp_path}' AS temp_db")
+                    temp_db_attached = True
                     
                     # Check if required tables exist in the temp database
                     cursor = conn.execute("SELECT name FROM temp_db.sqlite_master WHERE type='table' AND (name='beers' OR name='taps')")
@@ -1261,7 +1263,6 @@ class DatabaseManager:
                     
                     if 'beers' not in tables or 'taps' not in tables:
                         logger.error("Import failed: Required tables not found in source database")
-                        conn.execute("DETACH DATABASE temp_db")
                         return False
                     
                     # Get our local node_id
@@ -1337,6 +1338,7 @@ class DatabaseManager:
                     
                     # Detach the temporary database
                     conn.execute("DETACH DATABASE temp_db")
+                    temp_db_attached = False
                     
                     # Count imported records
                     cursor = conn.execute("SELECT COUNT(*) FROM beers")
@@ -1350,19 +1352,35 @@ class DatabaseManager:
                     
                 except Exception as e:
                     # Make sure to detach the database even if an error occurs
-                    try:
-                        conn.execute("DETACH DATABASE IF EXISTS temp_db")
-                    except:
-                        pass
+                    if temp_db_attached:
+                        try:
+                            conn.execute("DETACH DATABASE temp_db")
+                        except Exception as detach_err:
+                            logger.error(f"Failed to detach temp_db after error: {detach_err}")
                     logger.error(f"Error during database import transaction: {e}")
                     return False
             
             # Execute the import using DBService transaction
             result = self.dbs.run_in_transaction(perform_import)
+            
+            # Remove temporary file after successful import or failure
+            try:
+                if os.path.exists(temp_db_path):
+                    os.remove(temp_db_path)
+                    logger.debug(f"Removed temporary database file: {temp_db_path}")
+            except Exception as e:
+                logger.warning(f"Failed to remove temporary database file: {e}")
+                
             return result
                 
         except Exception as e:
             logger.error(f"Error importing database: {e}")
+            # Try to clean up temp file on exception
+            try:
+                if os.path.exists(temp_db_path):
+                    os.remove(temp_db_path)
+            except:
+                pass
             return False
     
     def _create_backup_before_import(self, error_backup=False):

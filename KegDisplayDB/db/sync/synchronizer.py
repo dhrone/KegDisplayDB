@@ -12,6 +12,8 @@ import socket
 import json
 from datetime import datetime, UTC
 import sys
+import uuid
+import sqlite3
 
 from .protocol import SyncProtocol
 
@@ -369,12 +371,56 @@ class DatabaseSynchronizer:
         if not sizeb: return 0
         total = int.from_bytes(sizeb,'big')
         got = 0
-        with open(output_path,'wb') as f:
-            while got < total:
-                seg = sock.recv(min(self.chunk_size, total-got))
-                if not seg: break
-                f.write(seg)
-                got += len(seg)
+        
+        # Create a temporary file with a unique name to avoid conflicts
+        output_dir = os.path.dirname(output_path)
+        temp_name = f"temp_recv_{uuid.uuid4().hex[:8]}.db"
+        temp_path = os.path.join(output_dir, temp_name)
+        
+        try:
+            with open(temp_path, 'wb') as f:
+                while got < total:
+                    seg = sock.recv(min(self.chunk_size, total-got))
+                    if not seg: break
+                    f.write(seg)
+                    got += len(seg)
+            
+            # Basic validation that the file is a SQLite database
+            if got > 0:
+                try:
+                    # Try to open the database just to validate it
+                    test_conn = sqlite3.connect(temp_path)
+                    # Check if there's at least one table
+                    cursor = test_conn.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1")
+                    has_tables = cursor.fetchone() is not None
+                    test_conn.close()
+                    
+                    if not has_tables:
+                        logger.error("Received file is not a valid SQLite database or has no tables")
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                        return 0
+                    
+                    # If validation passed, move the file to its final location
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                    shutil.move(temp_path, output_path)
+                    logger.info(f"Successfully received and validated database file ({got} bytes)")
+                    
+                except Exception as e:
+                    logger.error(f"Database validation failed: {e}")
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    return 0
+        except Exception as e:
+            logger.error(f"Error receiving database file: {e}")
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+            return 0
+            
         return got
 
     # ——— Outbound sync & full‐DB requests ———
@@ -462,55 +508,111 @@ class DatabaseSynchronizer:
             return True
             
         backup = None
+        temp_file = None
+        conn_socket = None
+        
         if os.path.exists(self.db_manager.db_path):
             backup = self._backup_database()
+            if not backup:
+                logger.error("Failed to create backup before requesting full database, aborting")
+                return False
+                
         try:
+            # Clean up any existing temp file
+            temp_file = f"{self.db_manager.db_path}.temp"
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                    logger.debug(f"Removed existing temp file: {temp_file}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove existing temp file: {e}")
+                    # If we can't remove it, generate a unique temp file path
+                    temp_file = f"{self.db_manager.db_path}.temp_{uuid.uuid4().hex[:8]}"
+            
             # Set a connection timeout to prevent hanging in tests or other scenarios
             connection_timeout = 3.0  # 3 seconds should be enough for tests and quick enough for production
             
-            s = self.network.connect_to_peer(peer_ip, peer_port, timeout=connection_timeout)
-            if not s: return False
-            s.settimeout(self.socket_timeout)
+            conn_socket = self.network.connect_to_peer(peer_ip, peer_port, timeout=connection_timeout)
+            if not conn_socket: 
+                logger.error(f"Failed to connect to peer {peer_ip}:{peer_port}")
+                return False
+                
+            conn_socket.settimeout(self.socket_timeout)
             version = self._update_version_cache()
             req = self.protocol.create_full_db_request(version, self.network.sync_port)
-            s.sendall(req)
-            msg = self._recv_message(s)
+            conn_socket.sendall(req)
+            
+            msg = self._recv_message(conn_socket)
             if msg.get('type')!='full_db_response':
+                logger.error(f"Received unexpected response type: {msg.get('type')}")
                 raise Exception("Bad full_db_response")
+                
             size = msg.get('db_size',0)
-            s.sendall(self.protocol.create_ack_message())
-            tmp = f"{self.db_manager.db_path}.temp"
-            got = self._receive_database_file(s,tmp)
-            if got==size:
-                success = self.db_manager.import_from_file(tmp)
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-                if success:
-                    self.change_tracker.initialize_tracking()
-                    self._invalidate_version_cache()
-                    return True
-            if backup:
-                self._restore_database(backup)
+            if size <= 0:
+                logger.warning(f"Peer reports database size of {size} bytes, skipping download")
+                return False
+                
+            conn_socket.sendall(self.protocol.create_ack_message())
+            got = self._receive_database_file(conn_socket, temp_file)
+            
+            if got == 0 or got != size:
+                logger.error(f"Database transfer failed: received {got} bytes out of {size}")
+                return False
+                
+            success = self.db_manager.import_from_file(temp_file)
+            
+            # The import_from_file now handles temp file cleanup, but add a fallback check
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except Exception as e:
+                    logger.warning(f"Failed to remove temp file after import: {e}")
+            
+            if success:
+                self.change_tracker.initialize_tracking()
                 self._invalidate_version_cache()
-            return False
+                logger.info(f"Successfully imported full database from {peer_ip}")
+                return True
+            else:
+                logger.error(f"Failed to import database from {peer_ip}")
+                if backup:
+                    logger.info("Attempting to restore from backup")
+                    self._restore_database(backup)
+                    self._invalidate_version_cache()
+                return False
+                
         except socket.timeout:
             logger.warning(f"Socket timeout connecting to peer {peer_ip}:{peer_port}")
             if backup:
+                logger.info("Socket timeout occurred, restoring from backup")
                 self._restore_database(backup)
                 self._invalidate_version_cache()
             return False
+            
         except Exception as e:
             logger.exception(f"Error in _request_full_database: {e}")
             if backup:
+                logger.info(f"Error occurred: {e}, restoring from backup")
                 self._restore_database(backup)
                 self._invalidate_version_cache()
             return False
+            
         finally:
-            try: 
-                if 's' in locals() and s:
-                    s.close()
-            except: 
-                pass
+            # Clean up resources
+            try:
+                if conn_socket:
+                    conn_socket.close()
+                    logger.debug("Closed connection socket")
+            except Exception as e:
+                logger.warning(f"Error closing socket: {e}")
+                
+            # If temp_file still exists at this point, try to clean it up
+            try:
+                if temp_file and os.path.exists(temp_file):
+                    os.remove(temp_file)
+                    logger.debug(f"Removed temporary file in finally block: {temp_file}")
+            except Exception as e:
+                logger.warning(f"Failed to remove temporary file in finally block: {e}")
 
     # ——— Rotate backups ———
     
@@ -539,13 +641,41 @@ class DatabaseSynchronizer:
         if not bk or bk=="_TESTONLY_backup": return True
         if not os.path.exists(bk): return False
         try:
-            success = self.db_manager.import_from_file(bk)
+            # Ensure any leftover temporary files are cleaned up
+            tmp_path = f"{self.db_manager.db_path}.temp"
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                    logger.info(f"Removed leftover temporary database file: {tmp_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove leftover temporary file: {e}")
+            
+            # Create a unique temporary file for the restoration to avoid conflicts
+            restore_tmp = f"{self.db_manager.db_path}.restore_{uuid.uuid4().hex[:8]}"
+            
+            # Copy backup to the temporary file
+            shutil.copy2(bk, restore_tmp)
+            
+            # Import from the temporary file
+            success = self.db_manager.import_from_file(restore_tmp)
+            
+            # Clean up temporary file
+            if os.path.exists(restore_tmp):
+                try:
+                    os.remove(restore_tmp)
+                except Exception:
+                    logger.warning(f"Could not remove temporary restore file: {restore_tmp}")
+            
             if success:
                 self.change_tracker.initialize_tracking()
                 self._invalidate_version_cache()
+                logger.info("Successfully restored database from backup")
+            else:
+                logger.error("Failed to restore database from backup")
+            
             return success
-        except:
-            logger.exception("Restore failed")
+        except Exception as e:
+            logger.exception(f"Restore failed: {e}")
             return False
                 
     def _remove_backup(self, bk):
