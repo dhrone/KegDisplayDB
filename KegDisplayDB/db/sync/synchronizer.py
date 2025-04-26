@@ -440,19 +440,20 @@ class DatabaseSynchronizer:
         # clock seen in broadcast, we might have missed updates 
         # in between. Request all changes from the beginning to ensure
         # we don't miss anything.
-        our_peer_data = self.peers.get(peer_ip, ({}, 0, 0))
-        peer_latest_clock = our_peer_data[0].get('logical_clock', 0)
-        
-        if peer_latest_clock > our_clock:
-            logger.info(f"Our clock ({our_clock}) is behind peer's ({peer_latest_clock}), requesting full sync from beginning")
-            last_clock = 0
+
+        # disable this for now
+        #our_peer_data = self.peers.get(peer_ip, ({}, 0, 0))
+        #peer_latest_clock = our_peer_data[0].get('logical_clock', 0)
+        #if peer_latest_clock > our_clock:
+        #    logger.info(f"Our clock ({our_clock}) is behind peer's ({peer_latest_clock}), requesting full sync from beginning")
+        #    last_clock = 0
         
         logger.info(f"Requesting changes from {peer_ip} since clock {last_clock}")
 
-        backup = self._backup_database()
-        if not backup:
-            logger.error("Backup failed; aborting sync")
-            return
+        #backup = self._backup_database()
+        #if not backup:
+        #    logger.error("Backup failed; aborting sync")
+        #    return
 
         s = None
         try:
@@ -682,24 +683,37 @@ class DatabaseSynchronizer:
     # ——— Peer discovery & heartbeats ———
     
     def _initial_peer_discovery(self):
+
+        EMPTY_DB_HASH = 'd751713988987e9331980363e24189ce'
+
         version = self._update_version_cache(force=True)
         msg = self.protocol.create_discovery_message(version, self.network.sync_port)
         self.network.send_broadcast(msg)
         time.sleep(5)
         
-        # find newest peer
+        # Find newest peer
         ov = self._update_version_cache()
         best_ip, best_ver, best_clk = None, ov, ov.get('logical_clock',0)
         empty = self.change_tracker.is_database_empty()
+        peer_has_data = False
+        
         with self.lock:
             for ip,(v,_,p) in self.peers.items():
+                # Check if peer has a non-empty database (hash won't be 0 or empty)
+                peer_hash = v.get('hash', '0')
+                if peer_hash != EMPTY_DB_HASH and peer_hash != '0' and peer_hash != '':
+                    peer_has_data = True
+                
                 clk = v.get('logical_clock',0)
                 if (v.get('hash')!=ov.get('hash')
                     and (empty or clk>best_clk
                          or (clk==best_clk and self.change_tracker.is_newer_version(v,best_ver)))):
                     best_ip, best_ver, best_clk = ip, v, clk
         
-        if best_ip:
+        # Only proceed if we found a best peer AND either:
+        # 1. Our database is empty and the peer has data, OR
+        # 2. The peer has a better version than us
+        if best_ip and (empty and peer_has_data or not empty):
             # Clear the database and change log first
             def tx(c):
                 c.execute("DELETE FROM taps;")
@@ -719,6 +733,8 @@ class DatabaseSynchronizer:
             # Request sync from the beginning (last_clock=0)
             logger.info(f"Requesting incremental sync from the beginning from {best_ip}")
             self._request_sync(best_ip, self.peers[best_ip][2], 0)
+        elif empty:
+            logger.info("All peers have empty databases. Waiting for data to be available.")
     
     def _heartbeat_sender(self):
         while self.running:
