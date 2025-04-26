@@ -10,6 +10,7 @@ import threading
 import uuid
 from datetime import datetime, UTC
 import sys
+import atexit
 
 # Try to import gunicorn's BaseApplication
 try:
@@ -354,7 +355,17 @@ def main():
     logger.setLevel(getattr(logging, args.log_level))
     args.db_path = os.path.expanduser(args.db_path)
     synced_db = SyncedDatabase(db_path=args.db_path, broadcast_port=args.broadcast_port, sync_port=args.sync_port, test_mode=False)
+    synced_db.start()  # Start the synchronization system
     logger.info(f"Sync service running on {args.host}:{args.port}")
+    
+    # Register cleanup handler
+    def cleanup():
+        logger.info("Shutting down sync service...")
+        if synced_db:
+            synced_db.close()
+        logger.info("Sync service shutdown complete")
+    
+    atexit.register(cleanup)
     
     # Force use of Flask development server
     logger.info("Using Flask development server (no Gunicorn)")
