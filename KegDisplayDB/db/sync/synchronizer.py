@@ -193,7 +193,8 @@ class DatabaseSynchronizer:
             self.peers[peer_ip] = (pv, time.time(), port)
 
         # Lamport receive
-        self.change_tracker.update_logical_clock(pCLK)
+        if message_type == 'update':
+            self.change_tracker.update_logical_clock(pCLK)
 
         # decide sync
         sync = False
@@ -205,16 +206,12 @@ class DatabaseSynchronizer:
         clock_gap = pCLK - last_clk
         our_clock_gap = pCLK - oCLK
         
-        if clock_gap > 20 or (our_clock_gap > 0 and message_type == 'update'):
-            # We're significantly behind this peer's updates or this is an update message
-            # and we have a lower clock, so get the full database
-            logger.info(f"Clock gap with peer {peer_ip} is significant (gap={clock_gap}, our gap={our_clock_gap}), requesting full database")
-            sync = True
-            use_full_db = True
-        elif pCLK > last_clk:
+ 
+        if pCLK > last_clk:
             sync = True
         elif pCLK == oCLK and pHASH != oHASH:
             if self.change_tracker.is_newer_version(pv, ov):
+                logger.info(f"Peer {peer_ip} has a newer version, requesting full database")
                 sync = True
                 def tx(c):
                     c.execute("DELETE FROM taps;")
@@ -228,10 +225,6 @@ class DatabaseSynchronizer:
                 self._invalidate_version_cache()
 
         if sync:
-            if use_full_db:
-                logger.info(f"Requesting full database from {peer_ip}")
-                self._request_full_database(peer_ip, port)
-            else:
                 logger.info(f"Triggering sync from {peer_ip}")
                 self._request_sync(peer_ip, port, last_clk)
 
@@ -689,12 +682,11 @@ class DatabaseSynchronizer:
     # ——— Peer discovery & heartbeats ———
     
     def _initial_peer_discovery(self):
-        # bump
-        self.change_tracker.increment_logical_clock()
         version = self._update_version_cache(force=True)
         msg = self.protocol.create_discovery_message(version, self.network.sync_port)
         self.network.send_broadcast(msg)
         time.sleep(5)
+        
         # find newest peer
         ov = self._update_version_cache()
         best_ip, best_ver, best_clk = None, ov, ov.get('logical_clock',0)
@@ -706,13 +698,31 @@ class DatabaseSynchronizer:
                     and (empty or clk>best_clk
                          or (clk==best_clk and self.change_tracker.is_newer_version(v,best_ver)))):
                     best_ip, best_ver, best_clk = ip, v, clk
+        
         if best_ip:
-            self._request_full_database(best_ip, self.peers[best_ip][2])
+            # Clear the database and change log first
+            def tx(c):
+                c.execute("DELETE FROM taps;")
+                c.execute("DELETE FROM beers;")
+                c.execute("DELETE FROM change_log;")
+                return True
+            self.db_manager.transaction(tx)
+            
+            # Clear the peers except for the best one
+            with self.lock:
+                self.peers.clear()
+                self.peers[best_ip] = (best_ver, time.time(), self.peers[best_ip][2])
+            
+            # Invalidate the version cache
+            self._invalidate_version_cache()
+            
+            # Request sync from the beginning (last_clock=0)
+            logger.info(f"Requesting incremental sync from the beginning from {best_ip}")
+            self._request_sync(best_ip, self.peers[best_ip][2], 0)
     
     def _heartbeat_sender(self):
         while self.running:
             try:
-                self.change_tracker.increment_logical_clock()
                 ver = self._update_version_cache(force=True)
                 msg = self.protocol.create_heartbeat_message(ver, self.network.sync_port)
                 
@@ -772,6 +782,7 @@ class DatabaseSynchronizer:
             self.db_manager.apply_sync_changes(changes)
         self.change_tracker.update_logical_clock(pv.get('logical_clock',0))
 
+    '''
     def _find_latest_peer(self):
         ov = self._update_version_cache()
         best_ip, best_clk = None, ov.get('logical_clock',0)
@@ -783,6 +794,7 @@ class DatabaseSynchronizer:
                     best_ip, best_clk = ip, clk
         if best_ip:
             self._request_full_database(best_ip, self.peers[best_ip][2])
+    '''
 
     def _daily_backup_thread(self):
         while self.running:
