@@ -113,14 +113,6 @@ class ChangeTracker:
             logger.warning(f"Using temporary node ID: {temp_id}")
             return temp_id
     
-    def get_logical_clock(self):
-        """Get the logical clock value
-        
-        Returns:
-            int: Logical clock value
-        """
-
-        return self.db_manager.execute("SELECT logical_clock FROM version WHERE id = 1")[0]
 
     def get_current_clock(self):
         """Get the current logical clock value
@@ -133,16 +125,6 @@ class ChangeTracker:
         current_clock_row = current_clock_row[0] if current_clock_row else (-1,)
         return current_clock_row[0]
     
-    def get_current_version(self):
-        """Get the current version
-        
-        Returns:
-            dict: Current version information
-        """
-        version_row = self.db_manager.execute("SELECT timestamp, hash, logical_clock, node_id FROM version WHERE id = 1")
-        version_row = version_row[0] if version_row else ('', '', -1, 'None')
-
-        return version_row
 
     def register_cache_callback(self, callback):
         """Register a callback function to be called when version changes
@@ -185,9 +167,10 @@ class ChangeTracker:
             if current_clock <0:
                 # Insert new version record if none exists
                 self.db_manager.execute(
-                    "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
-                    (timestamp, content_hash, new_clock, self.node_id)
+                    "INSERT INTO version (id, timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?, ?)",
+                    (1, timestamp, content_hash, new_clock, self.node_id)
                 )
+                log_message = f"Incremented a new logical clock to {new_clock}"
             else:
                 # Update existing version record
                 self.db_manager.execute(
@@ -201,14 +184,14 @@ class ChangeTracker:
                     """,
                     (timestamp, content_hash, new_clock, self.node_id)
                 )
+                log_message = f"Incremented logical clock from {current_clock} to {new_clock}"
+            self.logical_clock = new_clock
+            logger.debug(log_message)
             
-                self.logical_clock = new_clock
-                logger.debug(f"Incremented logical clock from {current_clock} to {new_clock}")
-                
-                # Notify any registered cache callbacks
-                self.notify_version_change()
-                
-                return new_clock
+            # Notify any registered cache callbacks
+            self.notify_version_change()
+            
+            return new_clock
 
                 
         except Exception as e:
@@ -263,84 +246,66 @@ class ChangeTracker:
             self.initialize_tracking()
             self.node_id = self.initialize_node_id()
     
-    def log_change(self, table_name, operation, row_id, increment_clock=True, record_node_id=None):
-        """Log a database change with Lamport logical clock
-        
-        Args:
-            table_name: Name of the table that changed
-            operation: Operation type (INSERT, UPDATE, DELETE)
-            row_id: ID of the row that changed
-            record_node_id: Node ID of the node that recorded the change
-            conn: Optional database connection to use within an existing transaction
-            
-        Note:
-            This implements the Lamport Clock protocol for local DB updates as specified:
-            1. Increment the logical clock (localClock += 1)
-            2. Log the change with the new clock value
-            3. Update the version table with the new clock value
+    def log_change(self, table_name, operation, row_id,
+                   increment_clock=True, record_node_id=None):
         """
-        try:
-            # Use transaction to ensure atomicity of the entire operation
-           
-            if increment_clock:
-            # Increment logical clock for this operation
-                new_clock = self.increment_logical_clock()
-            else:
-                new_clock = self.get_current_clock()
-            
-            # Get content for the row
-            content = self._get_row_content(table_name, row_id)
-            content_hash = hashlib.md5(content.encode()).hexdigest()
-            timestamp = datetime.now(UTC).isoformat()
+        Atomically log a database change and bump the Lamport clock,
+        then notify any version‐cache listeners.
+        """
+        # 1. Compute new logical clock in‐memory
+        current_clock = self.get_current_clock()
+        new_clock = (max(current_clock, 0) + 1) if increment_clock else current_clock
 
-            # If no node ID is provided, use our own node ID
-            if record_node_id is None:
-                record_node_id = self.node_id
-                logger.debug(f"Using local node ID for change log: {record_node_id}")
-            else:
-                logger.debug(f"Using provided node ID for change log: {record_node_id}")
-            
-            # Log the change with logical clock and node ID
-            self.db_manager.execute(
+        # 2. Capture row content & hashes up front
+        content = self._get_row_content(table_name, row_id)
+        content_hash = hashlib.md5(content.encode()).hexdigest()
+        timestamp = datetime.now(UTC).isoformat()
+        if record_node_id is None:
+            record_node_id = self.node_id
+
+        # 3. Compute overall DB content hash
+        db_content_hash = self._calculate_content_hash()
+
+        # 4. Wrap both writes in one transaction
+        def _txn(conn):
+            # insert into change_log
+            conn.execute(
                 """
-                INSERT INTO change_log 
-                (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
+                INSERT INTO change_log
+                  (table_name, operation, row_id, timestamp,
+                   content, content_hash, logical_clock, node_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (table_name, operation, row_id, timestamp, content, content_hash, new_clock, record_node_id)
+                (table_name, operation, row_id,
+                 timestamp, content, content_hash,
+                 new_clock, record_node_id)
             )
-            
-            # Calculate a fresh database content hash
-            db_content_hash = self._calculate_content_hash()
-            
-            # Update version table with new logical clock and all other fields
-            version_update_result = self.db_manager.execute(
+            # update (or insert) version row
+            cur = conn.execute(
                 """
-                UPDATE version SET timestamp = ?, hash = ?, logical_clock = ?, node_id = ? WHERE id = 1
+                UPDATE version
+                   SET timestamp     = ?,
+                       hash          = ?,
+                       logical_clock = ?,
+                       node_id       = ?
+                 WHERE id = 1
                 """,
                 (timestamp, db_content_hash, new_clock, self.node_id)
             )
-            
-            # If no rows were updated, insert a new row
-            if version_update_result == 0:
-                self.db_manager.execute(
+            if cur.rowcount == 0:
+                conn.execute(
                     "INSERT INTO version (timestamp, hash, logical_clock, node_id) VALUES (?, ?, ?, ?)",
-                    (timestamp, db_content_hash, new_clock, self.node_id),
+                    (timestamp, db_content_hash, new_clock, self.node_id)
                 )
-        
-            logger.debug(f"Logged {operation} operation on {table_name} for row {row_id} with logical clock {new_clock}")
-            
-            # Notify any registered cache callbacks if increment_clock is False
-            # (when true, it happens in increment_logical_clock)
-            if not increment_clock:
-                self.notify_version_change()
-                
             return new_clock
-            
-        except Exception as e:
-            logger.error(f"Error logging change: {e}")
-            raise
-    
+
+        # 5. Execute transaction and get new clock
+        new_clock = self.db_manager.transaction(_txn)
+
+        # 6. Notify callbacks that version changed
+        self.notify_version_change()
+
+        return new_clock    
 
     def get_changes_since_clock(self, last_clock, peer_node_id=None, batch_size=1000):
         """Get all changes since a given logical clock value
