@@ -173,7 +173,7 @@ class SyncedDatabase:
         if not success:
             return False
         clock = self.change_tracker.log_change("beers", "UPDATE", beer_id, increment_clock=True)
-        if kwargs.get('notify', True):
+        if notify:
             self.notify_update(clock)
         return True
 
