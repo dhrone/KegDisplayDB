@@ -264,7 +264,6 @@ class DatabaseSynchronizer:
 
     def _handle_sync_request(self, client_socket, message, addr):
         peer_ip = addr[0]
-        logger.info(f"ENTRY sync_request from {peer_ip}")
         
         last_clock = message.get('last_clock', 0)
         peer_node_id = message.get('node_id')

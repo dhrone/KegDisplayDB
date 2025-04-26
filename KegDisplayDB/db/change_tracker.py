@@ -360,9 +360,9 @@ class ChangeTracker:
             
             # Log details about the number of changes found
             if all_changes:
-                logger.info(f"Found {len(higher_clock_changes)} changes with higher clock value than {last_clock}")
+                logger.debug(f"Found {len(higher_clock_changes)} changes with higher clock value than {last_clock}")
                 if equal_clock_changes:
-                    logger.info(f"Found {len(equal_clock_changes)} changes with equal clock value from different nodes")
+                    logger.debug(f"Found {len(equal_clock_changes)} changes with equal clock value from different nodes")
             
             # Limit to batch_size
             if len(all_changes) > batch_size:

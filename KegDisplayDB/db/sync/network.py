@@ -205,7 +205,7 @@ class NetworkManager:
                 # Periodic logging to ensure the listener is active
                 current_time = time.time()
                 if current_time - last_log_time > 60:  # Log activity every minute
-                    logger.info(f"Broadcast listener active, received {recv_count} messages in the last minute")
+                    logger.debug(f"Broadcast listener active, received {recv_count} messages in the last minute")
                     recv_count = 0
                     last_log_time = current_time
                 
@@ -222,17 +222,19 @@ class NetworkManager:
                         try:
                             msg_data = json.loads(data.decode('utf-8'))
                             VERSION = msg_data.get('version')
-                            HASH = msg_data.get('hash')[-10:]
-                            NODE_ID = VERSION.get('node_id')[-12:]
-                            TS = VERSION.get('timestamp')[-9:]
-                            CLK = VERSION.get('logical_clock')
-
-                            logger.info(f"Rcvd bcast from Node {-6:NODE_ID} Hash {HASH[-10:] if len(HASH) > 10 else HASH} CLK {CLK} ")
-                        except json.JSONDecodeError:
-                            logger.debug(f"Could not parse message as JSON")
+                            if VERSION:  # Add this check
+                                HASH = VERSION.get('hash', '')[-10:] if VERSION.get('hash') else 'unknwn'
+                                NODE_ID = VERSION.get('node_id', '')[-12:] if VERSION.get('node_id') else 'unknwn'
+                                TS = VERSION.get('timestamp', '')[-9:] if VERSION.get('timestamp') else ''
+                                CLK = VERSION.get('logical_clock', -1)
+                                logger.info(f"Rcvd bcast from Node {NODE_ID[-6:]} Hash {HASH} CLK {CLK}")
+                            else:
+                                logger.info(f"Received message with missing version field: {msg_data}")
+                        except json.JSONDecodeError as e:
+                            logger.info(f"Could not parse message as JSON: {e}")
                             
                     except Exception as e:
-                        logger.debug(f"Could not decode message preview: {e}")
+                        logger.info(f"Could not decode message preview: {e}")
                     
                     # Call the message handler if set
                     if self.message_handler:
