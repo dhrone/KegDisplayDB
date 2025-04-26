@@ -1376,14 +1376,13 @@ class DatabaseManager:
             # Get the directory and base name for the database
             db_dir = os.path.dirname(self.db_path)
             db_name = os.path.basename(self.db_path)
-
-            backup_name = f"{db_name}.{i}.err.bak" if error_backup else f"{db_name}.{i}.bak"
             
             # Use a simple rotating backup scheme (max 5 backups)
             max_backups = 5
             
             # Find an available backup slot (1-5)
             for i in range(1, max_backups + 1):
+                backup_name = f"{db_name}.{i}.err.bak" if error_backup else f"{db_name}.{i}.bak"
                 backup_path = os.path.join(db_dir, backup_name)
                 if not os.path.exists(backup_path):
                     break
@@ -1391,6 +1390,7 @@ class DatabaseManager:
                 # If all slots are taken, use the oldest backup
                 backup_files = []
                 for i in range(1, max_backups + 1):
+                    backup_name = f"{db_name}.{i}.err.bak" if error_backup else f"{db_name}.{i}.bak"
                     path = os.path.join(db_dir, backup_name)
                     if os.path.exists(path):
                         backup_files.append((path, os.path.getmtime(path)))
@@ -1401,6 +1401,7 @@ class DatabaseManager:
                     backup_path = backup_files[0][0]
                 else:
                     i = 1
+                    backup_name = f"{db_name}.{i}.err.bak" if error_backup else f"{db_name}.{i}.bak"
                     backup_path = os.path.join(db_dir, backup_name)
             
             # Create the backup

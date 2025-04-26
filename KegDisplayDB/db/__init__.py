@@ -345,7 +345,8 @@ class SyncedDatabase:
                 logger.error(f"Error clearing beer related data: {e}")
                 return (0, ["Failed to clear beer related data"])
     
-            clock = self.change_tracker.log_change("version", "CLEAR", 1)  # Disable clear logging for now
+            #clock = self.change_tracker.log_change("version", "CLEAR", 1)  # Disable clear logging for now
+            first_call = True
             # Process beers in batches
             for batch_start in range(0, len(sorted_beers), BATCH_SIZE):
                 batch_end = min(batch_start + BATCH_SIZE, len(sorted_beers))
@@ -371,7 +372,8 @@ class SyncedDatabase:
                             tapped=beer_data.get('Tapped'),
                             notes=beer_data.get('Notes')
                         )
-                        self.change_tracker.log_change("beers", "INSERT", beer_id, increment_clock=False)
+                        clock = self.change_tracker.log_change("beers", "INSERT", beer_id, increment_clock=first_call)
+                        first_call = False
                         
                         if beer_id:
                             batch_success_count += 1
@@ -418,17 +420,13 @@ class SyncedDatabase:
 
                 # Clear the change log
                 self.db_manager.clear_change_log()
-                
-                # Log the change
-                clock = self.change_tracker.log_change("version", "CLEAR", 1)
-                
- 
+
                 return beer_count
                 
-            return beer_count
+            return True
         except Exception as e:
-            logger.error(f"Error clearing beers: {e}")
-            return 0
+            logger.error(f"Error clearing beers")
+            raise
     
     def set_tap_count(self, count):
         """
