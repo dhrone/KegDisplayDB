@@ -550,7 +550,7 @@ class DatabaseSynchronizer:
         while self.running:
             with self.lock:
                 now = time.time()
-                self.peers = { ip:pd for ip,pd in self.peers.items() if now-pd[1]<15 }
+                self.peers = { ip:pd for ip,pd in self.peers.items() if now-pd[1] < 180 }
             time.sleep(5)
 
     def add_peer(self, peer_ip):
