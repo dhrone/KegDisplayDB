@@ -145,11 +145,9 @@ class NetworkManager:
                     node_id = version.get('node_id', 'unknown')
                     hash_val = version.get('hash', '0')
                     logical_clock = version.get('logical_clock', 0)
-                    logger.info(f"Broadcasting    Node {-6:node_id} Hash {hash_val[-10:] if len(hash_val) > 10 else hash_val} CLK {logical_clock}")
+                    logger.info(f"Broadcasting    Node {node_id[-6:]} Hash {hash_val[-10:] if len(hash_val) > 10 else hash_val} CLK {logical_clock}")
                 except Exception as e:
                     logger.warning(f"Error getting version info for broadcast: {e}")
-            # f"Broadcasting    Node {-6:node_id} Hash {hash_val[-10:] if len(hash_val) > 10 else hash_val} CLK {logical_clock}"
-            # 
             
             # Send the message regardless of whether we have version info
             self.broadcast_socket.sendto(message, ('<broadcast>', self.broadcast_port))
@@ -261,7 +259,7 @@ class NetworkManager:
         while self.running:
             try:
                 client, addr = self.sync_socket.accept()
-                logger.info(f"Accepted sync connection from {addr[0]}")
+                logger.debug(f"Accepted sync connection from {addr[0]}")
                 
                 # Handle the connection in a new thread
                 threading.Thread(
