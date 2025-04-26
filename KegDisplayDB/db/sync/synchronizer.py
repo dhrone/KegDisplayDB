@@ -225,7 +225,6 @@ class DatabaseSynchronizer:
                 self._invalidate_version_cache()
 
         if sync:
-                logger.info(f"Triggering sync from {peer_ip}")
                 self._request_sync(peer_ip, port, last_clk)
 
     # ——— Sync‐connection dispatch ———
@@ -488,16 +487,33 @@ class DatabaseSynchronizer:
                 changes = self.protocol.deserialize_changes(data)
                 try:
                     self.db_manager.apply_sync_changes(changes)
+                    
+                    # Get the updated version after applying changes
+                    updated_version = self._update_version_cache(force=True)
+                    
+                    # Update the peer entry with the NEW version info AND current time
+                    with self.lock:
+                        if peer_ip in self.peers:
+                            # Keep only the peer's port from the previous entry
+                            _, _, peer_port = self.peers[peer_ip]
+                            
+                            # Use msg.get('version') to update peer's version info
+                            # This uses the peer's reported version, which is more accurate 
+                            # than our local cache
+                            peer_version = msg.get('version', {})
+                            self.peers[peer_ip] = (peer_version, time.time(), peer_port)
                 except:
                     self._restore_database(backup)
                 finally:
                     self._invalidate_version_cache()
-
-            # Update the peer's lastSeen time since we've successfully communicated
-            with self.lock:
-                if peer_ip in self.peers:
-                    peer_version, _, peer_port = self.peers[peer_ip]
-                    self.peers[peer_ip] = (peer_version, time.time(), peer_port)
+            else:
+                # Even if no changes, update the lastSeen time
+                with self.lock:
+                    if peer_ip in self.peers:
+                        peer_version, _, peer_port = self.peers[peer_ip]
+                        # Update the peer version from the response
+                        received_version = msg.get('version', peer_version)
+                        self.peers[peer_ip] = (received_version, time.time(), peer_port)
         except socket.timeout:
             logger.warning(f"Socket timeout connecting to peer {peer_ip}:{peer_port}")
             if backup:
@@ -701,7 +717,6 @@ class DatabaseSynchronizer:
     # ——— Peer discovery & heartbeats ———
     
     def _initial_peer_discovery(self):
-
         EMPTY_DB_HASH = 'd751713988987e9331980363e24189ce'
 
         version = self._update_version_cache(force=True)
@@ -732,6 +747,9 @@ class DatabaseSynchronizer:
         # 1. Our database is empty and the peer has data, OR
         # 2. The peer has a better version than us
         if best_ip and (empty and peer_has_data or not empty):
+            # Save the port before clearing all peers
+            best_port = self.peers[best_ip][2]
+            
             # Clear the database and change log first
             def tx(c):
                 c.execute("DELETE FROM taps;")
@@ -743,7 +761,8 @@ class DatabaseSynchronizer:
             # Clear the peers except for the best one
             with self.lock:
                 self.peers.clear()
-                self.peers[best_ip] = (best_ver, time.time(), self.peers[best_ip][2])
+                # Use the saved port
+                self.peers[best_ip] = (best_ver, time.time(), best_port)
             
             # Invalidate the version cache
             self._invalidate_version_cache()

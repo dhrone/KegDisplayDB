@@ -145,9 +145,11 @@ class NetworkManager:
                     node_id = version.get('node_id', 'unknown')
                     hash_val = version.get('hash', '0')
                     logical_clock = version.get('logical_clock', 0)
-                    logger.info(f"Broadcasting message {node_id}:{hash_val[-10:] if len(hash_val) > 10 else hash_val}:{logical_clock}")
+                    logger.info(f"Broadcasting    Node {-6:node_id} Hash {hash_val[-10:] if len(hash_val) > 10 else hash_val} CLK {logical_clock}")
                 except Exception as e:
                     logger.warning(f"Error getting version info for broadcast: {e}")
+            # f"Broadcasting    Node {-6:node_id} Hash {hash_val[-10:] if len(hash_val) > 10 else hash_val} CLK {logical_clock}"
+            # 
             
             # Send the message regardless of whether we have version info
             self.broadcast_socket.sendto(message, ('<broadcast>', self.broadcast_port))
@@ -212,11 +214,11 @@ class NetworkManager:
                 # Skip messages from our own IP
                 if addr[0] not in self.local_ips:
                     logger.info(f"Rcvd broadcast from {addr[0]} len:{len(data)}")
+      
                     
                     # Try to log the first part of the message for debugging
                     try:
                         msg_preview = data[:50].decode('utf-8', errors='replace')
-                        logger.info(f"Message preview: {msg_preview}...")
                         
                         # Try to parse the message to check if it's an update
                         try:
@@ -226,8 +228,8 @@ class NetworkManager:
                             NODE_ID = VERSION.get('node_id')[-12:]
                             TS = VERSION.get('timestamp')[-9:]
                             CLK = VERSION.get('logical_clock')
-                            if msg_data.get('type') == 'update':
-                                logger.info(f"Received UPDATE message at {TS} from {addr[0]}: CLK {CLK} H {HASH} N {NODE_ID}")
+
+                            logger.info(f"Rcvd bcast from Node {-6:NODE_ID} Hash {HASH[-10:] if len(HASH) > 10 else HASH} CLK {CLK} ")
                         except json.JSONDecodeError:
                             logger.debug(f"Could not parse message as JSON")
                             

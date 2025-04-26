@@ -369,7 +369,11 @@ class ChangeTracker:
                 logger.warning(f"Limiting changes from {len(all_changes)} to {batch_size}")
                 all_changes = all_changes[:batch_size]
             
-            logger.info(f"Found {len(all_changes)} changes since logical clock {last_clock}")
+            if len(all_changes) > 0:
+                logger.info(f"Found {len(all_changes)} changes since logical clock {last_clock}")
+            else:
+                logger.debug(f"No changes found since logical clock {last_clock}")
+
             return all_changes
             
         except Exception as e:
