@@ -345,7 +345,7 @@ class SyncedDatabase:
                 logger.error(f"Error clearing beer related data: {e}")
                 return (0, ["Failed to clear beer related data"])
     
-            #clock = self.change_tracker.log_change("version", "CLEAR", 1)  # Disable clear logging for now
+            clock = self.change_tracker.log_change("version", "CLEAR", 1)  # Disable clear logging for now
             # Process beers in batches
             for batch_start in range(0, len(sorted_beers), BATCH_SIZE):
                 batch_end = min(batch_start + BATCH_SIZE, len(sorted_beers))

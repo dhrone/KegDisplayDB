@@ -1116,7 +1116,7 @@ class DatabaseManager:
                             logger.debug(f"Applying change: {operation} to {table_name}.{row_id} (logical clock: {logical_clock}, our new clock: {new_clock})")
                             
                             # Apply the change based on operation type
-                            if operation in ['INSERT', 'UPDATE', 'DELETE', 'CLEAR']:
+                            if operation in ['INSERT', 'UPDATE', 'DELETE']:
                                 try:
                                     # Parse the content as JSON and build the SQL
                                     row_data = json.loads(content)
@@ -1140,11 +1140,10 @@ class DatabaseManager:
                                         sql = f"DELETE FROM {table_name} WHERE rowid = ?;"
                                         conn.execute(sql, (row_id,))
 
-                                    elif operation == 'CLEAR':
-                                        # Build CLEAR statement
-                                        error_message = f"Error applying CLEAR to database"
-                                        sql = f"DELETE FROM beers; UPDATE taps SET idBeer = NULL;"
-                                        conn.execute(sql)
+                                    else:
+                                        # Unknown operation error
+                                        error_message = f"Unknown operation '{operation}'"
+                                        raise ValueError(error_message)
                                     
                                     # Log the change in our change_log table with OUR new clock value
                                     # but preserve the ORIGINAL node_id to maintain provenance
