@@ -254,6 +254,7 @@ class DatabaseSynchronizer:
         self.change_tracker.update_logical_clock(msg.get('version',{}).get('logical_clock',0))
 
         typ = msg.get('type')
+        logger.info(f"Handling sync connection from {peer_ip} with type {typ}")
         if typ == 'sync_request':
             return self._handle_sync_request(client_socket, msg, addr)
         if typ == 'full_db_request':
@@ -293,12 +294,14 @@ class DatabaseSynchronizer:
         db_path = self.db_manager.db_path
 
         if not os.path.exists(db_path):
+            logger.info(f"Database file does not exist at {db_path}, sending empty response")
             resp = self.protocol.create_full_db_response(self._update_version_cache(), 0)
             client_socket.sendall(resp)
             client_socket.close()
             return
                 
         size = os.path.getsize(db_path)
+        logger.info(f"Sending full database response to {peer_ip} with size {size}")
         resp = self.protocol.create_full_db_response(self._update_version_cache(), size)
         client_socket.sendall(resp)
         if not self._await_ack(client_socket, addr):
