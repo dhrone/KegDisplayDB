@@ -8,12 +8,14 @@ Type=simple
 User=beer
 WorkingDirectory=/home/beer/Dev/KegDisplayDB
 # Use full path to poetry
-ExecStart=/home/beer/.local/bin/poetry run sync
+ExecStart=/home/beer/.poetry/bin/poetry run sync
 # Or alternatively use this if poetry is installed system-wide
 # ExecStart=/usr/local/bin/poetry run sync
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target 
