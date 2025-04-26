@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime, UTC
 import sys
 import atexit
+import sqlite3
 
 # Try to import gunicorn's BaseApplication
 try:
@@ -354,8 +355,38 @@ def main():
     configure_logging(log_level=args.log_level)
     logger.setLevel(getattr(logging, args.log_level))
     args.db_path = os.path.expanduser(args.db_path)
-    synced_db = SyncedDatabase(db_path=args.db_path, broadcast_port=args.broadcast_port, sync_port=args.sync_port, test_mode=False)
-    synced_db.start()  # Start the synchronization system
+    
+    # Ensure the database directory exists
+    db_dir = os.path.dirname(args.db_path)
+    if not os.path.exists(db_dir):
+        logger.info(f"Creating database directory: {db_dir}")
+        os.makedirs(db_dir, exist_ok=True)
+    
+    try:
+        # Check if the database file is accessible
+        if os.path.exists(args.db_path):
+            # Try to check if the file is readable/writable
+            try:
+                with open(args.db_path, 'r+b'):
+                    pass
+            except (IOError, PermissionError) as e:
+                logger.error(f"Database file exists but cannot be accessed: {e}")
+                logger.error(f"Please check permissions on {args.db_path}")
+                sys.exit(1)
+        
+        synced_db = SyncedDatabase(db_path=args.db_path, broadcast_port=args.broadcast_port, sync_port=args.sync_port, test_mode=False)
+        synced_db.start()  # Start the synchronization system
+    except sqlite3.OperationalError as e:
+        logger.error(f"SQLite operational error: {e}")
+        logger.error(f"This could be due to a corrupted database file or disk issues.")
+        logger.error(f"You may want to try deleting the database file at {args.db_path} and starting over.")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Failed to initialize SyncedDatabase: {e}")
+        if hasattr(e, '__traceback__'):
+            import traceback
+            logger.error(traceback.format_exc())
+        sys.exit(1)
     logger.info(f"Sync service running on {args.host}:{args.port}")
     
     # Register cleanup handler

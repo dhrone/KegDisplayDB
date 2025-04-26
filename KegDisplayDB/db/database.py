@@ -77,6 +77,10 @@ class DBService:
         }
         self._busy_timeout = busy_timeout
 
+        # Check if database file exists, and if not, clean up any orphaned WAL/SHM files
+        if not os.path.exists(db_path):
+            self._cleanup_orphaned_files(db_path)
+
         # Shutdown control
         self._shutdown_event = threading.Event()
         self._shutdown_requested = False
@@ -93,14 +97,42 @@ class DBService:
                 isolation_level=None
             )
             self._configure_pragmas()
-        except Exception:
-            logger.exception("DBS INIT ERROR: Failed to open SQLite connection.")
+        except Exception as e:
+            logger.exception("DBS INIT ERROR: Failed to open SQLite connection: %s", e)
             raise
 
         # Start actor and watchdog threads
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         threading.Thread(target=self._watchdog, daemon=True).start()
+
+    def _cleanup_orphaned_files(self, db_path):
+        """
+        Clean up orphaned WAL and SHM files if the main database file doesn't exist.
+        This prevents issues when creating a new database from being blocked by leftover files.
+        
+        Args:
+            db_path: Path to the database file
+        """
+        logger.info(f"Database file does not exist at {db_path}, checking for orphaned WAL/SHM files")
+        
+        # Check for WAL file
+        wal_file = f"{db_path}-wal"
+        if os.path.exists(wal_file):
+            try:
+                logger.warning(f"Found orphaned WAL file at {wal_file}, deleting")
+                os.remove(wal_file)
+            except Exception as e:
+                logger.error(f"Failed to delete orphaned WAL file: {e}")
+        
+        # Check for SHM file
+        shm_file = f"{db_path}-shm"
+        if os.path.exists(shm_file):
+            try:
+                logger.warning(f"Found orphaned SHM file at {shm_file}, deleting")
+                os.remove(shm_file)
+            except Exception as e:
+                logger.error(f"Failed to delete orphaned SHM file: {e}")
 
     def _configure_pragmas(self) -> None:
         cursor = self._conn.cursor()

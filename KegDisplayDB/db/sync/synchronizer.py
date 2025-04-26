@@ -23,8 +23,8 @@ class DatabaseSynchronizer:
     with Lamport clocks, JSON framing, unified ACKs, and
     transactional clears.
     """
-
-    def __init__(self, db_manager, change_tracker, network_manager,
+    
+    def __init__(self, db_manager, change_tracker, network_manager, 
                  socket_timeout=60, buffer_size=65536, chunk_size=32768,
                  max_retries=5):
         self.db_manager = db_manager
@@ -35,12 +35,12 @@ class DatabaseSynchronizer:
         self.lock = threading.Lock()
         self.running = False
         self.threads = []  # Initialize threads list for test compatibility
-
+        
         self.socket_timeout = socket_timeout
         self.buffer_size = buffer_size
         self.chunk_size = chunk_size
         self.max_retries = max_retries
-
+        
         self.version_cache = None
         self.version_cache_time = 0
         self.version_cache_lock = threading.Lock()
@@ -62,7 +62,7 @@ class DatabaseSynchronizer:
             self.version_cache = self.change_tracker.get_db_version()
             self.version_cache_time = time.time()
             return self.version_cache
-
+    
     def start(self):
         logger.info("Starting synchronizer")
         self.running = True
@@ -77,7 +77,7 @@ class DatabaseSynchronizer:
             
         self._initial_peer_discovery()
         logger.info("Synchronizer started")
-
+    
     def stop(self):
         # Check if Python is shutting down
         if not hasattr(sys, "meta_path") or sys.meta_path is None:
@@ -92,7 +92,7 @@ class DatabaseSynchronizer:
         for thread in self.threads:
             if thread.is_alive():
                 thread.join(1.0)  # Wait up to 1 second
-
+        
     # ——— JSON framing & error/ACK helpers ———
 
     def _recv_message(self, sock):
@@ -120,8 +120,10 @@ class DatabaseSynchronizer:
         except Exception:
             logger.exception("Failed sending error")
         finally:
-            try: sock.close()
-            except: pass
+            try: 
+                sock.close()
+            except: 
+                pass
 
     def _await_ack(self, sock, addr):
         try:
@@ -156,7 +158,7 @@ class DatabaseSynchronizer:
             return []
 
     # ——— Broadcast handling ———
-
+    
     def handle_message(self, data, addr, is_sync=False):
         if is_sync:
             return self._handle_sync_connection(data, addr)
@@ -169,7 +171,7 @@ class DatabaseSynchronizer:
         if typ in ('discovery','heartbeat','update'):
             return self._handle_broadcast(msg, addr, typ)
         logger.warning(f"Unknown broadcast type '{typ}' from {addr[0]}")
-
+    
     def _handle_broadcast(self, message, addr, message_type):
         peer_ip = addr[0]
         if peer_ip in self.network.local_ips:
@@ -185,7 +187,7 @@ class DatabaseSynchronizer:
         logger.info(f"{message_type}@{peer_ip} peer={pCLK}/{pHASH[-6:]} ours={oCLK}/{oHASH[-6:]} last={last_clk}")
 
         # record
-        with self.lock:
+        with self.lock:    
             self.peers[peer_ip] = (pv, time.time(), port)
 
         # Lamport receive
@@ -214,7 +216,7 @@ class DatabaseSynchronizer:
             self._request_sync(peer_ip, port, last_clk)
 
     # ——— Sync‐connection dispatch ———
-
+    
     def _handle_sync_connection(self, client_socket, addr):
         peer_ip = addr[0]
         try:
@@ -222,10 +224,12 @@ class DatabaseSynchronizer:
             msg = self._recv_message(client_socket)
         except Exception as e:
             logger.error(f"Framing error from {peer_ip}: {e}")
-            try: client_socket.close()
-            except: pass
+            try: 
+                client_socket.close()
+            except: 
+                pass
             return
-
+            
         # one Lamport bump
         self.change_tracker.update_logical_clock(msg.get('version',{}).get('logical_clock',0))
 
@@ -242,8 +246,8 @@ class DatabaseSynchronizer:
     def _handle_sync_request(self, client_socket, message, addr):
         peer_ip = addr[0]
         logger.info(f"ENTRY sync_request from {peer_ip}")
-
-        last_clock   = message.get('last_clock', 0)
+        
+        last_clock = message.get('last_clock', 0)
         peer_node_id = message.get('node_id')
 
         changes = self._fetch_change_batch(last_clock, peer_node_id)
@@ -253,17 +257,17 @@ class DatabaseSynchronizer:
         self._send_sync_response(client_socket, version, has)
         if not has:
             return
-
+                
         if not self._await_ack(client_socket, addr):
             return
-
+                
         data = self.protocol.serialize_changes(changes)
         self._send_data_chunked(client_socket, data)
 
         self._await_ack(client_socket, addr)
 
     # ——— Full‐DB sync ———
-
+    
     def _handle_full_db_request(self, client_socket, message, addr):
         peer_ip = addr[0]
         db_path = self.db_manager.db_path
@@ -273,7 +277,7 @@ class DatabaseSynchronizer:
             client_socket.sendall(resp)
             client_socket.close()
             return
-
+                
         size = os.path.getsize(db_path)
         resp = self.protocol.create_full_db_response(self._update_version_cache(), size)
         client_socket.sendall(resp)
@@ -283,7 +287,7 @@ class DatabaseSynchronizer:
         client_socket.close()
 
     # ——— Chunked I/O ———
-
+    
     def _send_data_chunked(self, sock, data):
         total = len(data)
         # send length prefix
@@ -475,7 +479,7 @@ class DatabaseSynchronizer:
                 pass
 
     # ——— Rotate backups ———
-
+    
     def _backup_database(self):
         path = getattr(self.db_manager, 'db_path', None)
         if not path or not isinstance(path, str) or not os.path.exists(path):
@@ -509,14 +513,14 @@ class DatabaseSynchronizer:
         except:
             logger.exception("Restore failed")
             return False
-
+                
     def _remove_backup(self, bk):
         if bk and os.path.exists(bk) and bk!="_TESTONLY_backup":
             try: os.remove(bk)
             except: pass
 
     # ——— Peer discovery & heartbeats ———
-
+    
     def _initial_peer_discovery(self):
         # bump
         self.change_tracker.increment_logical_clock()
@@ -537,7 +541,7 @@ class DatabaseSynchronizer:
                     best_ip, best_ver, best_clk = ip, v, clk
         if best_ip:
             self._request_full_database(best_ip, self.peers[best_ip][2])
-
+    
     def _heartbeat_sender(self):
         while self.running:
             self.change_tracker.increment_logical_clock()
@@ -545,14 +549,14 @@ class DatabaseSynchronizer:
             msg = self.protocol.create_heartbeat_message(ver, self.network.sync_port)
             self.network.send_broadcast(msg)
             time.sleep(60)
-
+    
     def _cleanup_peers(self):
         while self.running:
             with self.lock:
                 now = time.time()
                 self.peers = { ip:pd for ip,pd in self.peers.items() if now-pd[1] < 180 }
             time.sleep(5)
-
+    
     def add_peer(self, peer_ip):
         if peer_ip in self.network.local_ips or not peer_ip: return
         with self.lock:
@@ -582,7 +586,7 @@ class DatabaseSynchronizer:
         changes = peer.change_tracker.get_changes_since_clock(ov.get('logical_clock',0), ov.get('node_id'))
         if changes:
             self.db_manager.apply_sync_changes(changes)
-            self.change_tracker.update_logical_clock(pv.get('logical_clock',0))
+        self.change_tracker.update_logical_clock(pv.get('logical_clock',0))
 
     def _find_latest_peer(self):
         ov = self._update_version_cache()
@@ -613,12 +617,6 @@ class DatabaseSynchronizer:
     def notify_update(self, clock=None):
         """Notify other instances that a change has been made.
         
-        Args:
-            clock: Optional logical clock value to use
-        """
-    def notify_update(self, clock=None):
-        """Notify other instances that a change has been made.
-
         Args:
             clock: Optional logical clock value to use
         """
