@@ -1031,35 +1031,30 @@ class DatabaseManager:
                 )
             )
             
-            # Process changes in batches of 100
-            batch_size = 100
+            # Group changes by their source logical clock and node_id
+            grouped_changes = {}
+            for change in changes:
+                source_clock = change[6] if len(change) > 6 else 0
+                source_node = change[7] if len(change) > 7 else local_node_id
+                key = (source_clock, source_node)
+                if key not in grouped_changes:
+                    grouped_changes[key] = []
+                grouped_changes[key].append(change)
             
-            # Process all changes in batches
-            for i in range(0, len(changes), batch_size):
-                batch = changes[i:i+batch_size]
-                batch_clock = current_clock  # Current clock at the start of this batch
-                logger.info(f"Processing batch {i//batch_size + 1}/{(len(changes)-1)//batch_size + 1} ({len(batch)} changes)")
+            # Process each group with its own single logical clock
+            for (source_clock, source_node), group in grouped_changes.items():
+                # Calculate a single logical clock for this entire group
+                group_clock = max(current_clock, source_clock) + 1
+                logger.info(f"Processing {len(group)} changes from clock {source_clock}, node {source_node} as batch with new clock {group_clock}")
                 
-                # Define the transaction function for this batch
-                def process_batch(conn):
-                    nonlocal batch_clock, total_applied_changes, total_failed_changes, highest_logical_clock
+                # Process all changes in this group
+                def process_group(conn):
+                    nonlocal total_applied_changes, total_failed_changes
                     
                     applied_changes = 0
                     failed_changes = 0
-                    batch_highest_clock = batch_clock
-
-                    def do_update_version(conn, timestamp, hash, logical_clock, node_id):
-                        # Update version table with new logical clock and timestamp
-                        self.execute(
-                            """
-                            UPDATE version SET timestamp = ?, hash = ?, logical_clock = ?, node_id = ?
-                            WHERE id = 1;
-                            """,
-                            (timestamp, hash, logical_clock, node_id)
-                        )
                     
-                    # Process each change in the batch
-                    for change_index, change in enumerate(batch):
+                    for change_index, change in enumerate(group):
                         try:
                             # Ensure the change has all the required fields
                             if len(change) != 8:
@@ -1079,44 +1074,57 @@ class DatabaseManager:
 
                             error_message = f"Error applying {operation} change to {table_name}.{row_id}"
                             
-                            # Check if this change is already in our change_log
+                            # Content-based duplicate detection: check if this content is already applied regardless of clock
                             cursor = conn.execute(
                                 """
                                 SELECT COUNT(*) FROM change_log 
-                                WHERE table_name = ? AND operation = ? AND row_id = ? 
-                                  AND ((logical_clock = ? AND node_id = ?) OR 
-                                       (logical_clock > ? AND content_hash = ?))
+                                WHERE table_name = ? AND operation = ? AND row_id = ? AND content_hash = ?
                                 """,
-                                (table_name, operation, row_id, logical_clock, node_id, 
-                                 logical_clock, content_hash)
+                                (table_name, operation, row_id, content_hash)
                             )
                             existing_change = cursor.fetchone()
                             
                             if existing_change and existing_change[0] > 0:
-                                # Skip changes we've already processed
-                                logger.debug(f"Skipping duplicate change: {operation} on {table_name}.{row_id} with clock {logical_clock} from node {node_id}")
+                                # Skip changes we've already processed (by content)
+                                logger.debug(f"Skipping duplicate change based on content: {operation} on {table_name}.{row_id} with hash {content_hash}")
                                 # Count as successful to track statistics properly
                                 applied_changes += 1
                                 continue
                                 
                             # Verify content hash (security check)
-                            if hashlib.md5(content.encode()).hexdigest() != content_hash:
+                            if operation == 'CLEAR' and (content is None or content == ""):
+                                # Skip hash verification for CLEAR operations with NULL content
+                                logger.debug("Skipping hash verification for CLEAR operation with null content")
+                            elif hashlib.md5(content.encode()).hexdigest() != content_hash:
                                 logger.warning(f"Content hash mismatch for change at index {change_index}")
                                 failed_changes += 1
                                 continue
                             
-                            # Update our logical clock (Lamport rule: localClock = max(localClock, t) + 1)
-                            new_clock = max(batch_clock, logical_clock) + 1
-                            batch_clock = new_clock  # Update for next iteration
-                            
-                            # Track the highest computed clock
-                            if new_clock > batch_highest_clock:
-                                batch_highest_clock = new_clock
-                            
-                            logger.debug(f"Applying change: {operation} to {table_name}.{row_id} (logical clock: {logical_clock}, our new clock: {new_clock})")
+                            logger.debug(f"Applying change: {operation} on {table_name}.{row_id} with group clock {group_clock}")
                             
                             # Apply the change based on operation type
-                            if operation in ['INSERT', 'UPDATE', 'DELETE']:
+                            if operation == 'CLEAR':
+                                # Handle CLEAR operation (clear all tables)
+                                logger.info(f"Executing CLEAR operation - clearing all tables")
+                                conn.execute("DELETE FROM beers;")
+                                conn.execute("DELETE FROM taps;")
+                                # Don't clear change_log here as we need to record this change
+                                
+                                # Make sure content is a valid JSON string for CLEAR operations with NULL content
+                                safe_content = content if content else "{}"
+                                
+                                # Log the CLEAR in our change_log with the group's clock
+                                conn.execute(
+                                    """
+                                    INSERT INTO change_log 
+                                    (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                    """,
+                                    (table_name, operation, row_id, timestamp, safe_content, content_hash, group_clock, node_id)
+                                )
+                                applied_changes += 1
+                                
+                            elif operation in ['INSERT', 'UPDATE', 'DELETE']:
                                 try:
                                     # Parse the content as JSON and build the SQL
                                     row_data = json.loads(content)
@@ -1139,22 +1147,17 @@ class DatabaseManager:
                                         # Build DELETE statement
                                         sql = f"DELETE FROM {table_name} WHERE rowid = ?;"
                                         conn.execute(sql, (row_id,))
-
-                                    else:
-                                        # Unknown operation error
-                                        error_message = f"Unknown operation '{operation}'"
-                                        raise ValueError(error_message)
                                     
-                                    # Log the change in our change_log table with OUR new clock value
+                                    # Log the change in our change_log table with group clock value
                                     # but preserve the ORIGINAL node_id to maintain provenance
-                                    logger.debug(f"Preserving original node_id {node_id} when recording change in local log")
+                                    logger.debug(f"Recording change in local log with group clock {group_clock}, preserving original node_id {node_id}")
                                     conn.execute(
                                         """
                                         INSERT INTO change_log 
                                         (table_name, operation, row_id, timestamp, content, content_hash, logical_clock, node_id) 
                                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                         """,
-                                        (table_name, operation, row_id, timestamp, content, content_hash, new_clock, node_id)
+                                        (table_name, operation, row_id, timestamp, content, content_hash, group_clock, node_id)
                                     )
 
                                     applied_changes += 1
@@ -1171,18 +1174,22 @@ class DatabaseManager:
                             logger.error(f"Error processing change at index {change_index}: {e}")
                             failed_changes += 1
                     
-                    # Update tracking variables after batch processing
-                    total_applied_changes += applied_changes
-                    total_failed_changes += failed_changes
-                    if batch_highest_clock > highest_logical_clock:
-                        highest_logical_clock = batch_highest_clock
-                    
-                    # Return the new clock value to use for the next batch
-                    return batch_highest_clock
+                    # Update tracking variables after processing
+                    return applied_changes, failed_changes, group_clock
                 
-                # Execute the batch transaction
-                batch_result = self.dbs.run_in_transaction(process_batch)
-                current_clock = batch_result  # Update current clock for next batch
+                # Execute the group transaction
+                result = self.dbs.run_in_transaction(process_group)
+                
+                if result:
+                    applied, failed, new_clock = result
+                    total_applied_changes += applied
+                    total_failed_changes += failed
+                    # Keep track of the highest clock we've assigned
+                    if new_clock > highest_logical_clock:
+                        highest_logical_clock = new_clock
+                    
+                    # Update current_clock for next group
+                    current_clock = new_clock
             
             # Update the version table with the highest computed logical clock
             if highest_logical_clock > 0:
