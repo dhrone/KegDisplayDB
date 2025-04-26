@@ -166,11 +166,13 @@ class SyncedDatabase:
             self.notify_update(clock)
         return beer_id
 
-    def update_beer(self, beer_id, **kwargs):
-        success = self.db_manager.update_beer(beer_id, **kwargs)
+    def update_beer(self, beer_id, name=None, abv=None, ibu=None, color=None, og=None, fg=None,
+                 description=None, brewed=None, kegged=None, tapped=None,
+                 notes=None, notify=True):
+        success = self.db_manager.update_beer(beer_id, name, abv, ibu, color, og, fg, description, brewed, kegged, tapped, notes)
         if not success:
             return False
-        clock = self.change_tracker.log_change("beers", "UPDATE", beer_id)
+        clock = self.change_tracker.log_change("beers", "UPDATE", beer_id, increment_clock=True)
         if kwargs.get('notify', True):
             self.notify_update(clock)
         return True
@@ -230,7 +232,7 @@ class SyncedDatabase:
         success = self.db_manager.update_tap(tap_id, beer_id)
         if not success:
             return False
-        clock = self.change_tracker.log_change("taps", "UPDATE", tap_id)
+        clock = self.change_tracker.log_change("taps", "UPDATE", tap_id, increment_clock=True)
         if notify:
             self.notify_update(clock)
         return True
@@ -239,7 +241,7 @@ class SyncedDatabase:
         success = self.db_manager.delete_tap(tap_id)
         if not success:
             return False
-        clock = self.change_tracker.log_change("taps", "DELETE", tap_id)
+        clock = self.change_tracker.log_change("taps", "DELETE", tap_id, increment_clock=True)
         if notify:
             self.notify_update(clock)
         return True
