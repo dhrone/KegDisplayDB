@@ -195,7 +195,21 @@ class DatabaseSynchronizer:
 
         # decide sync
         sync = False
-        if pCLK > last_clk:
+        use_full_db = False
+        
+        # ENHANCEMENT: If peer's clock is significantly ahead of our last known clock for this peer,
+        # or if our own clock is behind peer's clock, we might have missed too many updates.
+        # In this case, request full database instead of incremental sync.
+        clock_gap = pCLK - last_clk
+        our_clock_gap = pCLK - oCLK
+        
+        if clock_gap > 20 or (our_clock_gap > 0 and message_type == 'update'):
+            # We're significantly behind this peer's updates or this is an update message
+            # and we have a lower clock, so get the full database
+            logger.info(f"Clock gap with peer {peer_ip} is significant (gap={clock_gap}, our gap={our_clock_gap}), requesting full database")
+            sync = True
+            use_full_db = True
+        elif pCLK > last_clk:
             sync = True
         elif pCLK == oCLK and pHASH != oHASH:
             if self.change_tracker.is_newer_version(pv, ov):
@@ -212,8 +226,12 @@ class DatabaseSynchronizer:
                 self._invalidate_version_cache()
 
         if sync:
-            logger.info(f"Triggering sync from {peer_ip}")
-            self._request_sync(peer_ip, port, last_clk)
+            if use_full_db:
+                logger.info(f"Requesting full database from {peer_ip}")
+                self._request_full_database(peer_ip, port)
+            else:
+                logger.info(f"Triggering sync from {peer_ip}")
+                self._request_sync(peer_ip, port, last_clk)
 
     # ——— Sync‐connection dispatch ———
     
@@ -372,6 +390,22 @@ class DatabaseSynchronizer:
         self.change_tracker.increment_logical_clock()
         version = self._update_version_cache(force=True)
         node_id = version.get('node_id')
+        
+        # Get our current logical clock
+        our_clock = version.get('logical_clock', 0)
+
+        # ENHANCEMENT: If our clock is lower than peer's most recent 
+        # clock seen in broadcast, we might have missed updates 
+        # in between. Request all changes from the beginning to ensure
+        # we don't miss anything.
+        our_peer_data = self.peers.get(peer_ip, ({}, 0, 0))
+        peer_latest_clock = our_peer_data[0].get('logical_clock', 0)
+        
+        if peer_latest_clock > our_clock:
+            logger.info(f"Our clock ({our_clock}) is behind peer's ({peer_latest_clock}), requesting full sync from beginning")
+            last_clock = 0
+        
+        logger.info(f"Requesting changes from {peer_ip} since clock {last_clock}")
 
         backup = self._backup_database()
         if not backup:
@@ -544,11 +578,28 @@ class DatabaseSynchronizer:
     
     def _heartbeat_sender(self):
         while self.running:
-            self.change_tracker.increment_logical_clock()
-            ver = self._update_version_cache(force=True)
-            msg = self.protocol.create_heartbeat_message(ver, self.network.sync_port)
-            self.network.send_broadcast(msg)
-            time.sleep(60)
+            try:
+                self.change_tracker.increment_logical_clock()
+                ver = self._update_version_cache(force=True)
+                msg = self.protocol.create_heartbeat_message(ver, self.network.sync_port)
+                
+                # ENHANCEMENT: Send heartbeats multiple times to improve reliability
+                for _ in range(2):  # Send twice for redundancy
+                    self.network.send_broadcast(msg)
+                    if not self.running:
+                        return
+                    time.sleep(0.5)  # Short delay between broadcasts
+                
+                # ENHANCEMENT: More frequent heartbeats to avoid peers being removed prematurely
+                # Now wait for 30 seconds instead of 60 before the next heartbeat
+                for _ in range(30):  # 30 seconds in 1-second increments
+                    if not self.running:
+                        return
+                    time.sleep(1)
+            except Exception as e:
+                logger.error(f"Error in heartbeat sender: {e}")
+                # Wait a bit before trying again
+                time.sleep(5)
     
     def _cleanup_peers(self):
         while self.running:
