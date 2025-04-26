@@ -233,6 +233,12 @@ class DatabaseSynchronizer:
     def _handle_sync_connection(self, client_socket, addr):
         peer_ip = addr[0]
         try:
+            # Update the peer's lastSeen time since they're actively communicating
+            with self.lock:
+                if peer_ip in self.peers:
+                    peer_version, _, peer_port = self.peers[peer_ip]
+                    self.peers[peer_ip] = (peer_version, time.time(), peer_port)
+            
             client_socket.settimeout(self.socket_timeout)
             msg = self._recv_message(client_socket)
         except Exception as e:
@@ -279,6 +285,12 @@ class DatabaseSynchronizer:
         self._send_data_chunked(client_socket, data)
 
         self._await_ack(client_socket, addr)
+
+        # Update the peer's lastSeen time since we've successfully communicated
+        with self.lock:
+            if peer_ip in self.peers:
+                peer_version, _, peer_port = self.peers[peer_ip]
+                self.peers[peer_ip] = (peer_version, time.time(), peer_port)
 
     # ——— Full‐DB sync ———
     
@@ -480,6 +492,12 @@ class DatabaseSynchronizer:
                     self._restore_database(backup)
                 finally:
                     self._invalidate_version_cache()
+
+            # Update the peer's lastSeen time since we've successfully communicated
+            with self.lock:
+                if peer_ip in self.peers:
+                    peer_version, _, peer_port = self.peers[peer_ip]
+                    self.peers[peer_ip] = (peer_version, time.time(), peer_port)
         except socket.timeout:
             logger.warning(f"Socket timeout connecting to peer {peer_ip}:{peer_port}")
             if backup:
