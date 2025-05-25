@@ -101,6 +101,9 @@ class DBSyncService:
                 test_mode=False
             )
             
+            # Start the synchronization service
+            self.db.start()
+            
             # If a primary server IP is specified, add it as a peer
             if self.primary_ip:
                 logger.info(f"Adding primary server as peer: {self.primary_ip}")
