@@ -206,9 +206,18 @@ class DatabaseSynchronizer:
         clock_gap = pCLK - last_clk
         our_clock_gap = pCLK - oCLK
         
- 
+        # DEBUG: Add more detailed logging for sync decision
+        logger.debug(f"Sync decision for {peer_ip}: pCLK={pCLK}, last_clk={last_clk}, oCLK={oCLK}, pHASH={pHASH}, oHASH={oHASH}")
+        
         if pCLK > last_clk:
             sync = True
+            logger.debug(f"Sync triggered: peer clock {pCLK} > last known clock {last_clk}")
+        elif pCLK > oCLK:
+            # Also sync if the peer's clock is ahead of our own clock
+            sync = True
+            logger.debug(f"Sync triggered: peer clock {pCLK} > our clock {oCLK}")
+            # In this case, start from our current clock to get only missing changes
+            last_clk = oCLK
         elif pCLK == oCLK and pHASH != oHASH:
             if self.change_tracker.is_newer_version(pv, ov):
                 logger.info(f"Peer {peer_ip} has a newer version, requesting full database")
@@ -223,9 +232,14 @@ class DatabaseSynchronizer:
                     self.peers.clear()
                     self.peers[peer_ip] = (pv, time.time(), port)
                 self._invalidate_version_cache()
+        else:
+            logger.debug(f"No sync: pCLK={pCLK} <= max(last_clk={last_clk}, oCLK={oCLK}) and not a hash conflict")
 
         if sync:
-                self._request_sync(peer_ip, port, last_clk)
+            logger.info(f"Initiating sync with {peer_ip} since clock {last_clk}")
+            self._request_sync(peer_ip, port, last_clk)
+        else:
+            logger.debug(f"No sync needed with {peer_ip}")
 
     # ——— Sync‐connection dispatch ———
     
@@ -721,6 +735,7 @@ class DatabaseSynchronizer:
         version = self._update_version_cache(force=True)
         msg = self.protocol.create_discovery_message(version, self.network.sync_port)
         self.network.send_broadcast(msg)
+        logger.debug(f"Sent discovery message with version: {version}")
         time.sleep(5)
         
         # Find newest peer
@@ -729,23 +744,33 @@ class DatabaseSynchronizer:
         empty = self.change_tracker.is_database_empty()
         peer_has_data = False
         
+        logger.debug(f"Initial discovery: our_version={ov}, database_empty={empty}")
+        logger.debug(f"Found {len(self.peers)} peers during discovery")
+        
         with self.lock:
             for ip,(v,_,p) in self.peers.items():
                 # Check if peer has a non-empty database (hash won't be 0 or empty)
                 peer_hash = v.get('hash', '0')
+                logger.debug(f"Peer {ip}: hash={peer_hash}, clock={v.get('logical_clock', 0)}")
+                
                 if peer_hash != EMPTY_DB_HASH and peer_hash != '0' and peer_hash != '':
                     peer_has_data = True
+                    logger.debug(f"Peer {ip} has data (hash={peer_hash})")
                 
                 clk = v.get('logical_clock',0)
                 if (v.get('hash')!=ov.get('hash')
                     and (empty or clk>best_clk
                          or (clk==best_clk and self.change_tracker.is_newer_version(v,best_ver)))):
+                    logger.debug(f"Peer {ip} selected as best peer: clock={clk}, hash={v.get('hash')}")
                     best_ip, best_ver, best_clk = ip, v, clk
+        
+        logger.debug(f"Best peer: {best_ip}, peer_has_data: {peer_has_data}, empty: {empty}")
         
         # Only proceed if we found a best peer AND either:
         # 1. Our database is empty and the peer has data, OR
         # 2. The peer has a better version than us
         if best_ip and (empty and peer_has_data or not empty):
+            logger.info(f"Proceeding with sync from best peer {best_ip}")
             # Save the port before clearing all peers
             best_port = self.peers[best_ip][2]
             
@@ -771,6 +796,8 @@ class DatabaseSynchronizer:
             self._request_sync(best_ip, self.peers[best_ip][2], 0)
         elif empty:
             logger.info("All peers have empty databases. Waiting for data to be available.")
+        else:
+            logger.debug(f"No sync needed: best_ip={best_ip}, condition not met")
     
     def _heartbeat_sender(self):
         while self.running:
